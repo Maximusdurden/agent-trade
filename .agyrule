@@ -1,0 +1,14 @@
+# Custom Antigravity Rules for Agent Trade Workspace
+
+When working in this workspace, follow these system rules to ensure maximum productivity and consistency:
+
+## 1. Custom Skills Integration
+* **Portfolio Ledger Builder Skill**: This workspace is integrated with a custom skill named `portfolio-ledger-builder` (located in `C:\Users\17704\.gemini\skills\portfolio-ledger-builder`).
+* **Trigger**: When the user requests to "rebuild the ledger", "recreate the daily view", "run a portfolio audit", or "refresh historical curves", you must immediately invoke the skill's Python automation script:
+  ```powershell
+  .\venv\Scripts\python.exe C:\Users\17704\.gemini\skills\portfolio-ledger-builder\scripts\rebuild_ledger.py
+  ```
+  This will fetch live transaction records from Alpaca, calculate Day-over-Day balances, export to `portfolio_dod_balances.csv`, backfill SQLite history tables, and refresh the dashboard.
+
+## 2. Risk Guardrails
+* Always preserve `MIN_CASH_BUFFER_PCT = 0.10` in `config.py` to maintain a strict 10% rebalancing cushion buffer.
