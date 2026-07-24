@@ -22,7 +22,7 @@ else:
 # LLM Configurations
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Trading Parameters
 # The list of tickers we allow our agent to trade. SPY, QQQ, and SOL/USD.

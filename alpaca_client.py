@@ -262,6 +262,34 @@ class AlpacaClient:
         except Exception as e:
             logger.error(f"Error while canceling open orders for symbol {symbol}: {e}")
 
+    def get_latest_price(self, symbol: str) -> float:
+        """Fetches the real-time latest trade price for a symbol with standard closes as fallbacks."""
+        symbol = symbol.upper()
+        if self.is_mock:
+            return 140.0 if "SOL" in symbol else 400.0
+            
+        is_crypto = "/" in symbol or "USD" in symbol or "SOL" in symbol
+        try:
+            if is_crypto:
+                from alpaca.data.requests import CryptoLatestTradeRequest
+                req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+                res = self.crypto_data_client.get_crypto_latest_trade(req)
+                return float(res[symbol].price)
+            else:
+                from alpaca.data.requests import StockLatestTradeRequest
+                req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+                res = self.data_client.get_stock_latest_trade(req)
+                return float(res[symbol].price)
+        except Exception as e:
+            logger.warning(f"Failed to fetch real-time price for {symbol} via latest trade API: {e}. Falling back to 15m historical close.")
+            try:
+                df = self.get_historical_bars(symbol, limit=2, timeframe_str="15min")
+                if not df.empty:
+                    return float(df.iloc[-1]["close"])
+            except Exception as bar_err:
+                logger.error(f"Fallback to historical bars failed for {symbol}: {bar_err}")
+            raise ValueError(f"Could not resolve real-time or historical price for {symbol}: {e}")
+
     def execute_market_order(self, symbol: str, qty: float, side: str, take_profit_price: float = None, stop_loss_price: float = None) -> dict:
         """Executes a market order, optionally adding bracket take-profit and stop-loss legs for BUY actions on non-crypto assets."""
         symbol = symbol.upper()
@@ -398,6 +426,90 @@ class AlpacaClient:
                 "status": status_str
             }
         except Exception as e:
+            err_msg = str(e)
+            # Check if this is an Alpaca validation error about stop_loss.stop_price or take_profit.limit_price
+            if "stop_loss.stop_price" in err_msg or "take_profit.limit_price" in err_msg:
+                import re
+                import json
+                
+                actual_base_price = None
+                try:
+                    # Attempt to parse as JSON or extract via regex
+                    match = re.search(r'\{.*\}', err_msg)
+                    if match:
+                        err_json = json.loads(match.group(0))
+                        if "base_price" in err_json:
+                            actual_base_price = float(err_json["base_price"])
+                except Exception as parse_err:
+                    logger.warning(f"Could not parse base_price from error JSON: {parse_err}")
+                
+                # If JSON parsing failed, try direct float regex matching
+                if not actual_base_price:
+                    try:
+                        price_match = re.search(r'\"base_price\":\"([\d\.]+)\"', err_msg)
+                        if price_match:
+                            actual_base_price = float(price_match.group(1))
+                    except Exception:
+                        pass
+                
+                if actual_base_price:
+                    logger.info(f"Alpaca validation rejected bracket order. Extracted actual base_price: ${actual_base_price:.2f}")
+                    # Dynamically adjust take_profit and stop_loss to be valid relative to actual_base_price
+                    # A robust safe fallback is:
+                    # stop-loss should be at least max_allowed_stop relative to actual_base_price
+                    max_allowed_stop = round(min(actual_base_price * 0.995, actual_base_price - 0.05), 2)
+                    adjusted_sl = min(stop_loss_price, max_allowed_stop) if stop_loss_price else max_allowed_stop
+                    
+                    min_allowed_tp = round(actual_base_price + 0.05, 2)
+                    adjusted_tp = max(take_profit_price, min_allowed_tp) if take_profit_price else min_allowed_tp
+                    
+                    logger.info(f"Retrying bracket order submission with corrected levels: TP: ${adjusted_tp:.2f}, SL: ${adjusted_sl:.2f}")
+                    
+                    try:
+                        market_order_data = MarketOrderRequest(
+                            symbol=symbol,
+                            qty=qty,
+                            side=order_side,
+                            time_in_force=TimeInForce.GTC,
+                            order_class=OrderClass.BRACKET,
+                            take_profit=TakeProfitRequest(limit_price=adjusted_tp),
+                            stop_loss=StopLossRequest(stop_price=adjusted_sl)
+                        )
+                        order = self.trading_client.submit_order(order_data=market_order_data)
+                        order_id = str(order.id)
+                        logger.info(f"Bracket order retry submitted successfully! Order ID: {order_id}.")
+                        
+                        filled_price = None
+                        status_str = str(order.status.value)
+                        
+                        for attempt in range(10):
+                            try:
+                                updated_order = self.trading_client.get_order_by_id(order_id)
+                                status_str = str(updated_order.status.value)
+                                if updated_order.filled_avg_price is not None:
+                                    filled_price = float(updated_order.filled_avg_price)
+                                if status_str in ("filled", "partially_filled"):
+                                    logger.info(f"Order {order_id} confirmed filled. Status: {status_str} | Avg Price: ${filled_price}")
+                                    break
+                            except Exception as poll_err:
+                                logger.warning(f"Error polling order {order_id}: {poll_err}")
+                            time.sleep(0.5)
+                            
+                        if filled_price is None:
+                            logger.warning(f"Order {order_id} polling complete but fill price is still None. Status is: {status_str}")
+                            
+                        return {
+                            "id": order_id,
+                            "symbol": symbol,
+                            "qty": float(order.qty),
+                            "side": side,
+                            "filled_avg_price": filled_price,
+                            "status": status_str
+                        }
+                    except Exception as retry_err:
+                        logger.error(f"Failed retry of corrected bracket order: {retry_err}")
+                        raise retry_err
+                
             logger.error(f"Error executing market order: {e}")
             raise
 

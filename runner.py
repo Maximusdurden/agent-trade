@@ -218,21 +218,41 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         is_crypto = "/" in symbol or "USD" in symbol or "SOL" in symbol
         
         if action == "BUY" and not is_crypto:
-            if not take_profit_price:
-                take_profit_price = round(current_price * 1.05, 2)
+            # Fetch the real-time latest trade price as base_price to prevent validation failure due to price drift.
+            try:
+                base_price = alpaca_client.get_latest_price(symbol)
+                logger.info(f"Fetched real-time latest price for {symbol} as base_price: ${base_price:.2f} (originally ${current_price:.2f})")
+            except Exception as price_err:
+                logger.warning(f"Could not fetch real-time price: {price_err}. Falling back to cached current_price: ${current_price:.2f}")
+                base_price = float(current_price)
+            
+            # Since the entry base_price might have changed, we should recalculate TP/SL targets 
+            # to preserve the relative distance (percentage offsets) intended by the Strategy Brain.
+            cached_base = float(current_price) if current_price > 0 else base_price
+            
+            # Calculate original target percent offsets if they were provided
+            if take_profit_price:
+                tp_pct = float(take_profit_price) / cached_base
+                take_profit_price = round(base_price * tp_pct, 2)
+            else:
+                take_profit_price = round(base_price * 1.05, 2)
                 logger.info(f"Applying default 5% Take-Profit fallback target at ${take_profit_price:.2f}.")
+
+            if stop_loss_price:
+                sl_pct = float(stop_loss_price) / cached_base
+                stop_loss_price = round(base_price * sl_pct, 2)
             else:
-                take_profit_price = round(float(take_profit_price), 2)
-                
-            if not stop_loss_price:
-                stop_loss_price = round(current_price * 0.97, 2)
+                stop_loss_price = round(base_price * 0.97, 2)
                 logger.info(f"Applying default 3% Stop-Loss fallback target at ${stop_loss_price:.2f}.")
-            else:
-                stop_loss_price = round(float(stop_loss_price), 2)
-                
+
+            min_allowed_tp = round(base_price + 0.05, 2)
+            if take_profit_price < min_allowed_tp:
+                logger.info(f"Take-Profit price ${take_profit_price:.2f} is too close to entry or below entry. Raising to ${min_allowed_tp:.2f} to satisfy Alpaca validation with a safety buffer.")
+                take_profit_price = min_allowed_tp
+
             # Safeguard: Alpaca requires stop_loss.stop_price <= base_price - 0.01 for equities
             # We use a 0.5% or 5-cent buffer (whichever is more conservative) to handle live market spread fluctuations
-            max_allowed_stop = round(min(current_price * 0.995, current_price - 0.05), 2)
+            max_allowed_stop = round(min(base_price * 0.995, base_price - 0.05), 2)
             if stop_loss_price > max_allowed_stop:
                 logger.info(f"Stop-Loss price ${stop_loss_price:.2f} is too close to entry or above entry. Capping at ${max_allowed_stop:.2f} to satisfy Alpaca validation with a safety buffer.")
                 stop_loss_price = max_allowed_stop

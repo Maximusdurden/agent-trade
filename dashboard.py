@@ -97,12 +97,26 @@ def status_cache_worker():
             positions = {}
             is_mock = True
 
-            # 1. Fetch Alpaca Account State with grace
+            # 1. Fetch Alpaca Account State and Positions with extreme resilience
             try:
                 client = AlpacaClient()
-                account = client.get_account_state()
-                positions = client.get_positions()
                 is_mock = client.is_mock
+                
+                # Fetch positions independently
+                try:
+                    positions = client.get_positions()
+                except Exception as pos_err:
+                    print(f"[Dashboard Server] Failed to fetch positions: {pos_err}", file=sys.stderr)
+                    positions = {}
+
+                # Fetch account state independently
+                try:
+                    account = client.get_account_state()
+                except Exception as acc_err:
+                    print(f"[Dashboard Server] Failed to fetch account state: {acc_err}", file=sys.stderr)
+                    account = {}
+                    # Force fallback of account metrics to DB history if account state fails
+                    is_mock = True
             except Exception as alpaca_err:
                 print(f"[Dashboard Server] Gracefully handled Alpaca Client initialization/query failure: {alpaca_err}", file=sys.stderr)
                 is_mock = True  # Fallback to mock mode
