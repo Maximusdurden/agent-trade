@@ -5,9 +5,9 @@ import argparse
 import sys
 from datetime import datetime
 
-import config
-import database
-from alpaca_client import AlpacaClient
+from core import config
+from core import database
+from core.alpaca_client import AlpacaClient
 
 try:
     from google import genai
@@ -25,7 +25,7 @@ logging.basicConfig(
         logging.FileHandler(config.LOG_FILE)
     ]
 )
-import logger_setup
+from core import logger_setup
 logger_setup.setup_logging(app_name="agent-trade", env="production")
 logger = logging.getLogger("MetaStrategist")
 

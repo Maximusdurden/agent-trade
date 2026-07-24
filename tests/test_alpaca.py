@@ -1,11 +1,12 @@
 import sys
 import os
 
-# Add parent directory of library (Z:\python\projects) to python path
+# Add parent directory of library (Z:\python\projects) and project root to python path
 sys.path.insert(0, r"Z:\python\projects")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import config
-from alpaca_client import AlpacaClient
+from core import config
+from core.alpaca_client import AlpacaClient
 
 def test():
     print("Initializing AlpacaClient...")

@@ -1,7 +1,7 @@
 import logging
 import pandas as pd
 import numpy as np
-from alpaca_client import AlpacaClient
+from core.alpaca_client import AlpacaClient
 
 logger = logging.getLogger("DataProvider")
 

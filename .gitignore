@@ -42,6 +42,12 @@ trading_agent.db
 trading.log
 *.log
 
+# Cache & Temp files
+daily_cash_reconstructed.json
+detailed_search_results.json
+recent_jira_details.json
+portfolio_dod_balances.csv
+
 # IDEs and editors
 .vscode/
 .idea/

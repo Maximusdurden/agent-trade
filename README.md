@@ -1,4 +1,4 @@
-# Autonomous Alpaca AI Trading Agent 📈🤖
+# Autonomous Alpaca AI Trading Agent
 
 An autonomous, self-contained AI-powered paper trading agent built to trade stock indices (like **SPY** or **QQQ**) using the official **Alpaca API** and **Google Gemini**.
 
@@ -6,7 +6,7 @@ It includes a native, zero-setup **Mock Mode** fallback so you can try out the t
 
 ---
 
-## ✨ Features
+## Features
 
 - **Modular Architecture**: Separate layers for Alpaca integration, data provider, guardrails, LLM brain, and database tracking.
 - **Mock Fallback**: Runs automatically in Mock Mode if API keys or dependencies are missing, allowing instant testing.
@@ -17,25 +17,46 @@ It includes a native, zero-setup **Mock Mode** fallback so you can try out the t
 
 ---
 
-## 📁 File Structure
+## File Structure
 
 ```text
 agent-trade/
 ├── .env                  # Private credentials (git-ignored)
 ├── .env.template         # Placeholder file for environment variables
+├── .gitignore            # Git ignore definitions
+├── .agyrule              # Developer agent rule guidelines
 ├── requirements.txt      # Python dependencies
-├── config.py             # Loads configurations and sets safety values
-├── database.py           # SQLite database schemas and logging utilities
-├── alpaca_client.py      # Alpaca API interface (and Mock simulation fallback)
-├── data_provider.py      # Historical candle fetcher & indicator calculator
-├── guardrails.py         # Deterministic safety risk checker and trade sizer
-├── trading_brain.py      # Formulates prompts and requests Gemini AI structured decisions
-└── runner.py             # Orchestrator script to run trading ticks
+├── runner.py             # Core orchestrator and entry point for trading cycles
+│
+├── core/                 # Core Trading Engine and LLM Brain
+│   ├── config.py         # Loads configurations and sets safety values
+│   ├── database.py       # SQLite database schemas and logging utilities
+│   ├── alpaca_client.py  # Alpaca API interface (with offline Mock fallback)
+│   ├── data_provider.py  # Historical candle fetcher & technical indicator engine
+│   ├── guardrails.py     # Deterministic safety risk checker and trade sizer
+│   ├── trading_brain.py  # Formulates prompts and requests Gemini AI structured decisions
+│   ├── strategist.py     # Generates daily trading guidelines using Gemini
+│   └── logger_setup.py   # Application-wide logger configuration
+│
+├── dashboard/            # Web Monitoring and Visualization
+│   └── dashboard.py      # Streamlit-based monitoring dashboard
+│
+├── deploy/               # Deployment Automation
+│   └── create_task.ps1   # PowerShell Windows Scheduled Task registrar
+│
+├── tools/                # Administrative Utilities
+│   └── get_correct_balances.py  # Alpaca cash ledger & balance backfill tool
+│
+└── tests/                # Code Quality and Sanity Verification Tests
+    ├── test_alpaca.py    # Alpaca connectivity test script
+    ├── test_db.py        # Database query verification script
+    ├── test_fetch.py     # Dashboard HTTP status check script
+    └── test_gemini.py    # Gemini LLM models diagnostic script
 ```
 
 ---
 
-## 🚀 Quick Start Guide
+## Quick Start Guide
 
 ### 1. Set Up Environment
 Create a Python virtual environment and install the required dependencies:
@@ -109,7 +130,7 @@ python runner.py --loop
 
 ---
 
-## 🔒 Safety & Risk Guardrails
+## Safety and Risk Guardrails
 
 To prevent the LLM from making erratic or high-risk trading decisions, the deterministic `guardrails.py` enforces these rules:
 * **Max Allocation Size**: No single trade value can exceed **10% of total portfolio equity**. If the LLM requests more, the guardrails automatically **scale down** the share quantity to the maximum allowed safe value instead of failing.
@@ -119,7 +140,7 @@ To prevent the LLM from making erratic or high-risk trading decisions, the deter
 
 ---
 
-## 📊 Database Auditing
+## Database Auditing
 
 All logs are stored in `trading_agent.db`. You can view them using any SQLite viewer.
 * **`decisions`**: Stores every single tick analysis: the calculated RSI/MACD indicators at that moment, the portfolio cash/equity balance, the raw LLM thought process, proposed action, and whether it was approved or rejected by guardrails.

@@ -19,8 +19,8 @@ if GENAI_AVAILABLE:
         take_profit_price: float | None = Field(default=None, description="Propose a dynamic take-profit target price for BUY actions on equities/non-crypto assets based on Fibonacci or psychological levels; null otherwise.")
         stop_loss_price: float | None = Field(default=None, description="Propose a dynamic stop-loss price for BUY actions on equities/non-crypto assets based on Fibonacci or psychological levels; null otherwise.")
 
-import config
-import database
+from core import config
+from core import database
 
 logger = logging.getLogger("TradingBrain")
 

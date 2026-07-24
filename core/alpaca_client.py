@@ -22,7 +22,7 @@ try:
 except ImportError:
     NEWS_AVAILABLE = False
 
-import config
+from core import config
 
 logger = logging.getLogger("AlpacaClient")
 

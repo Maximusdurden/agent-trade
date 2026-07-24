@@ -1,5 +1,5 @@
 import logging
-import config
+from core import config
 from datetime import datetime
 
 logger = logging.getLogger("Guardrails")
@@ -86,7 +86,7 @@ class RiskGuardrails:
 
         # 3c. Check Anti-Whipsaw Holding Period (4 hours)
         try:
-            import database
+            from core import database
             recent_trades = database.get_recent_trades(limit=10)
             last_trade = None
             for t in recent_trades:

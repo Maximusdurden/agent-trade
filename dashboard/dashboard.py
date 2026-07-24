@@ -9,12 +9,12 @@ import threading
 import time
 from datetime import datetime
 
-# Add current folder to path to ensure local imports work
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+# Add parent folder to path to ensure root and core package imports work
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import config
-import database
-from alpaca_client import AlpacaClient
+from core import config
+from core import database
+from core.alpaca_client import AlpacaClient
 
 try:
     from google import genai

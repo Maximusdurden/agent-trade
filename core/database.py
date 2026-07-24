@@ -2,7 +2,7 @@ import sqlite3
 import json
 from datetime import datetime
 from collections import defaultdict
-from config import DATABASE_PATH
+from core.config import DATABASE_PATH
 
 def get_db_connection():
     """Returns a connection to the SQLite database with row factory enabled."""

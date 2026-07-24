@@ -1,7 +1,12 @@
 import os
+import sys
 import requests
 import json
-import config
+
+# Add parent folder to path to ensure root and core package imports work
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core import config
 import pandas as pd
 from datetime import datetime
 import pytz

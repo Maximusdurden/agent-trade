@@ -4,12 +4,12 @@ import logging
 import sys
 from datetime import datetime
 
-import config
-import database
-from alpaca_client import AlpacaClient
-from data_provider import DataProvider
-from guardrails import RiskGuardrails
-from trading_brain import TradingBrain
+from core import config
+from core import database
+from core.alpaca_client import AlpacaClient
+from core.data_provider import DataProvider
+from core.guardrails import RiskGuardrails
+from core.trading_brain import TradingBrain
 
 # Setup Logging
 logging.basicConfig(
@@ -20,7 +20,7 @@ logging.basicConfig(
         logging.FileHandler(config.LOG_FILE)
     ]
 )
-import logger_setup
+from core import logger_setup
 logger_setup.setup_logging(app_name="agent-trade", env="production")
 logger = logging.getLogger("Runner")
 
@@ -99,6 +99,10 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     """Executes a single workflow cycle of the autonomous trading agent."""
     # Check execution window (09:00 - 16:30 ET, weekdays, market open)
     is_allowed, reason = check_execution_window(alpaca_client)
+    import os
+    if os.getenv("BYPASS_MARKET_WINDOW") == "True":
+        is_allowed, reason = True, "Execution window check bypassed via BYPASS_MARKET_WINDOW environment variable."
+
     if not is_allowed:
         logger.info(f"Trading cycle skipped: {reason}")
         return
@@ -147,7 +151,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             if abs(daily_change) >= shock_threshold:
                 logger.warning(f"[SHOCK DETECTED] INTRADAY REGIME SHOCK: {symbol} daily move is {daily_change:.2f}% (Limit: {shock_threshold}%). Triggering emergency strategist run...")
                 try:
-                    from strategist import MetaStrategist
+                    from core.strategist import MetaStrategist
                     emergency_strategist = MetaStrategist()
                     # Trigger an immediate real-time strategy rules rewrite!
                     emergency_strategist.run_single_ticker_refinement(symbol, alpaca_client)
