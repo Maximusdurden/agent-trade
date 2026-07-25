@@ -130,13 +130,51 @@ class AlpacaClient:
         try:
             positions = self.trading_client.get_all_positions()
             positions_dict = {}
+
+            def get_str(obj, attr, default=""):
+                val = getattr(obj, attr, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(attr)
+                return str(val).strip() if val is not None else default
+
+            def get_float(obj, attr, default=None):
+                val = getattr(obj, attr, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(attr)
+                if val is None:
+                    return default
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return default
+
             for pos in positions:
-                positions_dict[pos.symbol] = {
-                    "qty": float(pos.qty),
-                    "qty_available": float(pos.qty_available) if hasattr(pos, "qty_available") else float(pos.qty),
-                    "market_value": float(pos.market_value),
-                    "avg_entry_price": float(pos.avg_entry_price),
-                    "unrealized_pnl": float(pos.unrealized_pl)
+                symbol = get_str(pos, "symbol").upper()
+                if not symbol:
+                    continue
+
+                # Map Alpaca's slashless crypto symbol (e.g. "SOLUSD") back to standard universe representation (e.g. "SOL/USD")
+                trading_universe = getattr(config, "TRADING_UNIVERSE", [])
+                for u_symbol in trading_universe:
+                    if "/" in u_symbol and u_symbol.replace("/", "").upper() == symbol:
+                        symbol = u_symbol
+                        break
+                else:
+                    # If not found in config.TRADING_UNIVERSE, but matches crypto pattern (e.g. ends with USD and >= 6 chars)
+                    if symbol.endswith("USD") and len(symbol) >= 6 and "/" not in symbol:
+                        symbol = f"{symbol[:-3]}/USD"
+
+                qty = get_float(pos, "qty", 0.0)
+                qty_available = get_float(pos, "qty_available", None)
+                if qty_available is None:
+                    qty_available = qty
+
+                positions_dict[symbol] = {
+                    "qty": qty,
+                    "qty_available": qty_available,
+                    "market_value": get_float(pos, "market_value", 0.0),
+                    "avg_entry_price": get_float(pos, "avg_entry_price", 0.0),
+                    "unrealized_pnl": get_float(pos, "unrealized_pl", 0.0)
                 }
             return positions_dict
         except Exception as e:
