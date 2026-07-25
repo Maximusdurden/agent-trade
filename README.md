@@ -187,3 +187,29 @@ If you prefer to configure it manually:
 > [!IMPORTANT]
 > When setting environment variables via `cmd.exe /c`, ensure there are **no spaces** around the `&&` separator (e.g., `BYPASS_MARKET_WINDOW=True&&Z:\python\...`). Otherwise, Windows will append a trailing space to the variable value, preventing Python from correctly reading it!
 
+---
+
+## 🚀 Upcoming Sprint Enhancements & Roadmap
+
+We are currently executing an optimization sprint alongside our subagents to introduce advanced quant capabilities, broaden our market reach, and establish automated reporting. Progress is tracked via [sprint_plan.md](sprint_plan.md).
+
+### 1. Broadened Universe & Batch Processing
+We are transitioning `agent-trade` from a small static list of 10 tickers to a scalable **Screener Candidate Pool of 50-100 high-liquidity stocks and crypto**. To do this without hitting Alpaca API rate limits, we are implementing batch historical data fetching and high-speed group-by indicator computation in Pandas.
+
+### 2. Autonomous Dynamic AI Screener
+A new multi-stage screening pipeline (`core/screener.py`) will automatically execute at the beginning of each cycle to select the top 3-5 candidates for the active watchlist:
+- **Liquidity filtering**: Filters out illiquid assets.
+- **Technical scoring**: Ranks companies based on Mean Reversion (Bollinger Bands/RSI) and Momentum (SMA/MACD) setups.
+- **SQLite Performance Feedback Loop**: Queries past trade outcomes to apply a booster (`1.2x`) for tickers with win rates $>60\%$, or a soft penalty (`0.7x`) for tickers with win rates $<40\%$.
+
+### 3. Intraday VWAP Indicators
+We are adding Volume Weighted Average Price (VWAP) and VWAP standard deviation bands as core technical indicators to enable:
+- **Intraday Support & Resistance**: Finding key confluences for entry.
+- **Mean Reversion boundaries**: Identifying overbought and oversold thresholds.
+- **Execution Quality tracking**: Verifying we buy below VWAP and sell above VWAP.
+
+### 4. End-of-Day Discord Reports
+An independent command-line interface `--eod-report` will be executed once daily as a Scheduled Task at **16:35 ET** (weekdays) to deliver Slack-style Discord performance alerts:
+- **Message A (Daily Summary)**: Color-coded embed reporting daily buys, sells, realized PnL, and net equity shifts (Green for gain, Red for loss).
+- **Message B (Detailed Breakdown)**: Chronological table of tickers traded and individual PnL outcomes for the day.
+
