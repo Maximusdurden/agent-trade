@@ -135,7 +135,18 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
 
     # 3. Fetch indicators and market state for the trading universe
     market_states = []
-    for symbol in config.TRADING_UNIVERSE:
+    
+    # If the US equity market is closed or outside hours, filter the universe to crypto-only
+    actual_market_open, _ = check_execution_window(alpaca_client)
+    filtered_universe = config.TRADING_UNIVERSE
+    if not actual_market_open:
+        filtered_universe = [
+            symbol for symbol in config.TRADING_UNIVERSE 
+            if "/" in symbol or "USD" in symbol or "SOL" in symbol
+        ]
+        logger.info(f"US Equity Market is closed/outside hours. Filtering trading universe to CRYPTO ONLY: {filtered_universe}")
+        
+    for symbol in filtered_universe:
         logger.info(f"Fetching market data and indicators for {symbol}...")
         state = data_provider.get_market_state(symbol)
         if state:

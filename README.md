@@ -146,3 +146,44 @@ All logs are stored in `trading_agent.db`. You can view them using any SQLite vi
 * **`decisions`**: Stores every single tick analysis: the calculated RSI/MACD indicators at that moment, the portfolio cash/equity balance, the raw LLM thought process, proposed action, and whether it was approved or rejected by guardrails.
 * **`trades`**: Stores actual executions with Alpaca order IDs, filled average price, timestamps, and order status.
 * **`portfolio_history`**: Tracks equity, cash, and PnL trends over time to construct charts.
+
+---
+
+## Windows Scheduled Task Deployment (Production)
+
+To run the agent-trade system continuously in production without keeping a terminal open, you can deploy it as a Windows Scheduled Task. 
+
+An automated registrar script is provided in [deploy/create_task.ps1](file:///Z:/python/projects/agent-trade/deploy/create_task.ps1) that registers a task named **`AgentTradeRunner`**.
+
+### How the task operates:
+- **Interval:** Executes the trading cycle every **15 minutes, 24 hours a day, 7 days a week**.
+- **Weekday Behavior:** Trades both **stocks/ETFs** and **cryptocurrency** during normal market hours (09:00 - 16:30 ET).
+- **Off-Hours & Weekend Behavior:** Automatically detects that the US equity market is closed, filters the trading universe to **crypto-only** (`SOL/USD`), and safely continues trading crypto around the clock without attempting off-hours stock trades.
+
+### Automatic Setup (Recommended)
+
+1. Open PowerShell as an **Administrator**.
+2. Run the deployment script:
+   ```powershell
+   Set-ExecutionPolicy Bypass -Scope Process -Force
+   .\deploy\create_task.ps1
+   ```
+3. To manually trigger a run right away to test it:
+   ```powershell
+   Start-ScheduledTask -TaskName "AgentTradeRunner"
+   ```
+
+### Manual Setup via Task Scheduler GUI
+
+If you prefer to configure it manually:
+1. Open **Task Scheduler** (`taskschd.msc`).
+2. Click **Create Basic Task...** on the right side.
+3. Set **Triggers** to **Weekly**, select all days of the week, and set it to repeat every 15 minutes indefinitely.
+4. Set **Action** to **Start a program**:
+   - **Program/script:** `cmd.exe`
+   - **Arguments:** `/c "set BYPASS_MARKET_WINDOW=True&&Z:\python\projects\agent-trade\venv\Scripts\python.exe Z:\python\projects\agent-trade\runner.py --once"`
+   - **Start in:** `Z:\python\projects\agent-trade`
+   
+> [!IMPORTANT]
+> When setting environment variables via `cmd.exe /c`, ensure there are **no spaces** around the `&&` separator (e.g., `BYPASS_MARKET_WINDOW=True&&Z:\python\...`). Otherwise, Windows will append a trailing space to the variable value, preventing Python from correctly reading it!
+
