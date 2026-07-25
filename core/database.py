@@ -69,6 +69,15 @@ def init_db():
             )
         """)
         
+        # 5. Watchlist History Table (Autonomous Screener logs)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                watchlist TEXT NOT NULL -- JSON representation of selected tickers
+            )
+        """)
+        
         conn.commit()
 
 def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process: str,
@@ -390,6 +399,20 @@ def get_daily_performance_breakdown(limit: int = 15) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error computing daily performance: {e}"
+
+def log_watchlist(symbols: list[str]) -> int:
+    """Logs the chosen watchlist to the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO watchlist_history (timestamp, watchlist)
+            VALUES (?, ?)
+        """, (
+            datetime.utcnow().isoformat(),
+            json.dumps(symbols)
+        ))
+        conn.commit()
+        return cursor.lastrowid
 
 # Auto-initialize database on import so the tables exist right away
 init_db()

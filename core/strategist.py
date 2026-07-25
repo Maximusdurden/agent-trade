@@ -200,7 +200,7 @@ DIRECTIONS:
    - If historical win rate is low (<50%) or max drawdown is high (>15%), design significantly more conservative rules with tighter, safer conditional thresholds to avoid over-allocating on speculative moves.
    - If our historical realized profit is negative, suggest smaller starter positions and require stronger support confirmations (e.g. confluences of Fibonacci support and psychological round numbers) before triggers.
    - Ensure the execution agent strictly avoids repeating previous errors or whipsaws.
-5. Write a single, highly refined paragraph of execution instructions. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" THRESHOLD for risk control (e.g. "If SPY breaks below $740, halt all buying immediately" or "If SOL drops below $75, exit 50% of positions and wait"). This is a deterministic condition that the tick loop brain can evaluate dynamically. Be extremely specific.
+5. Write a single, highly refined paragraph of execution instructions. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" THRESHOLD for risk control based on price, intraday VWAP, or vwap_dist_pct (e.g. "If SPY breaks below $740, halt all buying immediately", "If QQQ price stretches >= 2% above its VWAP (vwap_dist_pct >= 2.0), sell 50% to lock in gains", or "If SOL drops below $75, exit 50% of positions and wait"). This is a deterministic condition that the tick loop brain can evaluate dynamically. Be extremely specific.
 6. If the ticker is Solana (SOL/USD), keep in mind it is a 24/7 crypto asset with higher volatility and wider swings than index stocks like SPY/QQQ. Suggest rules with slightly wider tolerance thresholds.
 
 OUTPUT FORMAT:

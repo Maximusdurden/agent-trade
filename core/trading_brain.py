@@ -164,6 +164,12 @@ Ticker: {symbol}
 - MACD Histogram: {ind.get('macd_hist')}
 - Bollinger Upper Band: ${ind.get('bollinger_upper')}
 - Bollinger Lower Band: ${ind.get('bollinger_lower')}
+- Intraday VWAP: ${ind.get('vwap')}
+- VWAP Upper Band (+1σ): ${ind.get('vwap_upper_1')}
+- VWAP Lower Band (-1σ): ${ind.get('vwap_lower_1')}
+- VWAP Upper Band (+2σ): ${ind.get('vwap_upper_2')}
+- VWAP Lower Band (-2σ): ${ind.get('vwap_lower_2')}
+- Price Distance from VWAP: {ind.get('vwap_dist_pct')}%
 - ADVANCED PRICE ANCHORS:
   - Fibonacci Retracement Levels: {fib_str}
   - Psychological Levels: {psy_str}
@@ -190,7 +196,7 @@ ROLE:
 You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate a single high-conviction trade choice (BUY, SELL, or HOLD) that yields a profitable and stable trading strategy.
 
 DIRECTIONS:
-1. Analyze the technical indicators (RSI, Moving Averages, MACD, Bollinger Bands) to judge trends, support/resistance, overbought/oversold levels.
+1. Analyze the technical indicators (RSI, Moving Averages, MACD, Bollinger Bands, and intraday VWAP with standard deviation ±1σ and ±2σ bands) to judge trends, support/resistance, and overbought/oversold levels. Target buying below VWAP and selling above it, flagging standard deviation stretches of >= ±2σ as highly overextended mean-reversion setups.
 2. Observe Advanced Price Anchors (Fibonacci retracements, Psychological levels, Support/Resistance Swing zones) to find key pivot levels. Look for confluences where multiple anchors line up.
 3. Evaluate Recent News and Market Events for underlying sentiment. Bullish news should bolster buy conviction; bearish news or market distress should warrant extreme safety or sell execution.
 4. Scale your trade size (quantity) dynamically based on conviction and indicators:

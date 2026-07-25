@@ -20,9 +20,17 @@ else:
     ALPACA_BASE_URL = "https://api.alpaca.markets"
 
 # LLM Configurations
+# Default provider can be 'gemini'. Others can be added later.
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Discord Configurations
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+# Screener Configuration
+SCREENER_POOL_PATH = BASE_DIR / "screener_pool.json"
+
 
 # Trading Parameters
 # The list of tickers we allow our agent to trade. SPY, QQQ, and SOL/USD.

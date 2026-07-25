@@ -99,28 +99,28 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
 > **Goal**: Enable the agent to look at a broad universe of 50-100 companies by transitioning to batch API fetching and multi-index vectorized computations.
 
 #### **AT-1: Research and Implement Batch Fetching in AlpacaClient**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 3 Story Points
 *   **Description**: Refactor `AlpacaClient.get_historical_bars` to support passing a list of symbols instead of a single string. It must query Alpaca's batch endpoints and return a clean, sorted, multi-index pandas DataFrame.
 *   **Acceptance Criteria**:
-    - Supports both single-symbol and multi-symbol lists.
-    - Successfully routes stock symbols to `StockHistoricalDataClient` and crypto to `CryptoHistoricalDataClient`.
-    - Implements retry logic and exception handling for invalid symbols.
+106:     - Supports both single-symbol and multi-symbol lists.
+107:     - Successfully routes stock symbols to `StockHistoricalDataClient` and crypto to `CryptoHistoricalDataClient`.
+108:     - Implements retry logic and exception handling for invalid symbols.
 *   **Sub-tasks**:
-    - `[ ] AT-1.1 [DEV]`: Refactor `AlpacaClient` historical bars methods.
-    - `[ ] AT-1.2 [REVIEWER]`: Validate multi-index format and rate-limit compliance.
+    - `[DONE] AT-1.1 [DEV]`: Refactor `AlpacaClient` historical bars methods.
+    - `[DONE] AT-1.2 [REVIEWER]`: Validate multi-index format and rate-limit compliance.
 *   **Comments**:
 
 #### **AT-2: Batch Technical Indicator Computation in DataProvider**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 3 Story Points
 *   **Description**: Refactor `DataProvider` to process multi-index batch DataFrames. Implement group-by calculations for SMA, RSI, MACD, and Bollinger Bands.
 *   **Acceptance Criteria**:
     - Correctly partitions indicators by ticker.
     - Outputs identical indicator values as the sequential computation when tested on the same inputs.
 *   **Sub-tasks**:
-    - `[ ] AT-2.1 [DEV]`: Implement `groupby` transformations on DataProvider.
-    - `[ ] AT-2.2 [REVIEWER]`: Code-review vector logic and verify math accuracy.
+    - `[DONE] AT-2.1 [DEV]`: Implement `groupby` transformations on DataProvider.
+    - `[DONE] AT-2.2 [REVIEWER]`: Code-review vector logic and verify math accuracy.
 *   **Comments**:
 
 ---
@@ -129,7 +129,7 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
 > **Goal**: Develop an autonomous screening engine that runs at the beginning of each cycle to select the top 3-5 assets based on technical setups and SQLite historic
 
 #### **AT-3: Implement Technical Screening Engine**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 5 Story Points
 *   **Description**: Create `core/screener.py` to filter a broad list of 100 tickers sourced from `screener_pool.json`. Filter out low-liquidity assets (average daily volume $< \$10\text{M}$) and score the remaining tickers based on Mean Reversion (Bollinger/RSI) and Momentum (SMA/MACD) setups. Implement `tools/update_screener_pool.py` as a weekly task to automatically update `screener_pool.json` from Wikipedia index lists.
 *   **Acceptance Criteria**:
@@ -137,12 +137,12 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
     - `screener_pool.json` loads correctly and is written automatically via the update script.
     - Technical scoring output is sorted descending, returning the top N candidates.
 *   **Sub-tasks**:
-    - `[ ] AT-3.1 [DEV]`: Create `core/screener.py` technical scoring pipeline and Wikipedia index scraping helper.
-    - `[ ] AT-3.2 [REVIEWER]`: Verify quantitative mathematical weights and sorting.
+    - `[DONE] AT-3.1 [DEV]`: Create `core/screener.py` technical scoring pipeline and Wikipedia index scraping helper.
+    - `[DONE] AT-3.2 [REVIEWER]`: Verify quantitative mathematical weights and sorting.
 *   **Comments**:
  
 #### **AT-4: SQLite Feedback Loop & Watchlist Logging**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 5 Story Points
 *   **Description**: Connect `core/screener.py` to `trading_agent.db`. Extract historical trade outcomes per ticker. Multiply technical scores by a **Booster Factor** (e.g. `1.2x`) for win rates $> 60\%$ or a **Soft Penalty Factor** (e.g. `0.7x`) for win rates $< 40\%$. Log final chosen watchlist to a new database table `watchlist_history`.
 *   **Acceptance Criteria**:
@@ -151,20 +151,20 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
     - Correctly handles new tickers with zero trade history (defaults to neutral weight `1.0`).
     - Creates and migrates `watchlist_history` table automatically on start.
 *   **Sub-tasks**:
-    - `[ ] AT-4.1 [DEV]`: Code SQLite history lookup and soft penalty weight adjustments.
-    - `[ ] AT-4.2 [REVIEWER]`: Stress test database query locks and migrate schema safely.
+    - `[DONE] AT-4.1 [DEV]`: Code SQLite history lookup and soft penalty weight adjustments.
+    - `[DONE] AT-4.2 [REVIEWER]`: Stress test database query locks and migrate schema safely.
 *   **Comments**:
 
 #### **AT-5: Integrate Watchlist Screener into Runner Loop**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 3 Story Points
 *   **Description**: Integrate the screener into `runner.py`. In each 15-minute cycle, run the screener to pick the top 3-5 watchlist tickers, and pass *only* these tickers to the `TradingBrain` to formulate trading actions.
 *   **Acceptance Criteria**:
     - Runner successfully overrides static universe with screened watchlist.
     - Generates compact, focused prompts for Gemini, lowering token latency.
 *   **Sub-tasks**:
-    - `[ ] AT-5.1 [DEV]`: Update `runner.py` execution sequence.
-    - `[ ] AT-5.2 [REVIEWER]`: Conduct end-to-end dry-run tests in Mock Mode.
+    - `[DONE] AT-5.1 [DEV]`: Update `runner.py` execution sequence.
+    - `[DONE] AT-5.2 [REVIEWER]`: Conduct end-to-end dry-run tests in Mock Mode.
 *   **Comments**:
 
 ---
@@ -173,27 +173,27 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
 > **Goal**: Add VWAP as a high-conviction decision data point for support/resistance, mean reversion, and execution quality auditing.
 
 #### **AT-6: Add Dynamic Intraday VWAP Calculation to DataProvider**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 3 Story Points
 *   **Description**: Implement intraday resetting VWAP and VWAP Standard Deviation Bands in `DataProvider._add_technical_indicators`.
 *   **Acceptance Criteria**:
     - VWAP resets to current open typical price on the first bar of each calendar day.
     - Computes upper and lower standard deviation bands ($\pm 1\sigma$ and $\pm 2\sigma$).
 *   **Sub-tasks**:
-    - `[ ] AT-6.1 [DEV]`: Write dynamic daily rolling VWAP algorithm in Pandas.
-    - `[ ] AT-6.2 [REVIEWER]`: Verify calculation correctness using static unit test vectors.
+    - `[DONE] AT-6.1 [DEV]`: Write dynamic daily rolling VWAP algorithm in Pandas.
+    - `[DONE] AT-6.2 [REVIEWER]`: Verify calculation correctness using static unit test vectors.
 *   **Comments**:
 
 #### **AT-7: VWAP-Based Prompts & Strategist Integration**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 3 Story Points
 *   **Description**: Update `TradingBrain` prompt template and `MetaStrategist` guidelines to pass VWAP price distance indicators and establish rules based on VWAP pullbacks or deviations.
 *   **Acceptance Criteria**:
     - Prompt safely accepts and displays VWAP indicators.
     - LLM output structured JSON conforms to schema when parsing new indicators.
 *   **Sub-tasks**:
-    - `[ ] AT-7.1 [DEV]`: Update `TradingBrain` prompt context and Pydantic models.
-    - `[ ] AT-7.2 [REVIEWER]`: Audit LLM response schema parsing resilience.
+    - `[DONE] AT-7.1 [DEV]`: Update `TradingBrain` prompt context and Pydantic models.
+    - `[DONE] AT-7.2 [REVIEWER]`: Audit LLM response schema parsing resilience.
 *   **Comments**:
 
 ---
@@ -202,27 +202,27 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
 > **Goal**: Provide automated daily Slack-style Discord performance alerts to monitor the paper portfolio's success.
 
 #### **AT-8: Create Discord Notification Client**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 2 Story Points
 *   **Description**: Implement `core/discord_notifier.py` to transmit messages and rich color-coded embeds to the Discord webhook retrieved from `.env`.
 *   **Acceptance Criteria**:
     - Sends rich messages containing color codes (Green for PnL $> 0.0$, Red for PnL $\le 0.0$).
     - Gracefully catches connection errors without halting the parent application.
 *   **Sub-tasks**:
-    - `[ ] AT-8.1 [DEV]`: Build webhook client using `requests`.
-    - `[ ] AT-8.2 [REVIEWER]`: Validate embed layouts and check payload sizes.
+    - `[DONE] AT-8.1 [DEV]`: Build webhook client using `requests`.
+    - `[DONE] AT-8.2 [REVIEWER]`: Validate embed layouts and check payload sizes.
 *   **Comments**:
 
 #### **AT-9: Daily Performance Auditor & CLI Integration**
-*   **Status**: `[ ] TO DO`
+*   **Status**: `[DONE]`
 *   **Type**: Story | **Estimate**: 3 Story Points
 *   **Description**: Build a database query to calculate the daily total trade counts, tickers traded, individual trade PnLs, and overall net equity change. Integrate `--eod-report` command-line argument into `runner.py`.
 *   **Acceptance Criteria**:
     - Running `python runner.py --eod-report` compiles and sends the Discord notification.
     - Handles holidays and weekend schedules gracefully (no trades executed, sends empty report or holds dispatch).
 *   **Sub-tasks**:
-    - `[ ] AT-9.1 [DEV]`: Write daily performance summarizer and add CLI flag.
-    - `[ ] AT-9.2 [REVIEWER]`: Verify timezone alignments (Eastern Time) for daily closing balances.
+    - `[DONE] AT-9.1 [DEV]`: Write daily performance summarizer and add CLI flag.
+    - `[DONE] AT-9.2 [REVIEWER]`: Verify timezone alignments (Eastern Time) for daily closing balances.
 *   **Comments**:
 
 ---

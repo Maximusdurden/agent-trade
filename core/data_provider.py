@@ -74,6 +74,12 @@ class DataProvider:
                     "macd_hist": float(latest["macd_hist"]) if not pd.isna(latest["macd_hist"]) else None,
                     "bollinger_upper": float(latest["bollinger_upper"]) if not pd.isna(latest["bollinger_upper"]) else None,
                     "bollinger_lower": float(latest["bollinger_lower"]) if not pd.isna(latest["bollinger_lower"]) else None,
+                    "vwap": float(latest["vwap"]) if not pd.isna(latest["vwap"]) else None,
+                    "vwap_upper_1": float(latest["vwap_upper_1"]) if not pd.isna(latest["vwap_upper_1"]) else None,
+                    "vwap_lower_1": float(latest["vwap_lower_1"]) if not pd.isna(latest["vwap_lower_1"]) else None,
+                    "vwap_upper_2": float(latest["vwap_upper_2"]) if not pd.isna(latest["vwap_upper_2"]) else None,
+                    "vwap_lower_2": float(latest["vwap_lower_2"]) if not pd.isna(latest["vwap_lower_2"]) else None,
+                    "vwap_dist_pct": float(latest["vwap_dist_pct"]) if not pd.isna(latest["vwap_dist_pct"]) else None,
                 },
                 "advanced_pivots": pivots,
                 "news": news_data
@@ -86,7 +92,16 @@ class DataProvider:
 
     def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper to calculate standard technical indicators using Pandas/Numpy."""
+        if isinstance(df.index, pd.MultiIndex):
+            return df.groupby(level=0, group_keys=False).apply(self._add_technical_indicators_single)
+        else:
+            return self._add_technical_indicators_single(df)
+
+    def _add_technical_indicators_single(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Helper to calculate standard technical indicators for a single symbol."""
         df = df.copy()
+        if df.empty:
+            return df
         
         # 1. Simple Moving Averages (SMA)
         df["sma_20"] = df["close"].rolling(window=20).mean()
@@ -117,6 +132,27 @@ class DataProvider:
         std_20 = df["close"].rolling(window=20).std()
         df["bollinger_upper"] = df["bollinger_mid"] + (std_20 * 2)
         df["bollinger_lower"] = df["bollinger_mid"] - (std_20 * 2)
+
+        # 5. Dynamic Intraday VWAP and Bands (resetting daily)
+        df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
+        df["tp_vol"] = df["typical_price"] * df["volume"]
+        
+        dates = df.index.date if not isinstance(df.index, pd.MultiIndex) else df.index.get_level_values(1).date
+        
+        df["cum_tp_vol"] = df.groupby(dates)["tp_vol"].cumsum()
+        df["cum_vol"] = df.groupby(dates)["volume"].cumsum()
+        df["vwap"] = df["cum_tp_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
+        
+        df["tp_vwap_diff_sq_vol"] = ((df["typical_price"] - df["vwap"]) ** 2) * df["volume"]
+        df["cum_diff_sq_vol"] = df.groupby(dates)["tp_vwap_diff_sq_vol"].cumsum()
+        df["vwap_var"] = df["cum_diff_sq_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
+        df["vwap_std"] = np.sqrt(np.maximum(df["vwap_var"], 0))
+        
+        df["vwap_upper_1"] = df["vwap"] + df["vwap_std"]
+        df["vwap_lower_1"] = df["vwap"] - df["vwap_std"]
+        df["vwap_upper_2"] = df["vwap"] + (df["vwap_std"] * 2)
+        df["vwap_lower_2"] = df["vwap"] - (df["vwap_std"] * 2)
+        df["vwap_dist_pct"] = ((df["close"] - df["vwap"]) / np.where(df["vwap"] == 0, 0.00001, df["vwap"])) * 100
         
         return df
 

@@ -133,19 +133,27 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         logger.error(f"Error fetching positions: {e}. Proceeding with assumptions.")
         positions = {}
 
-    # 3. Fetch indicators and market state for the trading universe
-    market_states = []
-    
-    # If the US equity market is closed or outside hours, filter the universe to crypto-only
+    # 3. Fetch indicators and market state for the screened watchlist
     actual_market_open, _ = check_execution_window(alpaca_client)
-    filtered_universe = config.TRADING_UNIVERSE
+    
+    # Run the dynamic AI screener to select top candidates
+    try:
+        from core.screener import run_screener
+        screened_list = run_screener(alpaca_client, data_provider, watchlist_limit=5)
+        logger.info(f"Screener generated watchlist: {screened_list}")
+    except Exception as screener_err:
+        logger.error(f"Screener execution failed: {screener_err}. Falling back to static TRADING_UNIVERSE.")
+        screened_list = config.TRADING_UNIVERSE
+        
+    filtered_universe = screened_list
     if not actual_market_open:
         filtered_universe = [
-            symbol for symbol in config.TRADING_UNIVERSE 
+            symbol for symbol in screened_list 
             if "/" in symbol or "USD" in symbol or "SOL" in symbol
         ]
-        logger.info(f"US Equity Market is closed/outside hours. Filtering trading universe to CRYPTO ONLY: {filtered_universe}")
+        logger.info(f"US Equity Market is closed/outside hours. Filtering watchlist to CRYPTO ONLY: {filtered_universe}")
         
+    market_states = []
     for symbol in filtered_universe:
         logger.info(f"Fetching market data and indicators for {symbol}...")
         state = data_provider.get_market_state(symbol)
@@ -312,6 +320,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run a single trading cycle and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Perform all calculations, fetch data, query LLM but skip actual order placement.")
     parser.add_argument("--loop", action="store_true", help="Run continuously on the configured intervals.")
+    parser.add_argument("--eod-report", action="store_true", help="Fetch today's trading statistics and publish an EOD report to Discord.")
     args = parser.parse_args()
 
     # Validate configuration
@@ -324,11 +333,22 @@ def main():
     logger.info("Initializing trading agent system components...")
     alpaca_client = AlpacaClient()
     data_provider = DataProvider(alpaca_client)
+
+    if args.eod_report:
+        logger.info("Executing End-of-Day Performance Audit Report dispatch...")
+        from core.performance_auditor import send_eod_report
+        success = send_eod_report()
+        if success:
+            logger.info("EOD Report published successfully.")
+        else:
+            logger.error("Failed to publish EOD Report.")
+        sys.exit(0)
+
     brain = TradingBrain()
     guardrails = RiskGuardrails()
 
-    # If neither --once nor --loop is chosen, default to once for safety
-    if not args.once and not args.loop:
+    # If neither --once, --loop, nor --eod-report is chosen, default to once for safety
+    if not args.once and not args.loop and not args.eod_report:
         logger.info("No execution mode specified. Defaulting to a single dry-run cycle (--once --dry-run) for safety.")
         args.once = True
         args.dry_run = True

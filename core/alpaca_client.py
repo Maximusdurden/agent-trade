@@ -143,42 +143,60 @@ class AlpacaClient:
             logger.error(f"Error fetching positions: {e}")
             return {}
 
-    def get_historical_bars(self, symbol: str, limit: int = 100, timeframe_str: str = "day") -> pd.DataFrame:
-        """Fetches historical daily or intraday bar data for a ticker (automatically handles Stocks or Crypto)."""
-        symbol = symbol.upper()
+    def get_historical_bars(self, symbol, limit: int = 100, timeframe_str: str = "day") -> pd.DataFrame:
+        """Fetches historical daily or intraday bar data for a ticker or list of tickers (automatically handles Stocks or Crypto)."""
         timeframe_str = timeframe_str.lower()
         
+        # Check if symbol is list-like
+        is_list = isinstance(symbol, (list, tuple, set, pd.Index))
+        symbols_list = [sym.upper() for sym in (list(symbol) if is_list else [symbol])]
+        
+        if not symbols_list:
+            return pd.DataFrame()
+            
         if self.is_mock:
             # Generate dummy pandas dataframe with close prices
-            logger.info(f"Generating mock historical bars for {symbol} with timeframe {timeframe_str}.")
-            end_date = datetime.now()
-            
-            if timeframe_str == "day":
-                dates = [end_date - timedelta(days=i) for i in range(limit)][::-1]
-            else:
-                dates = [end_date - timedelta(minutes=15 * i) for i in range(limit)][::-1]
+            all_dfs = []
+            for sym in symbols_list:
+                logger.info(f"Generating mock historical bars for {sym} with timeframe {timeframe_str}.")
+                end_date = datetime.now()
                 
-            import numpy as np
-            
-            # Base price: Stock is around $400, Solana is around $140
-            base_price = 140.0 if "SOL" in symbol else 400.0
-            
-            closes = base_price + np.sin(np.linspace(0, 10, limit)) * (base_price * 0.05) + np.linspace(0, base_price * 0.05, limit)
-            highs = closes * 1.01
-            lows = closes * 0.99
-            opens = closes - (closes * 0.002)
-            volumes = np.random.randint(100000, 5000000, size=limit)
-            
-            df = pd.DataFrame({
-                "open": opens,
-                "high": highs,
-                "low": lows,
-                "close": closes,
-                "volume": volumes
-            }, index=dates)
-            df.index.name = "timestamp"
-            return df
-            
+                if timeframe_str == "day":
+                    dates = [end_date - timedelta(days=i) for i in range(limit)][::-1]
+                else:
+                    dates = [end_date - timedelta(minutes=15 * i) for i in range(limit)][::-1]
+                    
+                import numpy as np
+                
+                # Base price: Stock is around $400, Solana is around $140
+                base_price = 140.0 if "SOL" in sym else 400.0
+                
+                closes = base_price + np.sin(np.linspace(0, 10, limit)) * (base_price * 0.05) + np.linspace(0, base_price * 0.05, limit)
+                highs = closes * 1.01
+                lows = closes * 0.99
+                opens = closes - (closes * 0.002)
+                volumes = np.random.randint(100000, 5000000, size=limit)
+                
+                df = pd.DataFrame({
+                    "open": opens,
+                    "high": highs,
+                    "low": lows,
+                    "close": closes,
+                    "volume": volumes
+                }, index=dates)
+                df.index.name = "timestamp"
+                if is_list:
+                    df = df.reset_index()
+                    df["symbol"] = sym
+                    df = df.set_index(["symbol", "timestamp"])
+                all_dfs.append(df)
+                
+            if is_list:
+                combined = pd.concat(all_dfs).sort_index()
+                return combined
+            else:
+                return all_dfs[0]
+                
         # Determine TimeFrame object from string
         if timeframe_str == "day":
             tf = TimeFrame.Day
@@ -194,42 +212,104 @@ class AlpacaClient:
             tf = TimeFrame.Day
             day_multiplier = 2
         
-        # Check if symbol is cryptocurrency
-        is_crypto = "/" in symbol or "USD" in symbol
-        
-        try:
-            # Fetch last N days (making sure we cover weekends/holidays)
-            # Fetch double the limit in calendar days to guarantee enough trading days
-            start_time = datetime.now() - timedelta(days=limit * day_multiplier)
-            
-            if is_crypto:
-                request_params = CryptoBarsRequest(
-                    symbol_or_symbols=symbol,
-                    timeframe=tf,
-                    start=start_time,
-                    end=datetime.now()
-                )
-                bars = self.crypto_data_client.get_crypto_bars(request_params)
+        # Partition into stock and crypto symbols
+        stock_symbols = []
+        crypto_symbols = []
+        for sym in symbols_list:
+            if "/" in sym or "USD" in sym:
+                crypto_symbols.append(sym)
             else:
+                stock_symbols.append(sym)
+                
+        # Fetch last N days (making sure we cover weekends/holidays)
+        # Fetch double the limit in calendar days to guarantee enough trading days
+        start_time = datetime.now() - timedelta(days=limit * day_multiplier)
+        
+        def fetch_with_retry(client, request_params, fetch_func, max_retries=3):
+            for attempt in range(max_retries):
+                try:
+                    return fetch_func(request_params)
+                except Exception as e:
+                    logger.warning(f"Fetch attempt {attempt+1} failed: {e}")
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(1 * (attempt + 1))
+
+        stock_dfs = []
+        if stock_symbols:
+            try:
                 request_params = StockBarsRequest(
-                    symbol_or_symbols=symbol,
+                    symbol_or_symbols=stock_symbols,
                     timeframe=tf,
                     start=start_time,
                     end=datetime.now()
                 )
-                bars = self.data_client.get_stock_bars(request_params)
+                bars = fetch_with_retry(self.data_client, request_params, self.data_client.get_stock_bars)
+                if bars and bars.df is not None and not bars.df.empty:
+                    stock_dfs.append(bars.df)
+            except Exception as e:
+                logger.warning(f"Batch stock fetch failed for {stock_symbols}: {e}. Retrying symbols individually.")
+                for sym in stock_symbols:
+                    try:
+                        request_params = StockBarsRequest(
+                            symbol_or_symbols=sym,
+                            timeframe=tf,
+                            start=start_time,
+                            end=datetime.now()
+                        )
+                        bars = fetch_with_retry(self.data_client, request_params, self.data_client.get_stock_bars)
+                        if bars and bars.df is not None and not bars.df.empty:
+                            stock_dfs.append(bars.df)
+                    except Exception as sym_err:
+                        logger.error(f"Failed to fetch stock bars for {sym}: {sym_err}")
+
+        crypto_dfs = []
+        if crypto_symbols:
+            try:
+                request_params = CryptoBarsRequest(
+                    symbol_or_symbols=crypto_symbols,
+                    timeframe=tf,
+                    start=start_time,
+                    end=datetime.now()
+                )
+                bars = fetch_with_retry(self.crypto_data_client, request_params, self.crypto_data_client.get_crypto_bars)
+                if bars and bars.df is not None and not bars.df.empty:
+                    crypto_dfs.append(bars.df)
+            except Exception as e:
+                logger.warning(f"Batch crypto fetch failed for {crypto_symbols}: {e}. Retrying symbols individually.")
+                for sym in crypto_symbols:
+                    try:
+                        request_params = CryptoBarsRequest(
+                            symbol_or_symbols=sym,
+                            timeframe=tf,
+                            start=start_time,
+                            end=datetime.now()
+                        )
+                        bars = fetch_with_retry(self.crypto_data_client, request_params, self.crypto_data_client.get_crypto_bars)
+                        if bars and bars.df is not None and not bars.df.empty:
+                            crypto_dfs.append(bars.df)
+                    except Exception as sym_err:
+                        logger.error(f"Failed to fetch crypto bars for {sym}: {sym_err}")
+
+        all_dfs = stock_dfs + crypto_dfs
+        if not all_dfs:
+            return pd.DataFrame()
             
-            # Convert to pandas DataFrame
-            df = bars.df
-            # alpaca-py multi-index handles symbol. Reset index or select the symbol.
-            if isinstance(df.index, pd.MultiIndex):
-                df = df.xs(symbol)
-                
-            # Take the tail up to requested limit
-            return df.tail(limit)
-        except Exception as e:
-            logger.error(f"Error fetching historical bars for {symbol}: {e}")
-            raise
+        combined_df = pd.concat(all_dfs)
+        
+        if not is_list:
+            single_sym = symbols_list[0]
+            if isinstance(combined_df.index, pd.MultiIndex):
+                if single_sym in combined_df.index.levels[0]:
+                    combined_df = combined_df.xs(single_sym)
+                else:
+                    return pd.DataFrame()
+            return combined_df.tail(limit)
+        else:
+            # Ensure the combined_df is multi-indexed and apply tail limit per symbol
+            if isinstance(combined_df.index, pd.MultiIndex):
+                combined_df = combined_df.groupby(level=0, group_keys=False).apply(lambda x: x.tail(limit))
+            return combined_df
 
     def cancel_open_orders(self, symbol: str) -> None:
         """Cancels all open orders for a specific symbol."""
