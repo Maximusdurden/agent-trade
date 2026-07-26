@@ -1,0 +1,9 @@
+.git
+.gitignore
+.gemini
+venv/
+__pycache__/
+*.log
+*.db
+*.corrupted*
+tests/

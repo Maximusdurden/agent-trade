@@ -7,7 +7,7 @@ load_dotenv(override=True)
 
 # Project Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATABASE_PATH = BASE_DIR / "trading_agent.db"
+DATABASE_PATH = BASE_DIR / os.getenv("DATABASE_FILENAME", "trading_agent.db")
 
 # Alpaca Credentials & URLs
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
@@ -30,6 +30,11 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Screener Configuration
 SCREENER_POOL_PATH = BASE_DIR / "screener_pool.json"
+
+# Secure Dashboard Authentication Settings
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+SESSION_SALT = os.getenv("SESSION_SALT", "age_desk_secure_salt_change_me")
+
 
 
 # Trading Parameters

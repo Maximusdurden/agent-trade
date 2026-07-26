@@ -15,6 +15,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from core import config
 from core import database
 from core.alpaca_client import AlpacaClient
+from core.screener import load_screener_pool
 
 try:
     from google import genai
@@ -29,25 +30,72 @@ PORT = 8080
 LATEST_STATUS_CACHE = {}
 CACHE_LOCK = threading.Lock()
 
+def sync_database_from_gcs():
+    """
+    Downloads the latest trading_agent.db from Google Cloud Storage
+    to the local writeable /tmp/ folder if running inside a GCP Cloud Run environment.
+    """
+    gcs_bucket = os.getenv("GCS_BUCKET_NAME")
+    if not gcs_bucket:
+        # Not configured for GCS, assume local execution
+        return
+        
+    db_filename = os.getenv("DATABASE_FILENAME", "trading_agent.db")
+    # Verify we need to sync and that we are in a serverless environment (e.g. database path points to /tmp)
+    if "/tmp" not in db_filename:
+        return
+
+    # Check cache TTL (avoid downloading on every single HTTP asset request)
+    local_temp_db = db_filename
+    last_sync_key = "_gcs_last_sync_time"
+    now = time.time()
+    
+    with CACHE_LOCK:
+        last_sync = LATEST_STATUS_CACHE.get(last_sync_key, 0.0)
+        # Check if downloaded in the last 120 seconds (2 minutes)
+        if last_sync and (now - last_sync) < 120:
+            return
+
+    try:
+        from google.cloud import storage
+        print(f"[GCS Sync] Checking for database updates in gs://{gcs_bucket}...", flush=True)
+        client = storage.Client()
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob("trading_agent.db")
+        
+        # Download database to ephemeral directory
+        os.makedirs(os.path.dirname(local_temp_db), exist_ok=True)
+        blob.download_to_filename(local_temp_db)
+        
+        with CACHE_LOCK:
+            LATEST_STATUS_CACHE[last_sync_key] = now
+        print(f"[GCS Sync] Successfully synchronized {local_temp_db} from Cloud Storage.", flush=True)
+    except Exception as e:
+        print(f"[GCS Sync WARNING] Failed to sync database from GCS: {e}", file=sys.stderr)
+
 def get_portfolio_history():
     """Retrieves portfolio history from the SQLite database."""
     try:
-        with database.get_db_connection() as conn:
+        conn = database.get_db_connection()
+        try:
             cursor = conn.cursor()
             # Fetch the most recent 500 records (to keep chart performance snappy)
             cursor.execute("SELECT timestamp, equity, cash, unrealized_pnl FROM portfolio_history ORDER BY timestamp DESC LIMIT 500")
             rows = cursor.fetchall()
             history = [dict(row) for row in rows]
-            # Reverse so that chronological order is preserved for the Chart.js timeline (oldest to newest)
-            history.reverse()
+        finally:
+            conn.close() # Explicitly close SQLite connection securely
             
-            # Prevent co-mingling: if we have any active paper trading metrics (not exactly 100000.0),
-            # filter out the baseline fallback 100k data points.
-            has_real_data = any(h['equity'] != 100000.0 for h in history)
-            if has_real_data:
-                history = [h for h in history if h['equity'] != 100000.0]
-                
-            return history
+        # Reverse so that chronological order is preserved for the Chart.js timeline (oldest to newest)
+        history.reverse()
+        
+        # Prevent co-mingling: if we have any active paper trading metrics (not exactly 100000.0),
+        # filter out the baseline fallback 100k data points.
+        has_real_data = any(h['equity'] != 100000.0 for h in history)
+        if has_real_data:
+            history = [h for h in history if h['equity'] != 100000.0]
+            
+        return history
     except Exception as e:
         print(f"[Dashboard Server] Error fetching portfolio history: {e}", file=sys.stderr)
         return []
@@ -57,34 +105,54 @@ def get_ticker_history():
     import collections
     ticker_hist = collections.defaultdict(list)
     try:
-        with database.get_db_connection() as conn:
+        conn = database.get_db_connection()
+        try:
             cursor = conn.cursor()
             # Fetch the most recent 500 records to reconstruct positions curves
             cursor.execute("SELECT timestamp, portfolio_state FROM decisions ORDER BY timestamp DESC LIMIT 500")
             rows = cursor.fetchall()
-            # Reverse so that chronological order is preserved (oldest to newest)
-            rows = list(rows)
-            rows.reverse()
+        finally:
+            conn.close() # Explicitly close SQLite connection securely
             
-            for row in rows:
-                ts = row['timestamp']
-                p_state_str = row['portfolio_state']
-                if p_state_str:
-                    try:
-                        state_data = json.loads(p_state_str)
-                        positions = state_data.get('positions', {})
-                        for symbol, pos in positions.items():
-                            ticker_hist[symbol].append({
-                                "timestamp": ts,
-                                "equity": float(pos.get('market_value', 0.0)),
-                                "unrealized_pnl": float(pos.get('unrealized_pnl', 0.0)),
-                                "cash": 0.0
-                            })
-                    except Exception:
-                        pass
+        # Reverse so that chronological order is preserved (oldest to newest)
+        rows = list(rows)
+        rows.reverse()
+        
+        for row in rows:
+            ts = row['timestamp']
+            p_state_str = row['portfolio_state']
+            if p_state_str:
+                try:
+                    state_data = json.loads(p_state_str)
+                    positions = state_data.get('positions', {})
+                    for symbol, pos in positions.items():
+                        ticker_hist[symbol].append({
+                            "timestamp": ts,
+                            "equity": float(pos.get('market_value', 0.0)),
+                            "unrealized_pnl": float(pos.get('unrealized_pnl', 0.0)),
+                            "cash": 0.0
+                        })
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[Dashboard Server] Error extracting ticker history: {e}", file=sys.stderr)
     return ticker_hist
+
+def get_latest_watchlist():
+    """Retrieves the latest screened watchlist from the SQLite database."""
+    try:
+        conn = database.get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT watchlist FROM watchlist_history ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row["watchlist"])
+        finally:
+            conn.close() # Explicitly close SQLite connection securely
+    except Exception as e:
+        print(f"[Dashboard Server] Error fetching latest watchlist: {e}", file=sys.stderr)
+    return []
 
 def status_cache_worker():
     """Background thread that periodically fetches Alpaca status and SQLite data to update the global cache."""
@@ -92,6 +160,9 @@ def status_cache_worker():
     print("[Dashboard Server] Background status cache worker started.", flush=True)
     while True:
         try:
+            # Sync SQLite database if configured for Google Cloud Storage
+            sync_database_from_gcs()
+
             # Initialize default / fallback structures for Alpaca
             account = {}
             positions = {}
@@ -180,6 +251,8 @@ def status_cache_worker():
                 "dod_balances": dod_balances,
                 "logs": log_lines,
                 "trading_universe": config.TRADING_UNIVERSE,
+                "screener_pool": load_screener_pool(),
+                "latest_watchlist": get_latest_watchlist(),
                 "interval": config.TRADING_INTERVAL_MINUTES,
                 "is_mock": is_mock,
                 "is_paper": config.ALPACA_PAPER,
@@ -202,6 +275,8 @@ def status_cache_worker():
                         "ticker_history": {},
                         "logs": [f"[SERVER ERROR] Background cache failed to initialize: {e}"],
                         "trading_universe": config.TRADING_UNIVERSE,
+                        "screener_pool": [],
+                        "latest_watchlist": [],
                         "interval": config.TRADING_INTERVAL_MINUTES,
                         "is_mock": True,
                         "is_paper": config.ALPACA_PAPER,
@@ -244,20 +319,108 @@ HTML_CONTENT = """<!DOCTYPE html>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
-            --bg-base: #0a0d16;
-            --bg-surface: #101424;
-            --bg-surface-elevated: #161c33;
-            --border-subtle: rgba(255, 255, 255, 0.07);
-            --border-glow: rgba(0, 242, 254, 0.15);
-            --text-primary: #f3f4f6;
-            --text-secondary: #9ca3af;
-            --text-muted: #6b7280;
-            --color-teal: #00f2fe;
-            --color-blue: #0070f3;
-            --color-crimson: #ff0844;
-            --color-gold: #f6d365;
-            --color-green: #10b981;
-            --glass-gradient: linear-gradient(135deg, rgba(16, 20, 36, 0.7) 0%, rgba(10, 13, 22, 0.9) 100%);
+            /* P-1 Green Phosphor (Default theme variables) */
+            --crt-color: #33ff33;
+            --crt-color-rgb: 51, 255, 51;
+            --crt-color-dim: #008000;
+            --crt-bg: #030703;
+            --crt-surface: rgba(5, 12, 5, 0.85);
+            --crt-surface-elevated: rgba(10, 24, 10, 0.95);
+            --crt-border: rgba(51, 255, 51, 0.25);
+            --crt-glow: rgba(51, 255, 51, 0.12);
+            --crt-text-glow: 0 0 4px rgba(51, 255, 51, 0.55), 0 0 8px rgba(51, 255, 51, 0.25);
+            
+            --font-pixel: 'VT323', monospace;
+            --font-data: 'Share Tech Mono', monospace;
+
+            /* Tri-Phosphor Palette: Combining Green, Amber, Cyan inside Retro Console views */
+            --color-green: #33ff33;      /* P1 Green Phosphor for Holdings, Gains, Passes */
+            --color-crimson: #ffb000;    /* P3 Amber Phosphor for Warnings, Losses, Drawdowns */
+            --color-gold: #ffb000;       /* P3 Amber Phosphor for Intervals, Warnings, Screener Pool */
+            --color-teal: #00ffff;       /* P4 Cyan Phosphor for Focus, Primary, Headers */
+            --color-blue: #00ffff;       /* P4 Cyan Phosphor for Watchlists, Connections */
+
+            --text-primary: #33ff33;     /* Main text is Green by default */
+            --text-secondary: #008000;   /* Secondary is Dim Green */
+            --text-muted: rgba(51, 255, 51, 0.4);
+            --border-subtle: rgba(51, 255, 51, 0.15);
+            
+            /* Original Glass theme variables for fallback storage */
+            --modern-bg-base: #0a0d16;
+            --modern-bg-surface: #101424;
+            --modern-bg-surface-elevated: #161c33;
+            --modern-border-subtle: rgba(255, 255, 255, 0.07);
+            --modern-border-glow: rgba(0, 242, 254, 0.15);
+            --modern-text-primary: #f3f4f6;
+            --modern-text-secondary: #9ca3af;
+            --modern-text-muted: #6b7280;
+            --modern-color-teal: #00f2fe;
+            --modern-color-blue: #0070f3;
+            --modern-color-crimson: #ff0844;
+            --modern-color-gold: #f6d365;
+            --modern-color-green: #10b981;
+            --modern-glass-gradient: linear-gradient(135deg, rgba(16, 20, 36, 0.7) 0%, rgba(10, 13, 22, 0.9) 100%);
+        }
+
+        /* P-3 AMBER PHOSPHOR THEME */
+        body.theme-amber {
+            --crt-color: #ffb000;
+            --crt-color-rgb: 255, 176, 0;
+            --crt-color-dim: #996600;
+            --crt-bg: #060400;
+            --crt-surface: rgba(16, 10, 0, 0.85);
+            --crt-surface-elevated: rgba(30, 20, 0, 0.95);
+            --crt-border: rgba(255, 176, 0, 0.25);
+            --crt-glow: rgba(255, 176, 0, 0.12);
+            --crt-text-glow: 0 0 4px rgba(255, 176, 0, 0.55), 0 0 8px rgba(255, 176, 0, 0.25);
+
+            --text-primary: #ffb000;
+            --text-secondary: #996600;
+            --text-muted: rgba(255, 176, 0, 0.4);
+            --border-subtle: rgba(255, 176, 0, 0.15);
+        }
+
+        /* P-4 CYAN PHOSPHOR THEME */
+        body.theme-cyan {
+            --crt-color: #00ffff;
+            --crt-color-rgb: 0, 255, 255;
+            --crt-color-dim: #008b8b;
+            --crt-bg: #000606;
+            --crt-surface: rgba(0, 16, 16, 0.85);
+            --crt-surface-elevated: rgba(0, 30, 30, 0.95);
+            --crt-border: rgba(0, 255, 255, 0.25);
+            --crt-glow: rgba(0, 255, 255, 0.12);
+            --crt-text-glow: 0 0 4px rgba(0, 255, 255, 0.55), 0 0 8px rgba(0, 255, 255, 0.25);
+
+            --text-primary: #00ffff;
+            --text-secondary: #008b8b;
+            --text-muted: rgba(0, 255, 255, 0.4);
+            --border-subtle: rgba(0, 255, 255, 0.15);
+        }
+
+        /* MODERN GLASS FALLBACK THEME */
+        body.theme-modern {
+            --crt-color: var(--modern-text-primary);
+            --crt-color-dim: var(--modern-text-secondary);
+            --crt-bg: var(--modern-bg-base);
+            --crt-surface: var(--modern-bg-surface);
+            --crt-surface-elevated: var(--modern-bg-surface-elevated);
+            --crt-border: var(--modern-border-subtle);
+            --crt-glow: var(--modern-border-glow);
+            --crt-text-glow: none;
+            --font-pixel: 'Outfit', sans-serif;
+            --font-data: 'Inter', sans-serif;
+
+            --color-teal: var(--modern-color-teal);
+            --color-blue: var(--modern-color-blue);
+            --color-crimson: var(--modern-color-crimson);
+            --color-gold: var(--modern-color-gold);
+            --color-green: var(--modern-color-green);
+            
+            --text-primary: var(--modern-text-primary);
+            --text-secondary: var(--modern-text-secondary);
+            --text-muted: var(--modern-text-muted);
+            --border-subtle: var(--modern-border-subtle);
         }
 
         * {
@@ -267,91 +430,189 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-base);
-            color: var(--text-primary);
+            font-family: var(--font-data);
+            background-color: var(--crt-bg);
+            color: var(--crt-color);
             overflow-x: hidden;
-            background-image: 
-                radial-gradient(at 0% 0%, rgba(0, 112, 243, 0.1) 0px, transparent 50%),
-                radial-gradient(at 100% 100%, rgba(0, 242, 254, 0.1) 0px, transparent 50%);
-            background-attachment: fixed;
             min-height: 100vh;
+            transition: background-color 0.3s ease, color 0.3s ease;
         }
 
-        /* Custom Scrollbars */
+        /* CRT Screen Layout Wrapper */
+        #crt-frame {
+            position: relative;
+            width: 100%;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* CRT Effects Overlay Layers */
+        #crt-screen-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+            z-index: 999999;
+        }
+
+        #scanlines {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(
+                rgba(18, 16, 16, 0) 50%, 
+                rgba(0, 0, 0, 0.18) 50%
+            );
+            background-size: 100% 4px;
+        }
+
+        #noise {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0.035;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+            animation: noise-move 0.2s steps(4) infinite;
+        }
+
+        #vignette {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            box-shadow: inset 0 0 80px rgba(0, 0, 0, 0.95);
+            background: radial-gradient(circle, transparent 45%, rgba(0, 0, 0, 0.45) 100%);
+        }
+
+        @keyframes noise-move {
+            0%, 100% { background-position: 0 0; }
+            25% { background-position: 10px 15px; }
+            50% { background-position: -5px 10px; }
+            75% { background-position: -12px -5px; }
+        }
+
+        @keyframes crt-flicker {
+            0% { opacity: 0.985; }
+            50% { opacity: 1.0; }
+            100% { opacity: 0.988; }
+        }
+
+        /* Screen Flicker active only in retro modes when CRT effects are on */
+        body:not(.crt-off):not(.theme-modern) #crt-frame {
+            animation: crt-flicker 0.15s infinite;
+        }
+
+        /* CRT Disable overrides */
+        body.crt-off #scanlines,
+        body.crt-off #noise,
+        body.crt-off #vignette {
+            display: none !important;
+        }
+        body.crt-off * {
+            text-shadow: none !important;
+            box-shadow: none !important;
+            animation: none !important;
+        }
+
+        /* Scrollbars Customization */
         ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
+            width: 8px;
+            height: 8px;
         }
         ::-webkit-scrollbar-track {
-            background: rgba(0, 0, 0, 0.2);
+            background: rgba(0, 0, 0, 0.35);
+            border-left: 1px dashed var(--crt-border);
         }
         ::-webkit-scrollbar-thumb {
+            background: var(--crt-color-dim);
+            border: 1px solid var(--crt-color);
+        }
+        body.theme-modern ::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+            border-left: none;
+        }
+        body.theme-modern ::-webkit-scrollbar-thumb {
             background: rgba(255, 255, 255, 0.15);
+            border: none;
             border-radius: 4px;
         }
         ::-webkit-scrollbar-thumb:hover {
-            background: rgba(255, 255, 255, 0.3);
+            background: var(--crt-color);
+            box-shadow: var(--crt-text-glow);
         }
 
+        /* Layout Elements */
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 1.5rem 2rem;
-            border-bottom: 1px solid var(--border-subtle);
-            background: rgba(16, 20, 36, 0.5);
+            padding: 1.25rem 2rem;
+            border-bottom: 2px solid var(--crt-color);
+            background: var(--crt-surface);
             backdrop-filter: blur(12px);
             position: sticky;
             top: 0;
             z-index: 100;
+            transition: all 0.3s ease;
+        }
+
+        body.theme-modern header {
+            border-bottom: 1px solid var(--modern-border-subtle);
+            background: rgba(16, 20, 36, 0.5);
         }
 
         .brand-container {
             display: flex;
             align-items: center;
-            gap: 0.75rem;
-        }
-
-        .brand-logo {
-            width: 2.25rem;
-            height: 2.25rem;
-            background: linear-gradient(135deg, var(--color-teal), var(--color-blue));
-            border-radius: 0.5rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 0 15px rgba(0, 242, 254, 0.4);
-            animation: pulse-glow 3s infinite alternate;
+            gap: 0.85rem;
         }
 
         .brand-title {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.5rem;
+            font-family: var(--font-pixel);
+            font-size: 1.65rem;
             font-weight: 800;
-            background: linear-gradient(to right, #ffffff, #9ca3af);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            color: var(--crt-color);
+            text-shadow: var(--crt-text-glow);
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
         }
 
         .system-status {
             display: flex;
             align-items: center;
             gap: 0.5rem;
-            font-size: 0.825rem;
+            font-family: var(--font-pixel);
+            font-size: 0.9rem;
             font-weight: 600;
-            background: rgba(16, 20, 36, 0.8);
-            padding: 0.4rem 0.8rem;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 0.35rem 0.75rem;
+            border-radius: 2px;
+            border: 1px solid var(--crt-border);
+            box-shadow: var(--crt-text-glow);
+        }
+
+        body.theme-modern .system-status {
             border-radius: 2rem;
-            border: 1px solid var(--border-subtle);
+            background: rgba(16, 20, 36, 0.8);
+            border: 1px solid var(--modern-border-subtle);
+            box-shadow: none;
+            font-family: var(--font-data);
         }
 
         .status-dot {
             width: 0.5rem;
             height: 0.5rem;
             border-radius: 50%;
-            background-color: var(--color-green);
-            box-shadow: 0 0 8px var(--color-green);
+            background-color: var(--crt-color);
+            box-shadow: var(--crt-text-glow);
             animation: blink 1.5s infinite;
         }
 
@@ -362,6 +623,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             display: grid;
             grid-template-columns: 2fr 1fr;
             gap: 2rem;
+            width: 100%;
         }
 
         @media (max-width: 1100px) {
@@ -370,7 +632,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             }
         }
 
-        /* Metric Cards Grid */
+        /* Metrics Bar */
         .metrics-bar {
             grid-column: 1 / -1;
             display: grid;
@@ -385,29 +647,33 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .metric-card {
-            background: var(--glass-gradient);
-            border: 1px solid var(--border-subtle);
-            border-radius: 1rem;
+            background: var(--crt-surface);
+            border: 2px double var(--crt-color);
+            border-radius: 2px;
             padding: 1.25rem 1.5rem;
             position: relative;
             overflow: hidden;
+            transition: all 0.3s ease;
+            box-shadow: inset 0 0 10px rgba(var(--crt-color-rgb), 0.03);
+        }
+
+        body.theme-modern .metric-card {
+            background: var(--modern-glass-gradient);
+            border: 1px solid var(--modern-border-subtle);
+            border-radius: 1rem;
             backdrop-filter: blur(8px);
-            transition: transform 0.2s ease, border-color 0.2s ease;
+            box-shadow: none;
         }
 
         .metric-card:hover {
             transform: translateY(-2px);
-            border-color: var(--color-blue);
+            border-color: var(--crt-color);
+            box-shadow: 0 0 12px var(--crt-glow), inset 0 0 10px rgba(var(--crt-color-rgb), 0.05);
         }
 
-        .metric-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 2px;
-            background: linear-gradient(to right, transparent, rgba(255, 255, 255, 0.05), transparent);
+        body.theme-modern .metric-card:hover {
+            border-color: var(--modern-color-blue);
+            box-shadow: none;
         }
 
         .metric-label {
@@ -415,61 +681,112 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-weight: 600;
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            color: var(--text-secondary);
+            color: var(--crt-color);
+            opacity: 0.8;
             margin-bottom: 0.5rem;
             display: flex;
             align-items: center;
             gap: 0.35rem;
         }
 
+        body.theme-modern .metric-label {
+            color: var(--modern-text-secondary);
+            opacity: 1;
+        }
+
         .metric-value {
+            font-family: var(--font-pixel);
+            font-size: 2.15rem;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            color: var(--crt-color);
+            text-shadow: var(--crt-text-glow);
+        }
+
+        body.theme-modern .metric-value {
             font-family: 'Outfit', sans-serif;
             font-size: 1.85rem;
-            font-weight: 700;
             letter-spacing: -0.02em;
+            text-shadow: none;
+            color: var(--modern-text-primary);
         }
 
         .metric-sub {
-            font-size: 0.75rem;
-            color: var(--text-muted);
+            font-size: 0.725rem;
+            color: var(--crt-color-dim);
             margin-top: 0.35rem;
         }
 
-        .text-green { color: var(--color-green) !important; }
-        .text-crimson { color: var(--color-crimson) !important; }
-        .text-gold { color: var(--color-gold) !important; }
+        body.theme-modern .metric-sub {
+            color: var(--modern-text-muted);
+        }
 
-        /* General Card Section */
+        .text-green { color: var(--crt-color) !important; text-shadow: var(--crt-text-glow); }
+        .text-crimson { color: #f23d3d !important; text-shadow: 0 0 4px rgba(242, 61, 61, 0.4); }
+        .text-gold { color: #e6a100 !important; text-shadow: 0 0 4px rgba(230, 161, 0, 0.4); }
+
+        body.theme-modern .text-green { color: var(--modern-color-green) !important; text-shadow: none; }
+        body.theme-modern .text-crimson { color: var(--modern-color-crimson) !important; text-shadow: none; }
+        body.theme-modern .text-gold { color: var(--modern-color-gold) !important; text-shadow: none; }
+
+        /* Card Section Panels */
         .card-panel {
-            background: var(--glass-gradient);
-            border: 1px solid var(--border-subtle);
-            border-radius: 1.25rem;
+            background: var(--crt-surface);
+            border: 2px double var(--crt-color);
+            border-radius: 2px;
             padding: 1.5rem;
-            backdrop-filter: blur(12px);
             display: flex;
             flex-direction: column;
             gap: 1.25rem;
             position: relative;
+            box-shadow: inset 0 0 10px rgba(var(--crt-color-rgb), 0.03);
+            transition: all 0.3s ease;
+        }
+
+        body.theme-modern .card-panel {
+            background: var(--modern-glass-gradient);
+            border: 1px solid var(--modern-border-subtle);
+            border-radius: 1.25rem;
+            backdrop-filter: blur(12px);
+            box-shadow: none;
         }
 
         .panel-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid var(--border-subtle);
+            border-bottom: 1px dashed var(--crt-border);
             padding-bottom: 0.75rem;
+            font-family: var(--font-pixel);
+            letter-spacing: 0.05em;
+        }
+
+        body.theme-modern .panel-header {
+            border-bottom: 1px solid var(--modern-border-subtle);
+            font-family: var(--font-data);
         }
 
         .panel-title {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.15rem;
+            font-family: var(--font-pixel);
+            font-size: 1.35rem;
             font-weight: 700;
             display: flex;
             align-items: center;
             gap: 0.5rem;
+            color: var(--crt-color);
+            text-shadow: var(--crt-text-glow);
+            text-transform: uppercase;
         }
 
-        /* AI Thought Stream */
+        body.theme-modern .panel-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.15rem;
+            text-shadow: none;
+            text-transform: none;
+            color: var(--modern-text-primary);
+        }
+
+        /* Thought Decision Stream */
         .thought-stream {
             display: flex;
             flex-direction: column;
@@ -480,26 +797,45 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .thought-card {
-            background: var(--bg-surface);
-            border: 1px solid var(--border-subtle);
-            border-radius: 0.75rem;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px dashed var(--crt-border);
+            border-radius: 2px;
             padding: 1.25rem;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+            transition: all 0.25s ease;
             position: relative;
         }
 
+        body.theme-modern .thought-card {
+            background: var(--modern-bg-surface);
+            border: 1px solid var(--modern-border-subtle);
+            border-radius: 0.75rem;
+        }
+
         .thought-card:hover {
+            border-color: var(--crt-color);
+            box-shadow: 0 0 10px var(--crt-glow);
+        }
+
+        body.theme-modern .thought-card:hover {
             border-color: rgba(0, 242, 254, 0.25);
             box-shadow: 0 4px 20px rgba(0, 242, 254, 0.05);
         }
 
         .thought-card.approved {
-            border-left: 3px solid var(--color-green);
+            border-left: 4px solid var(--crt-color);
+        }
+
+        body.theme-modern .thought-card.approved {
+            border-left: 3px solid var(--modern-color-green);
         }
 
         .thought-card.rejected {
-            border-left: 3px solid var(--color-crimson);
+            border-left: 4px solid #f23d3d;
             opacity: 0.85;
+        }
+
+        body.theme-modern .thought-card.rejected {
+            border-left: 3px solid var(--modern-color-crimson);
         }
 
         .thought-header {
@@ -516,40 +852,70 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .thought-ticker {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.1rem;
+            font-family: var(--font-pixel);
+            font-size: 1.3rem;
             font-weight: 700;
             display: flex;
             align-items: center;
             gap: 0.5rem;
+            color: var(--crt-color);
+            text-shadow: var(--crt-text-glow);
+        }
+
+        body.theme-modern .thought-ticker {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.1rem;
+            text-shadow: none;
+            color: var(--modern-text-primary);
         }
 
         .badge {
             font-size: 0.65rem;
             font-weight: 700;
             padding: 0.15rem 0.4rem;
-            border-radius: 0.25rem;
+            border-radius: 2px;
             text-transform: uppercase;
         }
 
-        .badge-buy { background: rgba(16, 185, 129, 0.15); color: var(--color-green); border: 1px solid rgba(16, 185, 129, 0.3); }
-        .badge-sell { background: rgba(239, 68, 68, 0.15); color: var(--color-crimson); border: 1px solid rgba(239, 68, 68, 0.3); }
-        .badge-hold { background: rgba(245, 158, 11, 0.15); color: var(--color-gold); border: 1px solid rgba(245, 158, 11, 0.3); }
+        body.theme-modern .badge {
+            border-radius: 0.25rem;
+        }
+
+        .badge-buy { background: rgba(51, 255, 51, 0.1); color: var(--crt-color); border: 1px solid var(--crt-color); }
+        .badge-sell { background: rgba(242, 61, 61, 0.1); color: #f23d3d; border: 1px solid #f23d3d; }
+        .badge-hold { background: rgba(230, 161, 0, 0.1); color: #e6a100; border: 1px solid #e6a100; }
+
+        body.theme-modern .badge-buy { background: rgba(16, 185, 129, 0.15); color: var(--modern-color-green); border: 1px solid rgba(16, 185, 129, 0.3); }
+        body.theme-modern .badge-sell { background: rgba(239, 68, 68, 0.15); color: var(--modern-color-crimson); border: 1px solid rgba(239, 68, 68, 0.3); }
+        body.theme-modern .badge-hold { background: rgba(245, 158, 11, 0.15); color: var(--modern-color-gold); border: 1px solid rgba(245, 158, 11, 0.3); }
 
         .thought-time {
             font-size: 0.725rem;
-            color: var(--text-muted);
+            color: var(--crt-color-dim);
+        }
+
+        body.theme-modern .thought-time {
+            color: var(--modern-text-muted);
         }
 
         .thought-text {
             font-size: 0.85rem;
             line-height: 1.5;
-            color: var(--text-secondary);
-            background: rgba(10, 13, 22, 0.3);
+            color: var(--crt-color);
+            opacity: 0.95;
+            background: rgba(0, 0, 0, 0.4);
             padding: 0.75rem;
+            border-radius: 2px;
+            border: 1px solid var(--crt-border);
+            white-space: pre-line;
+        }
+
+        body.theme-modern .thought-text {
+            color: var(--modern-text-secondary);
+            opacity: 1;
+            background: rgba(10, 13, 22, 0.3);
             border-radius: 0.5rem;
             border: 1px solid rgba(255, 255, 255, 0.02);
-            white-space: pre-line;
         }
 
         .confluence-box {
@@ -560,14 +926,21 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .confluence-item {
-            background: var(--bg-surface-elevated);
+            background: rgba(0, 0, 0, 0.5);
             padding: 0.25rem 0.5rem;
-            border-radius: 0.25rem;
-            border: 1px solid var(--border-subtle);
-            color: var(--text-primary);
+            border-radius: 2px;
+            border: 1px solid var(--crt-border);
+            color: var(--crt-color);
         }
 
-        /* Order Audit Trail Table */
+        body.theme-modern .confluence-item {
+            background: var(--modern-bg-surface-elevated);
+            border-radius: 0.25rem;
+            border: 1px solid var(--modern-border-subtle);
+            color: var(--modern-text-primary);
+        }
+
+        /* Tables Customization */
         .trades-table-container {
             overflow-x: auto;
         }
@@ -581,39 +954,60 @@ HTML_CONTENT = """<!DOCTYPE html>
 
         .trades-table th {
             padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border-subtle);
-            color: var(--text-muted);
+            border-bottom: 2px solid var(--crt-color);
+            color: var(--crt-color-dim);
             font-weight: 600;
             text-transform: uppercase;
             font-size: 0.725rem;
             letter-spacing: 0.05em;
         }
 
+        body.theme-modern .trades-table th {
+            border-bottom: 1px solid var(--modern-border-subtle);
+            color: var(--modern-text-muted);
+        }
+
         .trades-table td {
             padding: 0.85rem 1rem;
+            border-bottom: 1px dashed var(--crt-border);
+        }
+
+        body.theme-modern .trades-table td {
             border-bottom: 1px solid rgba(255, 255, 255, 0.02);
         }
 
         .trades-table tr:hover {
+            background: rgba(var(--crt-color-rgb), 0.04);
+        }
+
+        body.theme-modern .trades-table tr:hover {
             background: rgba(255, 255, 255, 0.01);
         }
 
-        /* Live Terminal Logs */
+        /* Activity Console live tails */
         .terminal-pane {
-            background: #05070f;
-            border: 1px solid #1a1e36;
-            border-radius: 0.75rem;
+            background: rgba(0, 0, 0, 0.65);
+            border: 2px solid var(--crt-color);
+            border-radius: 2px;
             padding: 1rem;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: var(--font-data);
             font-size: 0.75rem;
             line-height: 1.42;
-            color: #d1d5db;
+            color: var(--crt-color);
             height: 350px;
             overflow-y: auto;
             white-space: pre-wrap;
             word-break: break-all;
             display: flex;
-            flex-direction: column-reverse; /* Shows latest log first */
+            flex-direction: column-reverse;
+        }
+
+        body.theme-modern .terminal-pane {
+            background: #05070f;
+            border: 1px solid #1a1e36;
+            border-radius: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            color: #d1d5db;
         }
 
         .terminal-line {
@@ -622,11 +1016,15 @@ HTML_CONTENT = """<!DOCTYPE html>
             padding-left: 0.4rem;
         }
 
-        .terminal-info { border-color: var(--color-blue); }
-        .terminal-warn { border-color: var(--color-gold); color: #fef08a; }
-        .terminal-error { border-color: var(--color-crimson); color: #fca5a5; }
+        .terminal-info { border-color: var(--crt-color); }
+        .terminal-warn { border-color: #e6a100; color: #fef08a; }
+        .terminal-error { border-color: #f23d3d; color: #fca5a5; }
 
-        /* Holdings Cards */
+        body.theme-modern .terminal-info { border-color: var(--modern-color-blue); }
+        body.theme-modern .terminal-warn { border-color: var(--modern-color-gold); color: #fef08a; }
+        body.theme-modern .terminal-error { border-color: var(--modern-color-crimson); color: #fca5a5; }
+
+        /* Holdings Cards list */
         .positions-list {
             display: flex;
             flex-direction: column;
@@ -634,13 +1032,19 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .position-row {
-            background: var(--bg-surface);
-            border: 1px solid var(--border-subtle);
-            border-radius: 0.75rem;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px dashed var(--crt-border);
+            border-radius: 2px;
             padding: 0.85rem 1rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
+        }
+
+        body.theme-modern .position-row {
+            background: var(--modern-bg-surface);
+            border: 1px solid var(--modern-border-subtle);
+            border-radius: 0.75rem;
         }
 
         .position-symbol-side {
@@ -650,14 +1054,27 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .pos-sym {
-            font-family: 'Outfit', sans-serif;
+            font-family: var(--font-pixel);
             font-weight: 700;
+            font-size: 1.25rem;
+            color: var(--crt-color);
+            text-shadow: var(--crt-text-glow);
+        }
+
+        body.theme-modern .pos-sym {
+            font-family: 'Outfit', sans-serif;
             font-size: 1rem;
+            text-shadow: none;
+            color: var(--modern-text-primary);
         }
 
         .pos-qty {
             font-size: 0.75rem;
-            color: var(--text-secondary);
+            color: var(--crt-color-dim);
+        }
+
+        body.theme-modern .pos-qty {
+            color: var(--modern-text-secondary);
         }
 
         .position-value-pnl {
@@ -668,9 +1085,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .pos-val {
-            font-family: 'JetBrains Mono', monospace;
+            font-family: var(--font-data);
             font-weight: 500;
             font-size: 0.95rem;
+        }
+
+        body.theme-modern .pos-val {
+            font-family: 'JetBrains Mono', monospace;
         }
 
         .pos-pnl {
@@ -678,116 +1099,37 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-weight: 600;
         }
 
-        /* Chart Section */
+        /* Chart Frame */
         .chart-box {
-            background: var(--bg-surface);
-            border: 1px solid var(--border-subtle);
-            border-radius: 0.75rem;
+            background: rgba(0, 0, 0, 0.45);
+            border: 2px dashed var(--crt-border);
+            border-radius: 2px;
             padding: 1rem;
             height: 250px;
             width: 100%;
         }
 
-        /* Animation utilities */
-        @keyframes blink {
-            0% { opacity: 0.4; }
-            50% { opacity: 1; }
-            100% { opacity: 0.4; }
-        }
-
-        @keyframes pulse-glow {
-            0% { box-shadow: 0 0 10px rgba(0, 242, 254, 0.3); }
-            100% { box-shadow: 0 0 20px rgba(0, 242, 254, 0.6); }
-        }
-
-        /* Maximized Strategy Q&A Focus Panel */
-        #qa-analyst-panel.maximized {
-            position: fixed;
-            top: 4vh;
-            left: 6vw;
-            width: 88vw;
-            height: 92vh;
-            z-index: 99999;
-            background: rgba(10, 13, 22, 0.96);
-            backdrop-filter: blur(25px);
-            border: 1.5px solid var(--color-teal);
-            box-shadow: 0 10px 50px rgba(0, 242, 254, 0.25);
-            border-radius: 1.25rem;
-            padding: 2rem;
-            display: flex;
-            flex-direction: column;
-            gap: 1.25rem;
-            animation: scaleInQAMax 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-        }
-        #qa-analyst-panel.maximized #chat-log {
-            flex: 1 !important;
-            height: auto !important; /* overrides fixed 250px height */
-            background: rgba(5, 7, 15, 0.8) !important;
-        }
-        #equity-curve-panel.maximized {
-            position: fixed;
-            top: 4vh;
-            left: 6vw;
-            width: 88vw;
-            height: 92vh;
-            z-index: 99999;
-            background: rgba(10, 13, 22, 0.96);
-            backdrop-filter: blur(25px);
-            border: 1.5px solid var(--color-blue);
-            box-shadow: 0 10px 50px rgba(0, 112, 243, 0.25);
-            border-radius: 1.25rem;
-            padding: 2rem;
-            display: flex;
-            flex-direction: column;
-            gap: 1.25rem;
-            animation: scaleInQAMax 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-        }
-        #chart-workarea-wrapper {
-            display: block;
-            width: 100%;
-        }
-        #equity-curve-panel.maximized #chart-workarea-wrapper {
-            display: flex;
-            gap: 1.75rem;
-            flex: 1;
-            min-height: 0;
-        }
-        #chart-left-pane {
-            width: 100%;
-            display: flex;
-            flex-direction: column;
-        }
-        #equity-curve-panel.maximized #chart-left-pane {
-            width: 70%;
-            height: 100%;
-        }
-        #chart-right-pane {
-            display: none;
-        }
-        #equity-curve-panel.maximized #chart-right-pane {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-            width: 30%;
-            height: 100%;
-            overflow-y: auto;
-            background: rgba(5, 7, 15, 0.4);
-            padding: 1.25rem;
+        body.theme-modern .chart-box {
+            background: var(--modern-bg-surface);
+            border: 1px solid var(--modern-border-subtle);
             border-radius: 0.75rem;
-            border: 1px solid var(--border-subtle);
-        }
-        #chart-metric-selector {
-            display: none;
-        }
-        #equity-curve-panel.maximized #chart-metric-selector {
-            display: flex;
-        }
-        #equity-curve-panel.maximized .chart-box {
-            flex: 1 !important;
-            height: auto !important;
         }
 
-        /* Maximized Executed Orders Panel */
+        /* Animations */
+        @keyframes blink {
+            0% { opacity: 0.35; }
+            50% { opacity: 1; }
+            100% { opacity: 0.35; }
+        }
+
+        @keyframes scaleInQAMax {
+            from { transform: scale(0.97); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+
+        /* Maximize Overlay Windows */
+        #qa-analyst-panel.maximized,
+        #equity-curve-panel.maximized,
         #executed-orders-panel.maximized {
             position: fixed;
             top: 4vh;
@@ -795,47 +1137,238 @@ HTML_CONTENT = """<!DOCTYPE html>
             width: 88vw;
             height: 92vh;
             z-index: 99999;
-            background: rgba(10, 13, 22, 0.96);
-            backdrop-filter: blur(25px);
-            border: 1.5px solid var(--color-green);
-            box-shadow: 0 10px 50px rgba(16, 185, 129, 0.25);
-            border-radius: 1.25rem;
+            background: var(--crt-surface-elevated);
+            border: 2px solid var(--crt-color);
+            box-shadow: 0 0 30px var(--crt-glow);
+            border-radius: 4px;
             padding: 2rem;
             display: flex;
             flex-direction: column;
             gap: 1.25rem;
-            animation: scaleInQAMax 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            animation: scaleInQAMax 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
+
+        body.theme-modern #qa-analyst-panel.maximized,
+        body.theme-modern #equity-curve-panel.maximized,
+        body.theme-modern #executed-orders-panel.maximized {
+            background: rgba(10, 13, 22, 0.96);
+            backdrop-filter: blur(25px);
+            border: 1.5px solid var(--modern-color-teal);
+            box-shadow: 0 10px 50px rgba(0, 242, 254, 0.25);
+            border-radius: 1.25rem;
+        }
+
+        #qa-analyst-panel.maximized #chat-log {
+            flex: 1 !important;
+            height: auto !important;
+            background: rgba(0, 0, 0, 0.6) !important;
+        }
+
+        #equity-curve-panel.maximized #chart-workarea-wrapper {
+            display: flex;
+            gap: 1.75rem;
+            flex: 1;
+            min-height: 0;
+        }
+
+        #chart-workarea-wrapper {
+            display: block;
+            width: 100%;
+        }
+
+        #chart-left-pane {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #equity-curve-panel.maximized #chart-left-pane {
+            width: 70%;
+            height: 100%;
+        }
+
+        #chart-right-pane {
+            display: none;
+        }
+
+        #equity-curve-panel.maximized #chart-right-pane {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            width: 30%;
+            height: 100%;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 1.25rem;
+            border-radius: 2px;
+            border: 1px dashed var(--crt-border);
+        }
+
+        body.theme-modern #equity-curve-panel.maximized #chart-right-pane {
+            background: rgba(5, 7, 15, 0.4);
+            border-radius: 0.75rem;
+            border: 1px solid var(--modern-border-subtle);
+        }
+
+        #chart-metric-selector {
+            display: none;
+        }
+
+        #equity-curve-panel.maximized #chart-metric-selector {
+            display: flex;
+        }
+
+        #equity-curve-panel.maximized .chart-box {
+            flex: 1 !important;
+            height: auto !important;
+        }
+
         #executed-orders-panel.maximized .trades-table-container {
             flex: 1 !important;
             overflow-y: auto !important;
             min-height: 0;
         }
 
-        @keyframes scaleInQAMax {
-            from { transform: scale(0.97); opacity: 0; }
-            to { transform: scale(1); opacity: 1; }
+        /* Buttons & Inputs */
+        button, select, input {
+            outline: none;
+            transition: all 0.2s ease;
         }
-        #orders-ticker-select option {
+
+        button:not(.theme-knob-btn) {
+            cursor: pointer;
+            font-family: var(--font-pixel);
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        input[type="text"] {
+            font-family: var(--font-data);
+            background: rgba(0, 0, 0, 0.5) !important;
+            border: 2px solid var(--crt-border) !important;
+            color: var(--crt-color) !important;
+            border-radius: 2px !important;
+            padding: 0.5rem 0.75rem;
+        }
+        
+        body.theme-modern input[type="text"] {
+            font-family: var(--font-data);
+            background: var(--modern-bg-surface-elevated) !important;
+            border: 1px solid var(--modern-border-subtle) !important;
+            color: var(--modern-text-primary) !important;
+            border-radius: 0.5rem !important;
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--crt-color) !important;
+            box-shadow: 0 0 10px var(--crt-glow) !important;
+        }
+
+        body.theme-modern input[type="text"]:focus {
+            border-color: var(--modern-color-teal) !important;
+            box-shadow: none !important;
+        }
+
+        select {
+            background: rgba(0, 0, 0, 0.5) !important;
+            border: 2px solid var(--crt-border) !important;
+            color: var(--crt-color) !important;
+            border-radius: 2px !important;
+            font-family: var(--font-pixel) !important;
+            letter-spacing: 0.05em;
+        }
+
+        body.theme-modern select {
+            background: rgba(255, 255, 255, 0.03) !important;
+            border: 1px solid var(--modern-border-subtle) !important;
+            color: var(--modern-text-primary) !important;
+            border-radius: 0.25rem !important;
+            font-family: var(--font-data) !important;
+        }
+
+        select option {
+            background: var(--crt-surface-elevated) !important;
+            color: var(--crt-color) !important;
+        }
+
+        body.theme-modern select option {
             background: #101424 !important;
-            color: var(--text-primary) !important;
+            color: var(--modern-text-primary) !important;
+        }
+
+        .timeframe-btn, .selector-btn {
+            background: rgba(0, 0, 0, 0.3) !important;
+            border: 2px solid var(--crt-border) !important;
+            color: var(--crt-color-dim) !important;
+            border-radius: 2px !important;
+            font-family: var(--font-pixel) !important;
+            font-size: 0.75rem !important;
+            padding: 0.25rem 0.5rem !important;
+        }
+
+        .timeframe-btn.active, .selector-btn.active {
+            background: rgba(var(--crt-color-rgb), 0.1) !important;
+            border-color: var(--crt-color) !important;
+            color: var(--crt-color) !important;
+            box-shadow: var(--crt-text-glow) !important;
+        }
+
+        body.theme-modern .timeframe-btn, body.theme-modern .selector-btn {
+            background: rgba(255, 255, 255, 0.03) !important;
+            border: 1px solid var(--modern-border-subtle) !important;
+            color: var(--modern-text-secondary) !important;
+            border-radius: 0.25rem !important;
+            font-family: var(--font-data) !important;
+            font-size: 0.7rem !important;
+        }
+
+        body.theme-modern .timeframe-btn.active, body.theme-modern .selector-btn.active {
+            background: rgba(0, 242, 254, 0.1) !important;
+            border-color: var(--modern-color-teal) !important;
+            color: var(--modern-color-teal) !important;
+            box-shadow: 0 0 10px rgba(0, 242, 254, 0.2) !important;
         }
     </style>
 </head>
-<body>
+<body class="theme-green">
+    <!-- Physical CRT monitor bezel casing wrappers -->
+    <div id="crt-frame">
+        <div id="crt-screen-overlay">
+            <div id="scanlines"></div>
+            <div id="noise"></div>
+            <div id="vignette"></div>
+        </div>
 
-    <header>
-        <div class="brand-container">
-            <div class="brand-logo">
-                <i data-lucide="trending-up" style="color: var(--bg-base); width: 1.25rem; height: 1.25rem;"></i>
+        <header>
+            <div class="brand-container">
+                <div class="brand-badge" style="border: 2px solid var(--crt-color); padding: 0.2rem 0.6rem; font-weight: bold; background: var(--crt-surface-elevated); box-shadow: var(--crt-text-glow); border-radius: 2px; font-family: var(--font-pixel);">
+                    [AGNT-TRD]
+                </div>
+                <h1 class="brand-title" style="font-family: var(--font-pixel); font-size: 1.6rem; color: var(--crt-color); text-shadow: var(--crt-text-glow); text-transform: uppercase;">agenttrade.us</h1>
             </div>
-            <h1 class="brand-title">AGE DESK</h1>
-        </div>
-        <div class="system-status">
-            <div class="status-dot" id="status-dot"></div>
-            <span id="system-status-text">SIMULATION LIVE</span>
-        </div>
-    </header>
+            
+            <div class="header-controls" style="display: flex; align-items: center; gap: 1rem;">
+                <!-- Phosphor Theme Selector Segmented Control -->
+                <div class="theme-knob-container" style="display: flex; align-items: center; gap: 0.5rem; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--crt-border); padding: 0.25rem 0.5rem; border-radius: 4px; font-family: var(--font-pixel); font-size: 0.85rem;">
+                    <span style="color: var(--crt-color); text-shadow: var(--crt-text-glow); text-transform: uppercase; margin-right: 0.25rem;">PHOSPHOR SELECTOR:</span>
+                    <button class="theme-knob-btn active" data-theme="theme-green" onclick="applyTheme('theme-green')" style="background: transparent; border: 1px solid var(--crt-color); color: var(--crt-color); padding: 0.15rem 0.4rem; cursor: pointer; border-radius: 2px; font-family: var(--font-pixel);">P-1 GREEN</button>
+                    <button class="theme-knob-btn" data-theme="theme-amber" onclick="applyTheme('theme-amber')" style="background: transparent; border: 1px solid var(--crt-color); color: var(--crt-color); padding: 0.15rem 0.4rem; cursor: pointer; border-radius: 2px; font-family: var(--font-pixel);">P-3 AMBER</button>
+                    <button class="theme-knob-btn" data-theme="theme-cyan" onclick="applyTheme('theme-cyan')" style="background: transparent; border: 1px solid var(--crt-color); color: var(--crt-color); padding: 0.15rem 0.4rem; cursor: pointer; border-radius: 2px; font-family: var(--font-pixel);">P-4 CYAN</button>
+                    <button class="theme-knob-btn" data-theme="theme-modern" onclick="applyTheme('theme-modern')" style="background: transparent; border: 1px solid var(--crt-color); color: var(--crt-color); padding: 0.15rem 0.4rem; cursor: pointer; border-radius: 2px; font-family: var(--font-pixel);">NEO-DARK</button>
+                </div>
+                
+                <!-- CRT Screen Accessibility Power Toggle -->
+                <button id="crt-power-btn" onclick="toggleCrtEffects()" style="background: var(--crt-surface-elevated); border: 2px solid var(--crt-color); color: var(--crt-color); font-family: var(--font-pixel); font-size: 0.85rem; padding: 0.25rem 0.75rem; border-radius: 4px; cursor: pointer; box-shadow: var(--crt-text-glow); font-weight: bold; transition: all 0.2s;">
+                    CRT EFFECTS: ON
+                </button>
+
+                <!-- System status badge -->
+                <div class="system-status">
+                    <div class="status-dot" id="status-dot"></div>
+                    <span id="system-status-text">SIMULATION LIVE</span>
+                </div>
+            </div>
+        </header>
 
     <main>
         <!-- Top metrics bar -->
@@ -898,14 +1431,14 @@ HTML_CONTENT = """<!DOCTYPE html>
                         Equity Valuation Curve
                     </h2>
                     <div id="chart-timeframe-selector" style="display: flex; gap: 0.35rem; margin-left: 1.5rem;">
-                        <button class="timeframe-btn" onclick="changeChartTimeframe('1D')" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; cursor: pointer; font-weight: 600; transition: all 0.2s;">1D</button>
-                        <button class="timeframe-btn" onclick="changeChartTimeframe('5D')" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; cursor: pointer; font-weight: 600; transition: all 0.2s;">5D</button>
-                        <button class="timeframe-btn" onclick="changeChartTimeframe('1M')" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; cursor: pointer; font-weight: 600; transition: all 0.2s;">1M</button>
-                        <button class="timeframe-btn active" onclick="changeChartTimeframe('ALL')" style="background: rgba(0, 242, 254, 0.1); border: 1px solid var(--color-teal); color: var(--color-teal); padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; cursor: pointer; font-weight: 600; transition: all 0.2s; box-shadow: 0 0 10px rgba(0, 242, 254, 0.2);">ALL</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('1D')">1D</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('5D')">5D</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('1M')">1M</button>
+                        <button class="timeframe-btn active" onclick="changeChartTimeframe('ALL')">ALL</button>
                     </div>
                     <div id="chart-ticker-selector-container" style="display: flex; align-items: center; gap: 0.35rem; margin-left: 1.5rem;">
-                        <span style="font-size: 0.7rem; text-transform: uppercase; color: var(--text-secondary); font-weight: 600; letter-spacing: 0.05em;">Ticker:</span>
-                        <select id="chart-ticker-select" onchange="filterChartByTicker()" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-primary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; font-weight: 600; outline: none; cursor: pointer; transition: border-color 0.2s;">
+                        <span style="font-size: 0.7rem; text-transform: uppercase; color: var(--text-secondary); font-weight: 600; letter-spacing: 0.05em; font-family: var(--font-pixel);">Ticker:</span>
+                        <select id="chart-ticker-select" onchange="filterChartByTicker()" style="padding: 0.25rem 0.5rem; font-size: 0.7rem; font-weight: 600; outline: none; cursor: pointer;">
                             <option value="ALL">ALL PORTFOLIO</option>
                         </select>
                     </div>
@@ -921,9 +1454,9 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div id="chart-workarea-wrapper">
                     <div id="chart-left-pane">
                         <div id="chart-metric-selector" style="display: none; gap: 0.5rem; margin-bottom: 0.75rem;">
-                            <button class="selector-btn active" onclick="changeChartMetric('equity')" style="background: rgba(0, 242, 254, 0.1); border: 1px solid var(--color-teal); color: var(--color-teal); padding: 0.35rem 0.75rem; border-radius: 0.25rem; font-size: 0.75rem; cursor: pointer; font-weight: 600; transition: all 0.2s;">📈 Equity ($)</button>
-                            <button class="selector-btn" onclick="changeChartMetric('pnl')" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); padding: 0.35rem 0.75rem; border-radius: 0.25rem; font-size: 0.75rem; cursor: pointer; font-weight: 600; transition: all 0.2s;">📊 Unrealized PnL ($)</button>
-                            <button class="selector-btn" onclick="changeChartMetric('cash')" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); padding: 0.35rem 0.75rem; border-radius: 0.25rem; font-size: 0.75rem; cursor: pointer; font-weight: 600; transition: all 0.2s;">💵 Cash Reserves ($)</button>
+                            <button class="selector-btn active" onclick="changeChartMetric('equity')">Equity ($)</button>
+                            <button class="selector-btn" onclick="changeChartMetric('pnl')">Unrealized PnL ($)</button>
+                            <button class="selector-btn" onclick="changeChartMetric('cash')">Cash Reserves ($)</button>
                         </div>
                         <div class="chart-box">
                             <canvas id="equity-chart"></canvas>
@@ -1126,15 +1659,39 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div class="panel-header" style="border-bottom: none; padding-bottom: 0;">
                     <h3 class="panel-title" style="font-size: 0.95rem;">
                         <i data-lucide="info" style="color: var(--color-blue); width: 1rem; height: 1rem;"></i>
-                        Platform Parameters
+                        Platform Parameters & Screener Pool
                     </h3>
                 </div>
                 <div style="background: rgba(10, 13, 22, 0.4); padding: 1rem; border-radius: 0.75rem; border: 1px solid var(--border-subtle);">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 0.4rem;">
-                        <span style="color: var(--text-secondary);">Trading Universe:</span>
-                        <span style="font-family: 'JetBrains Mono', monospace; font-weight: bold;" id="universe-text">SPY, QQQ, SOL/USD</span>
+                    <div style="margin-bottom: 0.8rem;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                            <span style="color: var(--text-secondary); font-weight: 600;">Screener Universe (60 Tickers):</span>
+                            <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--text-muted);" id="pool-count">0/60</span>
+                        </div>
+                        
+                        <!-- Color-coded Legend -->
+                        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.5rem; font-size: 0.7rem;">
+                            <span style="display: flex; align-items: center; gap: 0.25rem;">
+                                <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-green); display: inline-block; box-shadow: 0 0 5px var(--color-green);"></span>
+                                <span style="color: var(--color-green); font-weight: bold;">Holding</span>
+                            </span>
+                            <span style="display: flex; align-items: center; gap: 0.25rem;">
+                                <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-blue); display: inline-block; box-shadow: 0 0 5px var(--color-blue);"></span>
+                                <span style="color: var(--color-blue); font-weight: bold;">Watchlist</span>
+                            </span>
+                            <span style="display: flex; align-items: center; gap: 0.25rem;">
+                                <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-gold); display: inline-block; box-shadow: 0 0 5px var(--color-gold);"></span>
+                                <span style="color: var(--color-gold); font-weight: bold;">Screener Pool</span>
+                            </span>
+                        </div>
+                        
+                        <!-- Scrollable Grid -->
+                        <div id="screener-pool-container" style="display: flex; flex-wrap: wrap; gap: 0.35rem; max-height: 120px; overflow-y: auto; padding: 0.5rem; background: rgba(0,0,0,0.25); border-radius: 0.5rem; border: 1px solid rgba(255,255,255,0.05); font-family: 'JetBrains Mono', monospace;">
+                            <span style="color: var(--text-muted); font-size: 0.75rem;">Loading screener pool...</span>
+                        </div>
                     </div>
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 0.4rem;">
+
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 0.4rem; padding-top: 0.4rem; border-top: 1px solid rgba(255,255,255,0.05);">
                         <span style="color: var(--text-secondary);">Drawdown Bound:</span>
                         <span style="color: var(--color-crimson); font-weight: 600;">2.0% Daily Limit</span>
                     </div>
@@ -1329,26 +1886,49 @@ HTML_CONTENT = """<!DOCTYPE html>
                 ];
             }
 
-            // Dynamically plot based on activeChartMetric
+            // Dynamically plot based on activeChartMetric and active theme
             let label = 'Portfolio Value ($)';
             let borderColor = '#00f2fe';
             let backgroundColor = 'rgba(0, 242, 254, 0.05)';
             let data = [];
 
+            // Read colors dynamically from CSS variables
+            const isModern = document.body.classList.contains('theme-modern');
+            const bodyStyle = getComputedStyle(document.body);
+            
+            let crtColor = bodyStyle.getPropertyValue('--crt-color').trim() || '#33FF33';
+            let crtColorRgb = bodyStyle.getPropertyValue('--crt-color-rgb').trim() || '51, 255, 51';
+            let crtGlow = bodyStyle.getPropertyValue('--crt-glow').trim() || 'rgba(51, 255, 51, 0.12)';
+
             if (activeChartMetric === 'equity') {
                 label = activeChartTicker === 'ALL' ? 'Portfolio Value ($)' : `${activeChartTicker} Position Value ($)`;
-                borderColor = '#00f2fe';
-                backgroundColor = 'rgba(0, 242, 254, 0.05)';
+                if (isModern) {
+                    borderColor = '#00f2fe';
+                    backgroundColor = 'rgba(0, 242, 254, 0.05)';
+                } else {
+                    borderColor = crtColor;
+                    backgroundColor = crtGlow;
+                }
                 data = chartHistory.map(item => item.equity !== undefined ? item.equity : 100000);
             } else if (activeChartMetric === 'pnl') {
                 label = activeChartTicker === 'ALL' ? 'Unrealized PnL ($)' : `${activeChartTicker} Unrealized PnL ($)`;
-                borderColor = '#10b981';
-                backgroundColor = 'rgba(16, 185, 129, 0.05)';
+                if (isModern) {
+                    borderColor = '#10b981';
+                    backgroundColor = 'rgba(16, 185, 129, 0.05)';
+                } else {
+                    borderColor = crtColor;
+                    backgroundColor = crtGlow;
+                }
                 data = chartHistory.map(item => item.unrealized_pnl !== undefined ? item.unrealized_pnl : 0);
             } else if (activeChartMetric === 'cash') {
                 label = 'Cash Reserves ($)';
-                borderColor = '#0070f3';
-                backgroundColor = 'rgba(0, 112, 243, 0.05)';
+                if (isModern) {
+                    borderColor = '#0070f3';
+                    backgroundColor = 'rgba(0, 112, 243, 0.05)';
+                } else {
+                    borderColor = crtColor;
+                    backgroundColor = crtGlow;
+                }
                 data = chartHistory.map(item => item.cash !== undefined ? item.cash : 100000);
             }
 
@@ -1510,17 +2090,33 @@ HTML_CONTENT = """<!DOCTYPE html>
                     },
                     scales: {
                         x: {
-                            grid: { display: false },
+                            grid: { 
+                                display: !isModern,
+                                color: isModern ? 'rgba(255, 255, 255, 0.03)' : `rgba(${crtColorRgb}, 0.08)`,
+                                borderDash: [2, 2]
+                            },
                             ticks: { 
-                                color: '#6b7280', 
-                                font: { size: 10 },
-                                maxTicksLimit: 8, // Force auto-skipping to prevent cluttered/overlapping text labels
+                                color: isModern ? '#6b7280' : crtColor, 
+                                font: { 
+                                    size: 10,
+                                    family: isModern ? "'Inter', sans-serif" : "'Share Tech Mono', monospace"
+                                },
+                                maxTicksLimit: 8,
                                 autoSkip: true
                             }
                         },
                         y: {
-                            grid: { color: 'rgba(255, 255, 255, 0.03)' },
-                            ticks: { color: '#6b7280', font: { size: 10 } }
+                            grid: { 
+                                color: isModern ? 'rgba(255, 255, 255, 0.03)' : `rgba(${crtColorRgb}, 0.08)`,
+                                borderDash: [2, 2]
+                            },
+                            ticks: { 
+                                color: isModern ? '#6b7280' : crtColor, 
+                                font: { 
+                                    size: 10,
+                                    family: isModern ? "'Inter', sans-serif" : "'Share Tech Mono', monospace"
+                                } 
+                            }
                         }
                     }
                 }
@@ -1593,9 +2189,58 @@ HTML_CONTENT = """<!DOCTYPE html>
                 if (valIntervalEl) {
                     valIntervalEl.innerText = ((data && data.interval) || 15) + ' mins';
                 }
-                const universeTextEl = document.getElementById('universe-text');
-                if (universeTextEl) {
-                    universeTextEl.innerText = ((data && data.trading_universe) || []).join(', ');
+                // Update Screener Pool Grid
+                const screenerPoolContainer = document.getElementById('screener-pool-container');
+                const poolCountEl = document.getElementById('pool-count');
+                if (screenerPoolContainer) {
+                    screenerPoolContainer.innerHTML = '';
+                    const screenerPool = (data && data.screener_pool) || [];
+                    const latestWatchlist = (data && data.latest_watchlist) || [];
+                    const positionsData = (data && data.positions) || {};
+                    const holdings = Object.keys(positionsData).map(sym => sym.toUpperCase());
+
+                    if (poolCountEl) {
+                        poolCountEl.innerText = `${screenerPool.length}/60`;
+                    }
+
+                    if (screenerPool.length === 0) {
+                        screenerPoolContainer.innerHTML = '<span style="color: var(--text-muted); font-size: 0.75rem;">No screener pool loaded.</span>';
+                    } else {
+                        // Sort pool so holdings and watchlisted show first, then alphabetical
+                        const sortedPool = [...screenerPool].sort((a, b) => {
+                            const aUpper = a.toUpperCase();
+                            const bUpper = b.toUpperCase();
+                            
+                            const isAHolding = holdings.some(h => h.replace('/', '') === aUpper.replace('/', ''));
+                            const isBHolding = holdings.some(h => h.replace('/', '') === bUpper.replace('/', ''));
+                            
+                            const isAWatching = latestWatchlist.some(w => w.toUpperCase().replace('/', '') === aUpper.replace('/', ''));
+                            const isBWatching = latestWatchlist.some(w => w.toUpperCase().replace('/', '') === bUpper.replace('/', ''));
+
+                            if (isAHolding && !isBHolding) return -1;
+                            if (!isAHolding && isBHolding) return 1;
+                            if (isAWatching && !isBWatching) return -1;
+                            if (!isAWatching && isBWatching) return 1;
+                            return a.localeCompare(b);
+                        });
+
+                        sortedPool.forEach(symbol => {
+                            const symUpper = symbol.toUpperCase();
+                            const isHolding = holdings.some(h => h.replace('/', '') === symUpper.replace('/', ''));
+                            const isWatching = latestWatchlist.some(w => w.toUpperCase().replace('/', '') === symUpper.replace('/', ''));
+
+                            let badgeStyle = "padding: 0.15rem 0.35rem; border-radius: 0.25rem; font-size: 0.7rem; font-weight: bold; border: 1px solid; transition: all 0.2s;";
+                            if (isHolding) {
+                                badgeStyle += " border-color: var(--color-green); background: rgba(51, 255, 51, 0.08); color: var(--color-green); box-shadow: 0 0 4px var(--crt-glow);";
+                            } else if (isWatching) {
+                                badgeStyle += " border-color: var(--color-blue); background: rgba(0, 255, 255, 0.08); color: var(--color-blue); box-shadow: 0 0 4px rgba(0, 255, 255, 0.08);";
+                            } else {
+                                badgeStyle += " border-color: var(--color-gold); background: rgba(255, 176, 0, 0.02); color: var(--color-gold); opacity: 0.65;";
+                            }
+
+                            screenerPoolContainer.innerHTML += `<span style="${badgeStyle}" title="${isHolding ? 'Holding' : (isWatching ? 'Watchlist' : 'Screener Pool')}">${symbol}</span>`;
+                        });
+                    }
                 }
 
                 // 2. Positions List
@@ -1985,19 +2630,11 @@ HTML_CONTENT = """<!DOCTYPE html>
                 const buttons = container.querySelectorAll('.timeframe-btn');
                 buttons.forEach(btn => {
                     btn.classList.remove('active');
-                    btn.style.background = 'rgba(255, 255, 255, 0.03)';
-                    btn.style.border = '1px solid var(--border-subtle)';
-                    btn.style.color = 'var(--text-secondary)';
-                    btn.style.boxShadow = 'none';
                 });
                 
                 buttons.forEach(btn => {
                     if (btn.getAttribute('onclick').includes(`'${timeframe}'`)) {
                         btn.classList.add('active');
-                        btn.style.background = 'rgba(0, 242, 254, 0.1)';
-                        btn.style.border = '1px solid var(--color-teal)';
-                        btn.style.color = 'var(--color-teal)';
-                        btn.style.boxShadow = '0 0 10px rgba(0, 242, 254, 0.2)';
                     }
                 });
             }
@@ -2039,20 +2676,11 @@ HTML_CONTENT = """<!DOCTYPE html>
                 const buttons = container.querySelectorAll('.selector-btn');
                 buttons.forEach(btn => {
                     btn.classList.remove('active');
-                    btn.style.background = 'rgba(255, 255, 255, 0.03)';
-                    btn.style.border = '1px solid var(--border-subtle)';
-                    btn.style.color = 'var(--text-secondary)';
                 });
                 
                 buttons.forEach(btn => {
                     if (btn.getAttribute('onclick').includes(`'${metric}'`)) {
                         btn.classList.add('active');
-                        btn.style.background = 'rgba(0, 242, 254, 0.1)';
-                        btn.style.border = '1px solid var(--color-teal)';
-                        btn.style.color = 'var(--color-teal)';
-                        btn.style.boxShadow = '0 0 10px rgba(0, 242, 254, 0.2)';
-                    } else {
-                        btn.style.boxShadow = 'none';
                     }
                 });
             }
@@ -2368,17 +2996,591 @@ HTML_CONTENT = """<!DOCTYPE html>
                 }, 300);
             }, 2500);
         }
+        // --- Retro Terminal Theme & CRT Effects Controllers ---
+        function applyTheme(themeName) {
+            // Remove any active theme classes from body
+            document.body.classList.remove('theme-green', 'theme-amber', 'theme-cyan', 'theme-modern');
+            
+            // Add specified theme class
+            document.body.classList.add(themeName);
+            
+            // Save selection to localStorage
+            localStorage.setItem('agenttrade-theme', themeName);
+            
+            // Update active state on the selector buttons
+            const buttons = document.querySelectorAll('.theme-knob-btn');
+            buttons.forEach(btn => {
+                if (btn.getAttribute('data-theme') === themeName) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
+            
+            // Redraw chart to pick up new colors
+            updateChart(latestHistoryCached);
+        }
+
+        function toggleCrtEffects() {
+            const isCrtOn = !document.body.classList.contains('crt-off');
+            const btn = document.getElementById('crt-power-btn');
+            
+            if (isCrtOn) {
+                document.body.classList.add('crt-off');
+                localStorage.setItem('agenttrade-crt-on', 'false');
+                if (btn) btn.innerText = 'CRT EFFECTS: OFF';
+            } else {
+                document.body.classList.remove('crt-off');
+                localStorage.setItem('agenttrade-crt-on', 'true');
+                if (btn) btn.innerText = 'CRT EFFECTS: ON';
+            }
+        }
+
+        // Initialize user preferences on DOM content loaded or script execution
+        function initRetroPreferences() {
+            // Restore theme preference (Default is theme-green)
+            const savedTheme = localStorage.getItem('agenttrade-theme') || 'theme-green';
+            applyTheme(savedTheme);
+            
+            // Restore CRT effects preference (Default is true / crt-on)
+            const savedCrtOn = localStorage.getItem('agenttrade-crt-on');
+            const btn = document.getElementById('crt-power-btn');
+            if (savedCrtOn === 'false') {
+                document.body.classList.add('crt-off');
+                if (btn) btn.innerText = 'CRT EFFECTS: OFF';
+            } else {
+                document.body.classList.remove('crt-off');
+                if (btn) btn.innerText = 'CRT EFFECTS: ON';
+            }
+        }
+
+        // Invoke preferences init
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initRetroPreferences);
+        } else {
+            initRetroPreferences();
+        }
+    </script>
+    </div> <!-- Close #crt-frame -->
+</body>
+</html>
+"""
+
+import hashlib
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AGE Desk Security Terminal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --crt-color: #33ff33;
+            --crt-color-rgb: 51, 255, 51;
+            --crt-bg: #030703;
+            --crt-surface: rgba(5, 12, 5, 0.9);
+            --crt-surface-elevated: rgba(10, 24, 10, 0.95);
+            --crt-border: rgba(51, 255, 51, 0.25);
+            --crt-glow: rgba(51, 255, 51, 0.12);
+            --crt-text-glow: 0 0 4px rgba(51, 255, 51, 0.55), 0 0 8px rgba(51, 255, 51, 0.25);
+            --font-data: 'JetBrains Mono', monospace;
+        }
+
+        body.theme-amber {
+            --crt-color: #ffb000;
+            --crt-color-rgb: 255, 176, 0;
+            --crt-bg: #060400;
+            --crt-surface: rgba(16, 10, 0, 0.9);
+            --crt-surface-elevated: rgba(30, 20, 0, 0.95);
+            --crt-border: rgba(255, 176, 0, 0.25);
+            --crt-glow: rgba(255, 176, 0, 0.12);
+            --crt-text-glow: 0 0 4px rgba(255, 176, 0, 0.55), 0 0 8px rgba(255, 176, 0, 0.25);
+        }
+
+        body.theme-cyan {
+            --crt-color: #00ffff;
+            --crt-color-rgb: 0, 255, 255;
+            --crt-bg: #000606;
+            --crt-surface: rgba(0, 16, 16, 0.9);
+            --crt-surface-elevated: rgba(0, 30, 30, 0.95);
+            --crt-border: rgba(0, 255, 255, 0.25);
+            --crt-glow: rgba(0, 255, 255, 0.12);
+            --crt-text-glow: 0 0 4px rgba(0, 255, 255, 0.55), 0 0 8px rgba(0, 255, 255, 0.25);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-data);
+            background-color: var(--crt-bg);
+            color: var(--crt-color);
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* Scanlines and CRT effects */
+        #crt-frame {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: var(--crt-bg);
+            overflow: hidden;
+        }
+
+        #crt-screen-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        #scanlines {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(
+                rgba(18, 16, 16, 0) 50%, 
+                rgba(0, 0, 0, 0.25) 50%
+            ), linear-gradient(
+                90deg,
+                rgba(255, 0, 0, 0.06),
+                rgba(0, 255, 0, 0.02),
+                rgba(0, 0, 255, 0.06)
+            );
+            background-size: 100% 4px, 6px 100%;
+            opacity: 0.9;
+        }
+
+        #noise {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+            opacity: 0.025;
+        }
+
+        #vignette {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(
+                circle,
+                transparent 50%,
+                rgba(0, 0, 0, 0.75) 100%
+            );
+        }
+
+        /* Main Container */
+        .login-container {
+            width: 100%;
+            max-width: 520px;
+            padding: 30px;
+            background: var(--crt-surface);
+            border: 2px solid var(--crt-border);
+            border-radius: 4px;
+            box-shadow: 0 0 20px var(--crt-glow), inset 0 0 10px var(--crt-glow);
+            text-shadow: var(--crt-text-glow);
+            z-index: 10;
+            position: relative;
+            animation: flicker 0.15s infinite alternate;
+        }
+
+        @keyframes flicker {
+            0% { opacity: 0.99; }
+            100% { opacity: 0.97; }
+        }
+
+        .header-logo {
+            text-align: center;
+            margin-bottom: 25px;
+            border-bottom: 1px double var(--crt-border);
+            padding-bottom: 20px;
+        }
+
+        .brand-badge {
+            display: inline-block;
+            border: 2px solid var(--crt-color);
+            padding: 2px 10px;
+            font-weight: bold;
+            font-size: 14px;
+            background: var(--crt-surface-elevated);
+            margin-bottom: 10px;
+            letter-spacing: 2px;
+        }
+
+        .brand-title {
+            font-size: 22px;
+            font-weight: bold;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .system-meta {
+            font-size: 11px;
+            opacity: 0.7;
+            margin-top: 5px;
+            line-height: 1.5;
+        }
+
+        /* Form styling */
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 12px;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .input-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .input-wrapper .prompt-char {
+            position: absolute;
+            left: 12px;
+            font-weight: bold;
+            user-select: none;
+        }
+
+        .auth-input {
+            width: 100%;
+            background: var(--crt-surface-elevated);
+            border: 1px solid var(--crt-border);
+            border-radius: 2px;
+            padding: 12px 12px 12px 28px;
+            color: var(--crt-color);
+            font-family: inherit;
+            font-size: 14px;
+            letter-spacing: 2px;
+            text-shadow: var(--crt-text-glow);
+            outline: none;
+            transition: all 0.2s ease;
+        }
+
+        .auth-input:focus {
+            border-color: var(--crt-color);
+            box-shadow: 0 0 10px var(--crt-glow);
+        }
+
+        .submit-btn {
+            width: 100%;
+            background: var(--crt-color);
+            color: var(--crt-bg);
+            border: none;
+            border-radius: 2px;
+            padding: 12px;
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: bold;
+            text-transform: uppercase;
+            cursor: pointer;
+            letter-spacing: 1.5px;
+            transition: all 0.2s ease;
+            box-shadow: 0 0 10px var(--crt-glow);
+        }
+
+        .submit-btn:hover {
+            opacity: 0.9;
+            box-shadow: 0 0 15px var(--crt-color);
+        }
+
+        .submit-btn:active {
+            transform: scale(0.99);
+        }
+
+        /* Terminal Logs Area */
+        .terminal-logs {
+            margin-top: 25px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid var(--border-subtle);
+            border-radius: 2px;
+            padding: 12px;
+            height: 120px;
+            overflow-y: auto;
+            font-size: 11px;
+            line-height: 1.6;
+            color: var(--crt-color);
+            opacity: 0.8;
+            font-family: inherit;
+        }
+
+        .log-entry {
+            margin-bottom: 4px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .log-entry.error {
+            color: #ff0844;
+            text-shadow: 0 0 4px rgba(255, 8, 68, 0.4);
+        }
+
+        .log-entry.success {
+            color: #10b981;
+            text-shadow: 0 0 4px rgba(16, 185, 129, 0.4);
+        }
+
+        /* Theme Selector */
+        .theme-selector {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 8px;
+            z-index: 20;
+        }
+
+        .theme-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            cursor: pointer;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            transition: transform 0.2s;
+        }
+
+        .theme-dot:hover {
+            transform: scale(1.2);
+        }
+
+        .theme-dot.green { background: #33ff33; }
+        .theme-dot.amber { background: #ffb000; }
+        .theme-dot.cyan { background: #00ffff; }
+
+        /* Shake animation for incorrect password */
+        .shake {
+            animation: shake-anim 0.3s ease-in-out;
+        }
+
+        @keyframes shake-anim {
+            0%, 100% { transform: translateX(0); }
+            20%, 60% { transform: translateX(-10px); }
+            40%, 80% { transform: translateX(10px); }
+        }
+    </style>
+</head>
+<body class="theme-green">
+    <div id="crt-frame">
+        <div id="crt-screen-overlay">
+            <div id="scanlines"></div>
+            <div id="noise"></div>
+            <div id="vignette"></div>
+        </div>
+
+        <div class="login-container" id="login-card">
+            <div class="header-logo">
+                <div class="brand-badge">[AGNT-SEC]</div>
+                <div class="brand-title">AGE Desk Security</div>
+                <div class="system-meta">
+                    COGNITIVE CO-PILOT SYSTEM PORTAL<br>
+                    LOCAL TIME: <span id="time-display">--:--:--</span><br>
+                    STATUS: SECURED VIA AES-256 / SHA-256
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="auth-key">Authorization Key</label>
+                <div class="input-wrapper">
+                    <span class="prompt-char">></span>
+                    <input type="password" id="auth-key" class="auth-input" autofocus autocomplete="current-password" placeholder="••••••••" onkeydown="handleKeyDown(event)">
+                </div>
+            </div>
+
+            <button class="submit-btn" id="submit-btn" onclick="submitAuth()">VALIDATE KEY</button>
+
+            <div class="terminal-logs" id="logs-container">
+                <div class="log-entry">[*] SYSTEM ACCESS CONTROL IS ACTIVE.</div>
+                <div class="log-entry">[*] INITIALIZING ENCRYPTED AUTH SHIELD...</div>
+                <div class="log-entry">[!] ACCESS RESTRICTED TO AUTHORIZED TRADERS ONLY.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="theme-selector">
+        <div class="theme-dot green" onclick="setTheme('green')" title="P-1 Green Phosphor"></div>
+        <div class="theme-dot amber" onclick="setTheme('amber')" title="P-3 Amber Phosphor"></div>
+        <div class="theme-dot cyan" onclick="setTheme('cyan')" title="P-4 Cyan Phosphor"></div>
+    </div>
+
+    <script>
+        // Set dynamic clock
+        function updateTime() {
+            const now = new Date();
+            const timeStr = now.toTimeString().split(' ')[0];
+            document.getElementById('time-display').innerText = timeStr;
+        }
+        setInterval(updateTime, 1000);
+        updateTime();
+
+        // Theme management (matches main dashboard preference storage)
+        function setTheme(theme) {
+            document.body.className = '';
+            document.body.classList.add('theme-' + theme);
+            localStorage.setItem('retro_dashboard_theme', 'theme-' + theme);
+            addLog(`[*] Color Phosphor configured: ${theme.toUpperCase()}`);
+        }
+
+        // Load saved theme
+        const savedTheme = localStorage.getItem('retro_dashboard_theme');
+        if (savedTheme) {
+            const themeName = savedTheme.replace('theme-', '');
+            setTheme(themeName);
+        }
+
+        function addLog(text, type = '') {
+            const container = document.getElementById('logs-container');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            if (type) entry.classList.add(type);
+            
+            const now = new Date();
+            const stamp = `[${now.toTimeString().split(' ')[0]}] `;
+            entry.innerText = stamp + text;
+            
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function handleKeyDown(event) {
+            if (event.key === 'Enter') {
+                submitAuth();
+            }
+        }
+
+        async function submitAuth() {
+            const inputField = document.getElementById('auth-key');
+            const btn = document.getElementById('submit-btn');
+            const card = document.getElementById('login-card');
+            const password = inputField.value;
+
+            if (!password) {
+                addLog('[!] PLEASE ENTER A VALID AUTHORIZATION KEY.', 'error');
+                shakeCard();
+                return;
+            }
+
+            // Lock UI elements
+            inputField.disabled = true;
+            btn.disabled = true;
+            
+            addLog('[*] GENERATING CRYPTOGRAPHIC INTEGRITY SIGNATURE...');
+            addLog('[*] DISPATCHING VALIDATION PACKET TO CONTROL GATEWAY...');
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ password: password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    addLog('[+] SIGNATURE DECRYPTED. KEY MATCH DETECTED!', 'success');
+                    addLog('[*] INJECTING SECURE SESSION INTERFACE...', 'success');
+                    addLog('[*] DECK UNLOCKED. TRANSFERRING CONTROL...', 'success');
+                    
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 1200);
+                } else {
+                    addLog(`[!] AUTHENTICATION REFUSED: ${data.error || 'INVALID PASSKEY'}`, 'error');
+                    shakeCard();
+                    inputField.disabled = false;
+                    btn.disabled = false;
+                    inputField.value = '';
+                    inputField.focus();
+                }
+            } catch (err) {
+                addLog(`[!] GATEWAY TIMEOUT: ${err.message}`, 'error');
+                shakeCard();
+                inputField.disabled = false;
+                btn.disabled = false;
+            }
+        }
+
+        function shakeCard() {
+            const card = document.getElementById('login-card');
+            card.classList.remove('shake');
+            void card.offsetWidth; // Trigger reflow to restart animation
+            card.classList.add('shake');
+        }
     </script>
 </body>
 </html>
 """
 
+def get_expected_session_token():
+    password = config.DASHBOARD_PASSWORD
+    salt = config.SESSION_SALT
+    return hashlib.sha256((password + salt).encode('utf-8')).hexdigest()
+
+def is_authenticated(handler):
+    if not config.DASHBOARD_PASSWORD:
+        return True  # If password is empty, security is bypassed (local dev)
+    cookie_header = handler.headers.get('Cookie', '')
+    expected = get_expected_session_token()
+    return f"age_session={expected}" in cookie_header
+
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
+
     def log_message(self, format, *args):
         # Prevent logging every static/API poll to stderr to keep the terminal clean
         return
 
     def do_GET(self):
+        if config.DASHBOARD_PASSWORD and not is_authenticated(self):
+            if self.path == '/':
+                encoded_html = LOGIN_HTML.encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(encoded_html)))
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                self.end_headers()
+                self.wfile.write(encoded_html)
+            else:
+                encoded_err = json.dumps({"error": "Unauthorized. Please authenticate first."}).encode('utf-8')
+                self.send_response(401)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(encoded_err)))
+                self.end_headers()
+                self.wfile.write(encoded_err)
+            return
+
         if self.path == '/':
             encoded_html = HTML_CONTENT.encode('utf-8')
             self.send_response(200)
@@ -2403,6 +3605,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                         "ticker_history": {},
                         "logs": ["Dashboard server is initializing, please wait..."],
                         "trading_universe": config.TRADING_UNIVERSE,
+                        "screener_pool": [],
+                        "latest_watchlist": [],
                         "interval": config.TRADING_INTERVAL_MINUTES,
                         "is_mock": True,
                         "is_paper": config.ALPACA_PAPER,
@@ -2432,6 +3636,55 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        # 1. Handle auth endpoint `/api/login` (unauthenticated)
+        if self.path == '/api/login':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+                request_payload = json.loads(post_data.decode('utf-8'))
+                password = request_payload.get("password", "")
+                
+                if config.DASHBOARD_PASSWORD and password == config.DASHBOARD_PASSWORD:
+                    expected_token = get_expected_session_token()
+                    # Return success and set secure cookie
+                    encoded_res = json.dumps({"success": True}).encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Content-Length', str(len(encoded_res)))
+                    cookie_val = f"age_session={expected_token}; Path=/; HttpOnly; SameSite=Strict"
+                    # Add Secure flag if running over https (Cloud Run adds X-Forwarded-Proto header)
+                    is_https = self.headers.get('X-Forwarded-Proto', 'http') == 'https'
+                    if is_https:
+                        cookie_val += "; Secure"
+                    self.send_header('Set-Cookie', cookie_val)
+                    self.end_headers()
+                    self.wfile.write(encoded_res)
+                else:
+                    encoded_err = json.dumps({"error": "Incorrect password."}).encode('utf-8')
+                    self.send_response(401)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Content-Length', str(len(encoded_err)))
+                    self.end_headers()
+                    self.wfile.write(encoded_err)
+            except Exception as e:
+                encoded_err = json.dumps({"error": f"Login processing error: {e}"}).encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(encoded_err)))
+                self.end_headers()
+                self.wfile.write(encoded_err)
+            return
+
+        # 2. Security Guard: For any other POST endpoint, verify authentication if password is configured
+        if config.DASHBOARD_PASSWORD and not is_authenticated(self):
+            encoded_err = json.dumps({"error": "Unauthorized. Please authenticate first."}).encode('utf-8')
+            self.send_response(401)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Content-Length', str(len(encoded_err)))
+            self.end_headers()
+            self.wfile.write(encoded_err)
+            return
+
         if self.path == '/api/chat':
             try:
                 # Read content length and parse request body
@@ -2613,6 +3866,10 @@ def run_server():
                 print(f"[AGE DESK] - AUTONOMOUS AI TRADING DASHBOARD")
                 print(f"[*] Live Control Center is active and waiting for connections.")
                 print(f"[*] Local Access URL: http://localhost:{PORT}")
+                if config.DASHBOARD_PASSWORD:
+                    print(f"[*] Security Shield: ACTIVE (Restricted Access enabled)")
+                else:
+                    print(f"[!] Security Shield: BYPASSED (No password configured in .env)")
                 print(f"[*] Real-time Telemetry: Auto-polling database and files every 10s.")
                 print("=" * 60)
                 print("Press Ctrl+C to gracefully shut down the dashboard server.")

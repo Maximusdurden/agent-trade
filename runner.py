@@ -138,8 +138,17 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     
     # Run the dynamic AI screener to select top candidates
     try:
-        from core.screener import run_screener
-        screened_list = run_screener(alpaca_client, data_provider, watchlist_limit=5)
+        from core.screener import run_screener, load_screener_pool
+        screener_candidates = None
+        if not actual_market_open:
+            full_pool = load_screener_pool()
+            screener_candidates = [
+                symbol for symbol in full_pool 
+                if "/" in symbol or "USD" in symbol or "SOL" in symbol
+            ]
+            logger.info(f"US Equity Market is closed/outside hours. Filtering screener candidates to CRYPTO ONLY: {screener_candidates}")
+            
+        screened_list = run_screener(alpaca_client, data_provider, watchlist_limit=5, candidates=screener_candidates)
         logger.info(f"Screener generated watchlist: {screened_list}")
     except Exception as screener_err:
         logger.error(f"Screener execution failed: {screener_err}. Falling back to static TRADING_UNIVERSE.")
@@ -151,7 +160,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             symbol for symbol in screened_list 
             if "/" in symbol or "USD" in symbol or "SOL" in symbol
         ]
-        logger.info(f"US Equity Market is closed/outside hours. Filtering watchlist to CRYPTO ONLY: {filtered_universe}")
+        logger.info(f"US Equity Market is closed/outside hours. Double-checking watchlist is filtered to CRYPTO ONLY: {filtered_universe}")
         
     market_states = []
     for symbol in filtered_universe:

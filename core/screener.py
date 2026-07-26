@@ -154,10 +154,10 @@ def calculate_technical_score(row: pd.Series) -> float:
             
     return score
 
-def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_limit: int = 5) -> list[str]:
+def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_limit: int = 5, candidates: list[str] = None) -> list[str]:
     """
     Runs the autonomous screener cycle:
-    1. Loads candidates from screener_pool.json.
+    1. Loads candidates from screener_pool.json if none provided.
     2. Batch fetches historical daily bars.
     3. Vector-computes technical indicators.
     4. Filters out symbols with average daily dollar volume <= $10M.
@@ -169,7 +169,8 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
     logger.info("Starting Autonomous AI Screener execution...")
     
     # 1. Load candidates
-    candidates = load_screener_pool()
+    if candidates is None:
+        candidates = load_screener_pool()
     logger.info(f"Loaded {len(candidates)} candidates from pool configuration.")
     
     # 2. Fetch daily bars in batch (requires 50 daily bars to calculate 50 SMA)

@@ -53,3 +53,7 @@ portfolio_dod_balances.csv
 .idea/
 *.swp
 *.swo
+
+# Gemini configurations
+.gemini/
+
