@@ -28,3 +28,12 @@ LOG_FILE = os.getenv("LOG_FILE", "trading_agent.log")
 # Database Path
 DB_PATH = Path(__file__).parent.parent / "data" / "trades.db"
 DATABASE_PATH = Path(__file__).parent.parent / "trading_agent.db"
+
+# Dashboard & Security Configurations
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+SESSION_SALT = os.getenv("SESSION_SALT", "age_desk_secure_salt_change_me")
+TRADING_INTERVAL_MINUTES = int(os.getenv("TRADING_INTERVAL_MINUTES", "15"))
+
+# LLM & Gemini configurations
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
