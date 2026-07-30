@@ -7,3 +7,6 @@ __pycache__/
 *.db
 *.corrupted*
 tests/
+.weekend_skip.json
+.daily_cadence.json
+

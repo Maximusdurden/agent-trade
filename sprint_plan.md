@@ -11,6 +11,7 @@ This document outlines the research, system designs, and JIRA ticket breakdown f
    - [Epic 2: Autonomous Dynamic AI Screener](#epic-2-autonomous-dynamic-ai-screener)
    - [Epic 3: VWAP Indicator Integration](#epic-3-vwap-indicator-integration)
    - [Epic 4: End-of-Day Discord Reports](#epic-4-end-of-day-discord-reports)
+   - [Epic 5: Cloud Resilience, Weekend Smart Sleep & Discord Kill Switch](#epic-5-cloud-resilience-weekend-smart-sleep--discord-kill-switch)
 3. [JIRA Epic & Ticket Breakdown](#jira-epic--ticket-breakdown)
 4. [Testing & Validation Protocols](#testing--validation-protocols)
 
@@ -90,6 +91,25 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
     - Retrieve daily statistics and send reports using a modular command-line argument `--eod-report` in `runner.py`. This will be triggered once daily as an independent Windows Scheduled Task at **16:35 ET** (Option A) to guarantee clean isolation from the main 15-minute execution loop:
       - **Message A (Daily Summary)**: Total Buys/Sells count, total cash used, Realized PnL of completed trades, and Net Equity Change PnL. Displays a **Green Embed** sidebar for profitable days, and a **Red Embed** sidebar for unprofitable days.
       - **Message B (Detailed Breakdown)**: Chronological table of tickers bought and sold, showing average fill prices, share sizes, and realized PnL per trade.
+
+### Epic 5: Cloud Resilience, Weekend Smart Sleep & Discord Kill Switch
+*   **The Mandate**: "Establish high-efficiency sleep schedules and safety triggers for our cloud-deployed agent."
+*   **The Weekend Smart Sleep Challenge**: In the cloud, the `agent-trade` loop runs via a Windows Scheduled Task (or daemon) 24/7. However, during weekends, the US equity market is closed, leaving only cryptocurrency (`SOL/USD`) active. If the portfolio holds no active cryptocurrency positions over the weekend, running the analysis loop every 15 minutes is a waste of cloud resources and OpenRouter API tokens.
+*   **The Weekend Smart Sleep & Daily Cadence Challenge**: In the cloud, the `agent-trade` loop runs via a Windows Scheduled Task (or daemon) 24/7. However, during weekends, the US equity market is closed, leaving only cryptocurrency (`SOL/USD`) active. If the portfolio holds no active cryptocurrency positions over the weekend, running the analysis loop every 15 minutes is a waste of cloud resources and OpenRouter API tokens. Additionally, you need automated, high-fidelity daily check-ins to monitor when the bot starts and stops its daily tasks.
+*   **The Weekend Smart Sleep & Daily Cadence Solution**: 
+    - **Daily Morning Start Message**: Every weekday morning at **09:00 ET**, the first execution cycle of the day will transmit a friendly Discord message outlining our daily start: `"Hey, we're starting for the day! Here's what we have:"` with a breakdown of starting equity, cash, and active open positions.
+    - **Daily Evening Shutdown Message**: Every weekday evening at market close (**16:30 ET**), the final equity cycle will transmit: `"We're shutting down the equity desk for the day! Here's what we have:"` showing closing equity, cash, and open positions.
+    - **Smart Friday Dynamic Routing**: On Friday evening at 16:30 ET, when checking open positions:
+      - If `has_crypto` is `False`, the message displays: `"We're shutting down the equity desk for the day, and we hold no crypto positions over the weekend. See you next Monday morning! 💤"` and writes a local state file `.weekend_skip.json` specifying that execution should be skipped until **Monday 09:00 ET**.
+      - If `has_crypto` is `True`, it displays: `"We're shutting down the equity desk for the day. Equity market is closed, but we are holding crypto positions over the weekend. Crypto desk remains active! 🪙"`, continuing normal cycles over the weekend. If crypto is liquidated to 0 during the weekend, the bot immediately writes the skip state, posts a final hibernation alert, and shuts down until Monday morning.
+    - If the skip flag is active, the runner bypasses all heavy logic, API queries, and LLM calls, immediately exiting and conserving resources.
+    - During weekday trading hours, any stale `.weekend_skip.json` is automatically deleted.
+*   **The Discord Kill Switch Challenge**: We need a way to stop the live trading loop in case of emergency directly from Discord (identical to how the user manages `dexter-trader`).
+*   **The Discord Kill Switch Solution**:
+    - Extend the existing `dexter-trader/core/discord_bot.py` with three additional commands: `!agentkill`, `!agentresume`, and `!agentstatus`.
+    - These commands will read and write a `kill_switch.json` file in GCS (`agenttrade-us-data-bucket`).
+    - Integrate a kill switch check at the beginning of `agent-trade/runner.py`. If GCS shows `kill_switch.json` is set to `"HALTED"`, the runner immediately exits.
+    - Update `agent-trade/dashboard/dashboard.py` to check and display these statuses with reactive, glowing color-coded UI badges.
 
 ---
 
@@ -224,6 +244,105 @@ Subagents will use the JIRA tickets below to communicate requirements, progress,
     - `[DONE] AT-9.1 [DEV]`: Write daily performance summarizer and add CLI flag.
     - `[DONE] AT-9.2 [REVIEWER]`: Verify timezone alignments (Eastern Time) for daily closing balances.
 *   **Comments**:
+
+---
+
+### Epic 5: Cloud Resilience, Weekend Smart Sleep & Discord Kill Switch [AT-EP5]
+> Goal: Optimize cloud runner resources by sleeping when idle on weekends and implementing a GCS-based Discord kill switch.
+
+#### **AT-10: Weekend Smart Sleep State Controller**
+*   **Status**: `[ ] TO DO`
+*   **Type**: Story | **Estimate**: 3 Story Points
+*   **Description**: Implement timezone-aware Friday close detection in `runner.py` (Friday 16:30 ET - Monday 09:00 ET). Check for active crypto holdings. If none, write `.weekend_skip.json` to skip runs. Trigger a Discord notification of hibernation.
+*   **Acceptance Criteria**:
+    - Detects Friday close (after 16:30 ET) and weekend window correctly.
+    - Correctly identifies active crypto holdings (symbols with `/`, `USD`, or `SOL`).
+    - Writes `.weekend_skip.json` and skips further cycles when holdings are empty.
+    - Auto-deletes skip file on Monday morning.
+*   **Sub-tasks**:
+    - `[ ] AT-10.1 [DEV]`: Code timezone-aware weekend check and state persistence.
+    - `[ ] AT-10.2 [REVIEWER]`: Verify weekend transition boundary edge-cases with Mock clock.
+
+#### **AT-11: Integrate GCS Kill Switch Check in Runner**
+*   **Status**: `[ ] TO DO`
+*   **Type**: Story | **Estimate**: 3 Story Points
+*   **Description**: In `runner.py`, add a check at the start of `run_trading_cycle` to read `kill_switch.json` from `GCS_BUCKET_NAME`. If state is `"HALTED"`, exit immediately.
+*   **Acceptance Criteria**:
+    - Reads kill switch from GCS cleanly with local fallback if GCS is unavailable.
+    - Halts trading loop if state is `"HALTED"`.
+*   **Sub-tasks**:
+    - `[ ] AT-11.1 [DEV]`: Implement GCS blob downloader and halt check.
+    - `[ ] AT-11.2 [REVIEWER]`: Code-review safety logic and test failure recovery.
+
+#### **AT-12: Implement Discord Kill Switch Commands in Dexter Bot**
+*   **Status**: `[ ] TO DO`
+*   **Type**: Story | **Estimate**: 3 Story Points
+*   **Description**: Add `!agentkill`, `!agentresume`, and `!agentstatus` commands to `dexter-trader/core/discord_bot.py`.
+*   **Acceptance Criteria**:
+    - Authorizes only the predefined Discord Owner ID.
+    - Modifies `kill_switch.json` on GCS (`agenttrade-us-data-bucket`) correctly.
+*   **Sub-tasks**:
+    - `[ ] AT-12.1 [DEV]`: Extend discord_bot.py commands.
+    - `[ ] AT-12.2 [REVIEWER]`: Execute end-to-end testing from Discord interface.
+
+#### **AT-13: Enhance Streamlit Dashboard with Status Badges**
+*   **Status**: `[ ] TO DO`
+*   **Type**: Story | **Estimate**: 2 Story Points
+*   **Description**: Update `agent-trade/dashboard/dashboard.py` to check for active weekend skip or GCS kill switch states, and display color-coded status badges on the control panel.
+*   **Acceptance Criteria**:
+    - Dashboard reads skip file and kill switch state in its background status cache.
+    - UI updates in real-time with "HIBERNATING" or "HALTED" status badges.
+*   **Sub-tasks**:
+#### **AT-14: Daily Morning & Evening Discord Status Report Cadence**
+*   **Status**: `[ ] TO DO`
+*   **Type**: Story | **Estimate**: 2 Story Points
+*   **Description**: In `runner.py`, add automated timezone-aware morning (09:00 ET) and evening (16:30 ET) Discord report triggers. Post account equity, cash, and open position summaries with friendly human-readable greetings and custom weekend sleep notifications.
+*   **Acceptance Criteria**:
+    - Dispatches a starting morning digest at 09:00 ET with starting portfolio metrics.
+    - Dispatches an evening digest at 16:30 ET with closing metrics.
+    - On Friday evening at 16:30 ET, dynamically appends weekend sleep or active crypto desk details.
+*   **Sub-tasks**:
+    - `[ ] AT-14.1 [DEV]`: Program status report formatter and timing trigger hooks in runner.py.
+    - `[ ] AT-14.2 [REVIEWER]`: Verify timezone formatting, message styling, and dynamic weekend notifications.
+
+---
+
+### Epic 6: Broker Synchronization, Watchlist Alignment & Curve Backfilling [AT-EP6]
+> **Goal**: Harmonize guardrails with dynamic watchlists and expand portfolio metrics and trade execution history tracking starting from July 1 forward.
+
+#### **AT-15: Risk Guardrail Watchlist Integration**
+*   **Status**: `[DONE]`
+*   **Type**: Story | **Estimate**: 2 Story Points | **Key**: `TMCL-696`
+*   **Description**: Refactor guardrails in `core/guardrails.py` to permit trading of any symbol that is present either in `config.TRADING_UNIVERSE` or on the latest dynamic screened watchlist.
+*   **Acceptance Criteria**:
+    - Symbol COP is permitted when it is in the latest watchlist.
+    - Non-watchlist and non-universe symbols are rejected.
+    - Normalization handles `SOL/USD` vs `SOLUSD` cleanly.
+*   **Sub-tasks**:
+    - `[DONE] TMCL-697 [DEV]`: Implement database query helper and refactor `core/guardrails.py`.
+    - `[DONE] TMCL-698 [REVIEWER]`: Verify watchlist validation with unit tests.
+
+#### **AT-16: Rebuilt Ledger Database Backfill Extension**
+*   **Status**: `[DONE]`
+*   **Type**: Story | **Estimate**: 2 Story Points | **Key**: `TMCL-699`
+*   **Description**: Modify `rebuild_ledger.py` to backfill the entire day-over-day cash/equity history from July 1st forward into `portfolio_history`.
+*   **Acceptance Criteria**:
+    - Runs successfully and inserts all dates from July 1st into `portfolio_history`.
+    - Dashboard chart loads complete historical curve.
+*   **Sub-tasks**:
+    - `[DONE] TMCL-700 [DEV]`: Update `rebuild_ledger.py` database backfill loop.
+    - `[DONE] TMCL-701 [REVIEWER]`: Validate table consistency and verify dashboard load.
+
+#### **AT-17: Historical Broker Trade Syncer**
+*   **Status**: `[DONE]`
+*   **Type**: Story | **Estimate**: 3 Story Points | **Key**: `TMCL-702`
+*   **Description**: Extract historic completed fills from Alpaca activity logs and populate the database `trades` table.
+*   **Acceptance Criteria**:
+    - Re-running the ledger rebuilder populates `trades` cleanly.
+    - "Broker-Side Executed Orders" panel displays all filled orders.
+*   **Sub-tasks**:
+    - `[DONE] TMCL-703 [DEV]`: Code Activities API parser and database populator.
+    - `[DONE] TMCL-704 [REVIEWER]`: Verify trade history counts and check for duplicate rows.
 
 ---
 

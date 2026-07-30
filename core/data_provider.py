@@ -13,8 +13,18 @@ class DataProvider:
 
     def get_market_state(self, symbol: str, timeframe_str: str = "15min") -> dict:
         """Fetches historical bars for a symbol and returns a dictionary of latest prices and indicators."""
+        # Standardize crypto symbols to include /USD suffix if they are recognized crypto tickers
+        symbol_upper = symbol.upper()
+        crypto_tickers = {"SOL", "BTC", "ETH", "XRP", "ADA", "DOGE"}
+        if symbol_upper in crypto_tickers:
+            symbol = f"{symbol_upper}/USD"
+            
+        # For crypto assets, default to 5-minute bars as per the 5-minute trading interval setup
+        if timeframe_str == "15min" and ("/" in symbol or "USD" in symbol):
+            timeframe_str = "5min"
+
         try:
-            # Fetch last 100 bars (e.g. 15min bars) to calculate technical indicators
+            # Fetch last 100 bars to calculate technical indicators
             df = self.client.get_historical_bars(symbol, limit=100, timeframe_str=timeframe_str)
             
             if df.empty or len(df) < 30:
@@ -193,14 +203,23 @@ class DataProvider:
             increment = 10.0
         elif current_price > 50:
             increment = 5.0
-        else:
+        elif current_price > 10:
             increment = 1.0
+        elif current_price > 1.0:
+            increment = 0.10
+        elif current_price > 0.10:
+            increment = 0.01
+        elif current_price > 0.01:
+            increment = 0.001
+        else:
+            increment = 0.0001
             
-        psy_lower = (current_price // increment) * increment
+        import math
+        psy_lower = math.floor(round(current_price / increment, 9)) * increment
         psy_upper = psy_lower + increment
         result["psychological_levels"] = {
-            "closest_support": psy_lower,
-            "closest_resistance": psy_upper
+            "closest_support": float(psy_lower),
+            "closest_resistance": float(psy_upper)
         }
         
         # 3. Supply & Demand (Support/Resistance Swing Levels)

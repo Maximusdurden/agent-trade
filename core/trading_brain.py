@@ -29,11 +29,19 @@ class TradingBrain:
     
     def __init__(self):
         self.provider = config.LLM_PROVIDER
-        self.api_key = config.GEMINI_API_KEY
-        self.model_name = config.GEMINI_MODEL
         self.is_mock = False
         
-        if self.provider == "gemini":
+        if self.provider == "openrouter":
+            try:
+                from core.llm_client import SharedLLMClient
+                self.llm_client = SharedLLMClient()
+                logger.info("Successfully initialized OpenRouter SharedLLMClient for TradingBrain (Daily Driver Tier).")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenRouter SharedLLMClient: {e}. Falling back to rule-based brain.")
+                self.is_mock = True
+        elif self.provider == "gemini":
+            self.api_key = config.GEMINI_API_KEY
+            self.model_name = config.GEMINI_MODEL
             if not GENAI_AVAILABLE:
                 logger.warning("google-genai package is not installed. Falling back to mock rule-based brain.")
                 self.is_mock = True
@@ -62,6 +70,43 @@ class TradingBrain:
         # Build prompt
         prompt = self._build_prompt(market_data_list, account_state, positions, recent_decisions)
         
+        if self.provider == "openrouter":
+            try:
+                # Call generate_structured using TradingDecision model under the configured brain model tier
+                decision = self.llm_client.generate_structured(
+                    prompt=prompt,
+                    response_model=TradingDecision,
+                    tier=config.BRAIN_MODEL_TIER
+                )
+                
+                # Normalize fields
+                decision["action"] = decision.get("action", "HOLD").upper()
+                decision["symbol"] = decision.get("symbol", "").upper()
+                decision["quantity"] = float(decision.get("quantity", 0.0))
+                
+                tp = decision.get("take_profit_price")
+                sl = decision.get("stop_loss_price")
+                decision["take_profit_price"] = float(tp) if tp is not None else None
+                decision["stop_loss_price"] = float(sl) if sl is not None else None
+                
+                logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']}")
+                return decision
+            except Exception as e:
+                logger.error(f"Error in OpenRouter LLM decision making: {e}. Falling back to safe rule-based decision.")
+                try:
+                    import sys
+                    from agent_jira.jira_logger import log_exception
+                    exc_type, exc_value, exc_tb = sys.exc_info()
+                    log_exception(
+                        exc_type, exc_value, exc_tb,
+                        app_name="agent-trade",
+                        env="production",
+                        metadata={"Context": "Trading Tick Decision Failure"}
+                    )
+                except Exception as ex:
+                    logger.error(f"Failed to log exception to JIRA: {ex}")
+                return self._make_mock_decision(market_data_list, account_state, positions)
+
         try:
             response = self.client.models.generate_content(
                 model=self.model_name,
@@ -94,7 +139,9 @@ class TradingBrain:
             return self._make_mock_decision(market_data_list, account_state, positions)
 
     def _build_prompt(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict]) -> str:
-        """Constructs a comprehensive system prompt and state description."""
+        """Constructs a comprehensive system prompt and state description.
+        Handles both equities and crypto assets with appropriate rules for each.
+        """
         
         # Standardize state strings for prompt representation
         portfolio_summary = f"""
@@ -191,7 +238,18 @@ Ticker: {symbol}
 
         allowed_symbols_str = " | ".join([f'"{sym}"' for sym in config.TRADING_UNIVERSE]) + ' | ""'
         
+        # Add crypto-specific instructions to the system prompt
+        crypto_instructions = """
+        CRYPTO-SPECIFIC RULES:
+        1. Trade 24/7 with no market close restrictions
+        2. Use tighter stop losses (3-5% vs 5-7% for equities)
+        3. Expect higher volatility - adjust position sizes accordingly
+        4. Watch for weekend gaps and news-driven spikes
+        5. Use OCO (One-Cancels-Other) orders when possible
+        """
+        
         system_instruction = f"""
+{crypto_instructions}
 ROLE:
 You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate a single high-conviction trade choice (BUY, SELL, or HOLD) that yields a profitable and stable trading strategy.
 

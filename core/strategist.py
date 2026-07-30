@@ -33,23 +33,33 @@ class MetaStrategist:
     """The high-level portfolio strategist that runs daily to audit performance and generate dynamic rules."""
     
     def __init__(self):
-        self.api_key = config.GEMINI_API_KEY
-        self.model_name = config.GEMINI_MODEL
+        self.provider = getattr(config, "LLM_PROVIDER", "gemini").lower()
         self.is_mock = False
         
-        if not GENAI_AVAILABLE:
-            logger.warning("google-genai package is not installed. Falling back to rule-based strategist.")
-            self.is_mock = True
-        elif not self.api_key or self.api_key == "your_gemini_api_key_here":
-            logger.warning("Gemini API key is missing. Falling back to rule-based strategist.")
-            self.is_mock = True
-        else:
+        if self.provider == "openrouter":
             try:
-                self.client = genai.Client(api_key=self.api_key)
-                logger.info(f"Initialized Gemini Meta-Strategist Brain with model {self.model_name}.")
+                from core.llm_client import SharedLLMClient
+                self.llm_client = SharedLLMClient()
+                logger.info("Initialized OpenRouter SharedLLMClient for Meta-Strategist (Heavyweight Tier).")
             except Exception as e:
-                logger.error(f"Failed to initialize Gemini Client: {e}. Falling back to rule-based strategist.")
+                logger.error(f"Failed to initialize OpenRouter SharedLLMClient: {e}. Falling back to rule-based strategist.")
                 self.is_mock = True
+        else:
+            self.api_key = config.GEMINI_API_KEY
+            self.model_name = config.GEMINI_MODEL
+            if not GENAI_AVAILABLE:
+                logger.warning("google-genai package is not installed. Falling back to rule-based strategist.")
+                self.is_mock = True
+            elif not self.api_key or self.api_key == "your_gemini_api_key_here":
+                logger.warning("Gemini API key is missing. Falling back to rule-based strategist.")
+                self.is_mock = True
+            else:
+                try:
+                    self.client = genai.Client(api_key=self.api_key)
+                    logger.info(f"Initialized Gemini Meta-Strategist Brain with model {self.model_name}.")
+                except Exception as e:
+                    logger.error(f"Failed to initialize Gemini Client: {e}. Falling back to rule-based strategist.")
+                    self.is_mock = True
 
     def run_daily_strategy_refinement(self, alpaca_client: AlpacaClient):
         """Runs the strategist routine for all tickers in the trading universe."""
@@ -211,6 +221,42 @@ Schema:
   "todays_rules": "The concise, refined paragraph of trading rules for the execution loop. Must be under 3 sentences."
 }}
 """
+
+        if self.provider == "openrouter":
+            try:
+                from pydantic import BaseModel, Field
+                
+                class StrategistResponse(BaseModel):
+                    meta_reasoning: str = Field(description="Analytical breakdown of yesterday's performance and market trend.")
+                    todays_rules: str = Field(description="The concise paragraph of trading rules. Must be under 3 sentences and include at least one IF/THEN condition.")
+
+                result = self.llm_client.generate_structured(
+                    prompt=prompt,
+                    response_model=StrategistResponse,
+                    tier=config.STRATEGIST_MODEL_TIER
+                )
+                return {
+                    "meta_reasoning": result.get("meta_reasoning", "Maintained previous rule set due to matching market trend."),
+                    "todays_rules": result.get("todays_rules", yesterdays_rules)
+                }
+            except Exception as e:
+                logger.error(f"Error calling OpenRouter AI strategist for {ticker}: {e}. Falling back to yesterday's rules.")
+                try:
+                    import sys
+                    from agent_jira.jira_logger import log_exception
+                    exc_type, exc_value, exc_tb = sys.exc_info()
+                    log_exception(
+                        exc_type, exc_value, exc_tb,
+                        app_name="agent-trade",
+                        env="production",
+                        metadata={"Ticker": ticker, "Context": "Daily Strategy Optimization Failure"}
+                    )
+                except Exception as ex:
+                    logger.error(f"Failed to log exception to JIRA: {ex}")
+                return {
+                    "meta_reasoning": f"Failed to contact OpenRouter strategist AI client: {e}. Falling back to yesterday's guidelines.",
+                    "todays_rules": yesterdays_rules
+                }
 
         try:
             response = self.client.models.generate_content(

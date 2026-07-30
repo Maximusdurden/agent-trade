@@ -14,7 +14,7 @@ DEFAULT_TICKERS = [
     "PEP", "COST", "KO", "ADBE", "WMT", "MCD", "CSCO", "CRM", "BAC", "ACN",
     "TMO", "NFLX", "PFE", "ORCL", "AMD", "ABT", "NKE", "CMCSA", "DIS", "INTC",
     "CVX", "WFC", "QCOM", "TXN", "MS", "HON", "COP", "AMAT", "VZ", "RTX",
-    "VRTX", "NEE", "AMGN", "IBM", "PM", "GE", "UNP", "SPY", "QQQ", "SOL/USD"
+    "VRTX", "NEE", "AMGN", "IBM", "PM", "GE", "UNP", "SPY", "QQQ", "SOL/USD", "XRP/USD", "ETH/USD", "BTC/USD"
 ]
 
 def scrape_sp500_wikipedia() -> list[str]:
@@ -65,7 +65,7 @@ def main():
             logger.info(f"Successfully scraped {len(scraped)} tickers from Wikipedia.")
             scraped_set = set(scraped)
             
-            final_pool = ["SPY", "QQQ", "SOL/USD"]
+            final_pool = ["SPY", "QQQ", "SOL/USD", "XRP/USD", "ETH/USD", "BTC/USD"]
             
             # Add other defaults first (highest liquidity)
             for t in DEFAULT_TICKERS:

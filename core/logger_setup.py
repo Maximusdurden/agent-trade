@@ -3,14 +3,20 @@ import sys
 import os
 from datetime import datetime
 
-# Add the parent directory of library (Z:\python\projects) to python path
+# Add the parent directory of library (Z:\python\projects) and agent-jira-client to python path
 sys.path.insert(0, r"Z:\python\projects")
+sys.path.insert(0, r"Z:\python\projects\agent-jira-client")
 
 try:
-    from library.jira_logger import setup_global_handler, default_logger
+    from agent_jira.jira_logger import setup_global_handler, default_logger, setup_logger, log_exception
     JIRA_LOGGER_AVAILABLE = True
 except ImportError:
-    JIRA_LOGGER_AVAILABLE = False
+    try:
+        from library.jira_logger import setup_global_handler, default_logger
+        JIRA_LOGGER_AVAILABLE = True
+    except ImportError:
+        JIRA_LOGGER_AVAILABLE = False
+
 
 class JiraLoggingHandler(logging.Handler):
     """
@@ -75,6 +81,21 @@ def setup_logging(app_name="agent-trade", env="production"):
         print("[JiraLogger] Shared JIRA Logger library is not available in the python path.", file=sys.stderr)
         return
         
+    # Dynamically setup logger with explicit configuration from config module
+    from core import config
+    try:
+        if "setup_logger" in globals():
+            setup_logger(
+                site_url=config.JIRA_URL,
+                project_key=config.JIRA_PROJECT_KEY,
+                user_email=config.JIRA_EMAIL,
+                api_token=config.JIRA_API_TOKEN,
+                app_name=app_name,
+                env=env
+            )
+    except Exception as e:
+        print(f"[JiraLogger] setup_logger failed: {e}", file=sys.stderr)
+
     # Register global uncaught exception hook
     setup_global_handler(app_name=app_name, env=env)
     

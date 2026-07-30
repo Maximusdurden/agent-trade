@@ -9,6 +9,13 @@ import threading
 import time
 from datetime import datetime
 
+# Initialize google.cloud.storage first to prevent Python namespace conflicts with google-genai
+try:
+    from google.cloud import storage
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
+
 # Add parent folder to path to ensure root and core package imports work
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -58,20 +65,45 @@ def sync_database_from_gcs():
 
     try:
         from google.cloud import storage
-        print(f"[GCS Sync] Checking for database updates in gs://{gcs_bucket}...", flush=True)
+        print(f"[GCS Sync] Checking for file updates in gs://{gcs_bucket}...", flush=True)
         client = storage.Client()
         bucket = client.bucket(gcs_bucket)
-        blob = bucket.blob("trading_agent.db")
         
-        # Download database to ephemeral directory
+        # 1. Download database
+        blob = bucket.blob("trading_agent.db")
         os.makedirs(os.path.dirname(local_temp_db), exist_ok=True)
         blob.download_to_filename(local_temp_db)
+        print(f"[GCS Sync] Successfully synchronized {local_temp_db} from Cloud Storage.", flush=True)
         
+        # Ensure database tables exist in the downloaded database (Auto-Migration)
+        try:
+            database.init_db()
+            print("[GCS Sync] Database tables auto-initialized/migrated successfully.", flush=True)
+        except Exception as init_err:
+            print(f"[GCS Sync WARNING] Failed to auto-initialize database tables: {init_err}", file=sys.stderr)
+        
+        # 2. Download trading.log
+        log_blob = bucket.blob("trading.log")
+        try:
+            if log_blob.exists():
+                log_blob.download_to_filename("/tmp/trading.log")
+                print("[GCS Sync] Successfully synchronized /tmp/trading.log from Cloud Storage.", flush=True)
+        except Exception as log_sync_err:
+            print(f"[GCS Sync WARNING] Failed to sync trading.log: {log_sync_err}", file=sys.stderr)
+            
+        # 3. Download portfolio_dod_balances.csv
+        csv_blob = bucket.blob("portfolio_dod_balances.csv")
+        try:
+            if csv_blob.exists():
+                csv_blob.download_to_filename("/tmp/portfolio_dod_balances.csv")
+                print("[GCS Sync] Successfully synchronized /tmp/portfolio_dod_balances.csv from Cloud Storage.", flush=True)
+        except Exception as csv_sync_err:
+            print(f"[GCS Sync WARNING] Failed to sync portfolio_dod_balances.csv: {csv_sync_err}", file=sys.stderr)
+
         with CACHE_LOCK:
             LATEST_STATUS_CACHE[last_sync_key] = now
-        print(f"[GCS Sync] Successfully synchronized {local_temp_db} from Cloud Storage.", flush=True)
     except Exception as e:
-        print(f"[GCS Sync WARNING] Failed to sync database from GCS: {e}", file=sys.stderr)
+        print(f"[GCS Sync WARNING] Failed to sync files from GCS: {e}", file=sys.stderr)
 
 def get_portfolio_history():
     """Retrieves portfolio history from the SQLite database."""
@@ -147,7 +179,10 @@ def get_latest_watchlist():
             cursor.execute("SELECT watchlist FROM watchlist_history ORDER BY id DESC LIMIT 1")
             row = cursor.fetchone()
             if row:
-                return json.loads(row["watchlist"])
+                raw_watchlist = json.loads(row["watchlist"])
+                # Normalize watchlist symbols to uppercase and remove slashes
+                # to guarantee alignment with front-end string-matching logic
+                return [symbol.upper().replace('/', '') for symbol in raw_watchlist]
         finally:
             conn.close() # Explicitly close SQLite connection securely
     except Exception as e:
@@ -208,18 +243,20 @@ def status_cache_worker():
             # 3. Retrieve Latest Log Lines
             log_lines = []
             try:
-                if os.path.exists(config.LOG_FILE):
-                    with open(config.LOG_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                log_file_path = "/tmp/trading.log" if os.getenv("GCS_BUCKET_NAME") else config.LOG_FILE
+                if os.path.exists(log_file_path):
+                    with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         log_lines = f.readlines()[-60:]  # last 60 lines
             except Exception as log_err:
                 print(f"[Dashboard Server] Log file retrieval failed: {log_err}", file=sys.stderr)
 
             # 3b. Retrieve DoD Balances from CSV
             dod_balances = []
-            if os.path.exists("portfolio_dod_balances.csv"):
+            csv_path = "/tmp/portfolio_dod_balances.csv" if os.getenv("GCS_BUCKET_NAME") else "portfolio_dod_balances.csv"
+            if os.path.exists(csv_path):
                 try:
                     import csv
-                    with open("portfolio_dod_balances.csv", "r", encoding="utf-8") as f:
+                    with open(csv_path, "r", encoding="utf-8") as f:
                         reader = csv.DictReader(f)
                         for r in reader:
                             dod_balances.append({
@@ -240,6 +277,20 @@ def status_cache_worker():
                 account["cash"] = latest_entry.get("cash", 100000.0)
                 account["unrealized_pnl"] = latest_entry.get("unrealized_pnl", 0.0)
 
+            # GCS Kill Switch Check
+            kill_switch_state = "ACTIVE"
+            try:
+                from core.gcs_sync import check_kill_switch
+                ks_data = check_kill_switch()
+                if ks_data:
+                    kill_switch_state = ks_data.get("status", "ACTIVE")
+            except Exception as ks_err:
+                print(f"[Dashboard Server] Failed to read kill switch: {ks_err}", file=sys.stderr)
+
+            # Weekend Skip Check
+            skip_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".weekend_skip.json")
+            weekend_skip = os.path.exists(skip_file_path)
+
             # Assemble payload
             payload = {
                 "account": account,
@@ -256,8 +307,11 @@ def status_cache_worker():
                 "interval": config.TRADING_INTERVAL_MINUTES,
                 "is_mock": is_mock,
                 "is_paper": config.ALPACA_PAPER,
+                "kill_switch": kill_switch_state,
+                "weekend_skip": weekend_skip,
                 "error": None
             }
+
 
             with CACHE_LOCK:
                 LATEST_STATUS_CACHE = payload
@@ -995,11 +1049,17 @@ HTML_CONTENT = """<!DOCTYPE html>
             line-height: 1.42;
             color: var(--crt-color);
             height: 350px;
+            display: flex;
+            flex-direction: column;
             overflow-y: auto;
             white-space: pre-wrap;
             word-break: break-all;
             display: flex;
             flex-direction: column-reverse;
+        }
+
+        .terminal-pane.sort-oldest-first {
+            flex-direction: column;
         }
 
         body.theme-modern .terminal-pane {
@@ -1328,6 +1388,287 @@ HTML_CONTENT = """<!DOCTYPE html>
             color: var(--modern-color-teal) !important;
             box-shadow: 0 0 10px rgba(0, 242, 254, 0.2) !important;
         }
+
+        /* ==========================================================================
+           COMPREHENSIVE MOBILE & TABLET RESPONSIVENESS OVERRIDES (iOS & Android)
+           ========================================================================== */
+        
+        /* 1. Global Spacing & Layout Scaling */
+        @media (max-width: 1200px) {
+            main {
+                max-width: 100%;
+                gap: 1.5rem;
+                padding: 1.5rem;
+            }
+        }
+
+        @media (max-width: 991px) {
+            main {
+                grid-template-columns: 1fr; /* Single column layout */
+                gap: 1.25rem;
+                padding: 1.25rem;
+            }
+            .metrics-bar {
+                gap: 1rem;
+            }
+        }
+
+        @media (max-width: 768px) {
+            main {
+                gap: 1rem;
+                padding: 1rem;
+            }
+            .metrics-bar {
+                grid-template-columns: repeat(2, 1fr) !important;
+                gap: 0.75rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            main {
+                gap: 0.75rem;
+                padding: 0.5rem;
+            }
+            .metrics-bar {
+                gap: 0.5rem;
+            }
+            .card-panel {
+                padding: 1rem !important;
+                gap: 1rem !important;
+            }
+        }
+
+        /* 2. Responsive Premium Header */
+        @media (max-width: 991px) {
+            header {
+                padding: 1rem 1.5rem !important;
+            }
+        }
+
+        @media (max-width: 768px) {
+            header {
+                flex-direction: column !important;
+                align-items: stretch !important;
+                gap: 0.75rem !important;
+                padding: 0.85rem 1rem !important;
+            }
+            .brand-container {
+                justify-content: space-between;
+                width: 100%;
+            }
+            .header-controls {
+                width: 100%;
+                justify-content: space-between !important;
+                flex-wrap: wrap !important;
+                gap: 0.5rem !important;
+            }
+        }
+
+        @media (max-width: 576px) {
+            .brand-title {
+                font-size: 1.25rem !important;
+            }
+            .brand-badge {
+                font-size: 0.75rem !important;
+                padding: 0.15rem 0.4rem !important;
+            }
+            .theme-knob-container {
+                width: 100% !important;
+                justify-content: space-between !important;
+                padding: 0.35rem 0.5rem !important;
+            }
+            .theme-knob-container span {
+                display: none !important; /* Hide 'PHOSPHOR SELECTOR:' text to save space */
+            }
+            .theme-knob-btn {
+                flex: 1;
+                text-align: center;
+                font-size: 0.7rem !important;
+                padding: 0.25rem 0.35rem !important;
+            }
+            #crt-power-btn, .system-status {
+                flex: 1;
+                font-size: 0.75rem !important;
+                padding: 0.35rem 0.5rem !important;
+                justify-content: center !important;
+                text-align: center !important;
+            }
+        }
+
+        @media (max-width: 375px) {
+            .header-controls {
+                flex-direction: column !important;
+                align-items: stretch !important;
+            }
+            #crt-power-btn, .system-status {
+                width: 100% !important;
+            }
+        }
+
+        /* 3. Metrics Cards Auto-Scaling */
+        @media (max-width: 768px) {
+            .metric-card {
+                padding: 1rem !important;
+            }
+            .metric-value {
+                font-size: 1.65rem !important;
+            }
+            .metric-label {
+                font-size: 0.7rem !important;
+            }
+            .metric-sub {
+                font-size: 0.65rem !important;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .metric-card {
+                padding: 0.75rem !important;
+            }
+            .metric-value {
+                font-size: 1.35rem !important;
+            }
+            .metric-label {
+                font-size: 0.65rem !important;
+                gap: 0.25rem !important;
+            }
+            .metric-label i {
+                width: 0.75rem !important;
+                height: 0.75rem !important;
+            }
+        }
+
+        /* 4. Responsive Panel Headers & Filters */
+        @media (max-width: 768px) {
+            .panel-header {
+                flex-direction: column !important;
+                align-items: stretch !important;
+                gap: 0.65rem !important;
+            }
+            /* Remove hardcoded left/right margins from inline styles on controls */
+            .panel-header > div,
+            .panel-header #chart-timeframe-selector,
+            .panel-header #chart-ticker-selector-container,
+            .panel-header #orders-filter-container,
+            .panel-header [style*="margin-left"] {
+                margin-left: 0 !important;
+                margin-right: 0 !important;
+                width: 100% !important;
+                justify-content: space-between !important;
+                display: flex !important;
+            }
+            /* Styling selectors nicer on mobile */
+            #chart-ticker-select, #orders-ticker-select {
+                flex: 1;
+                max-width: 200px;
+                padding: 0.35rem 0.5rem !important;
+            }
+            .timeframe-btn {
+                flex: 1;
+                text-align: center;
+                padding: 0.35rem 0.25rem !important;
+            }
+            .panel-header div[style*="margin-left: auto"] {
+                justify-content: flex-end !important;
+                gap: 0.5rem !important;
+            }
+        }
+
+        /* 5. Immersive Full-Screen Maximized Overlays on Mobile */
+        @media (max-width: 768px) {
+            #qa-analyst-panel.maximized,
+            #equity-curve-panel.maximized,
+            #executed-orders-panel.maximized {
+                top: 0 !important;
+                left: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                border-radius: 0 !important;
+                padding: 1rem !important;
+                margin: 0 !important;
+                z-index: 1000000 !important;
+            }
+
+            /* Adjust maximized chart panel split to vertical layout */
+            #equity-curve-panel.maximized #chart-workarea-wrapper {
+                flex-direction: column !important;
+                overflow-y: auto !important;
+                display: flex !important;
+                gap: 1rem !important;
+            }
+            #equity-curve-panel.maximized #chart-left-pane,
+            #equity-curve-panel.maximized #chart-right-pane {
+                width: 100% !important;
+                height: auto !important;
+            }
+            #equity-curve-panel.maximized .chart-box {
+                height: 230px !important;
+                flex: none !important;
+            }
+            #equity-curve-panel.maximized #chart-right-pane {
+                padding: 0.75rem !important;
+                max-height: none !important;
+                overflow: visible !important;
+            }
+        }
+
+        /* 6. High-Performance Mobile Tables */
+        .trades-table-container {
+            -webkit-overflow-scrolling: touch; /* Kinetic scrolling on iOS */
+        }
+        @media (max-width: 768px) {
+            .trades-table th, .trades-table td {
+                padding: 0.5rem 0.6rem !important;
+                font-size: 0.75rem !important;
+            }
+            /* Hide non-critical columns on extremely small devices to reduce horizontal scroll scrollbars */
+            @media (max-width: 576px) {
+                .trades-table th:nth-child(6), .trades-table td:nth-child(6), /* Hide Order ID column */
+                .trades-table th:nth-child(7), .trades-table td:nth-child(7) {
+                    display: none !important;
+                }
+            }
+        }
+
+        /* 7. Copilot Q&A & Logs Optimization */
+        @media (max-width: 768px) {
+            .thought-card {
+                padding: 0.85rem !important;
+            }
+            .thought-text {
+                padding: 0.6rem !important;
+                font-size: 0.8rem !important;
+                line-height: 1.4 !important;
+            }
+            .confluence-box {
+                flex-wrap: wrap !important;
+                gap: 0.4rem !important;
+            }
+            .terminal-pane {
+                height: 250px !important;
+                font-size: 0.7rem !important;
+            }
+            #chat-log {
+                height: 220px !important;
+            }
+            #chat-input {
+                font-size: 0.8rem !important;
+                padding: 0.4rem 0.6rem !important;
+            }
+            #chat-send-btn {
+                width: 2rem !important;
+                height: 2rem !important;
+            }
+            /* Active Watchlist Grid */
+            #screener-pool-container {
+                max-height: 100px !important;
+                padding: 0.35rem !important;
+            }
+            #screener-pool-container span {
+                font-size: 0.65rem !important;
+                padding: 0.15rem 0.35rem !important;
+            }
+        }
     </style>
 </head>
 <body class="theme-green">
@@ -1362,10 +1703,24 @@ HTML_CONTENT = """<!DOCTYPE html>
                     CRT EFFECTS: ON
                 </button>
 
-                <!-- System status badge -->
-                <div class="system-status">
-                    <div class="status-dot" id="status-dot"></div>
-                    <span id="system-status-text">SIMULATION LIVE</span>
+                <!-- Enhanced System Status Badges -->
+                <div class="system-status" style="display: flex; gap: 0.5rem;">
+                    <div class="status-badge" style="background: rgba(51, 255, 51, 0.1); border: 1px solid var(--crt-color); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
+                        <div class="status-dot" id="status-dot" style="background-color: var(--crt-color);"></div>
+                        <span id="system-status-text">SIMULATION LIVE</span>
+                    </div>
+                    <div class="status-badge" id="kill-switch-badge" style="background: rgba(255, 8, 68, 0.1); border: 1px solid rgba(255, 8, 68, 0.3); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
+                        <div class="status-dot" style="background-color: rgba(255, 8, 68, 0.8);"></div>
+                        <span>KILL SWITCH: ACTIVE</span>
+                    </div>
+                    <div class="status-badge" id="weekend-skip-badge" style="background: rgba(230, 161, 0, 0.1); border: 1px solid rgba(230, 161, 0, 0.3); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
+                        <div class="status-dot" style="background-color: rgba(230, 161, 0, 0.8);"></div>
+                        <span>WEEKEND SKIP: OFF</span>
+                    </div>
+                    <div class="status-badge" id="db-sync-badge" style="background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
+                        <div class="status-dot" style="background-color: rgba(0, 242, 254, 0.8);"></div>
+                        <span>DB SYNC: ACTIVE</span>
+                    </div>
                 </div>
             </div>
         </header>
@@ -2139,7 +2494,17 @@ HTML_CONTENT = """<!DOCTYPE html>
                 const statusDot = document.getElementById('status-dot');
                 const statusText = document.getElementById('system-status-text');
                 if (statusText && statusDot) {
-                    if (data.is_paper) {
+                    if (data.kill_switch === "HALTED") {
+                        statusText.innerText = "SYSTEM HALTED (GCS KILL SWITCH)";
+                        statusText.style.color = "var(--color-crimson)";
+                        statusDot.style.backgroundColor = "var(--color-crimson)";
+                        statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
+                    } else if (data.weekend_skip) {
+                        statusText.innerText = "WEEKEND HIBERNATION (SMART SLEEP)";
+                        statusText.style.color = "var(--color-gold)";
+                        statusDot.style.backgroundColor = "var(--color-gold)";
+                        statusDot.style.boxShadow = "0 0 10px var(--color-gold)";
+                    } else if (data.is_paper) {
                         if (data.is_mock) {
                             statusText.innerText = "SIMULATION LIVE (PAPER - MOCK)";
                             statusText.style.color = "var(--color-gold)";
@@ -2390,7 +2755,9 @@ HTML_CONTENT = """<!DOCTYPE html>
                 if (terminalPane) {
                     terminalPane.innerHTML = '';
                     const logs = (data && data.logs) || [];
-                    logs.forEach(line => {
+                    const shouldReverse = terminalPane.classList.contains('sort-oldest-first');
+                    const sortedLogs = shouldReverse ? [...logs].reverse() : logs;
+                    sortedLogs.forEach(line => {
                         let levelClass = 'terminal-info';
                         if (line.includes('[WARNING]') || line.includes('[WARN]')) levelClass = 'terminal-warn';
                         if (line.includes('[CRITICAL]') || line.includes('[ERROR]') || line.includes('FATAL')) levelClass = 'terminal-error';
@@ -2520,7 +2887,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                 let botResponse = data.response || "No response received.";
                 
                 // Convert Markdown images: ![alt](url) to beautiful premium responsive img tags with hover-zoom and scroll-to-bottom
-                botResponse = botResponse.replace(/!\[(.*?)\]\((.*?)\)/g, function(match, alt, url) {
+                botResponse = botResponse.replace(/!\\[(.*?)\\]\\(((?:\\([^()]*\\)|[^()]+)*)\\)/g, function(match, alt, url) {
                     let processedUrl = url;
                     if (processedUrl.includes('quickchart.io')) {
                         processedUrl = processedUrl.replace(/%/g, '%25').replace(/#/g, '%23').replace(/ /g, '%20');
@@ -2529,7 +2896,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                 });
 
                 // Convert Markdown links: [text](url) to standard styled anchor tags
-                botResponse = botResponse.replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2" target="_blank" style="color: var(--color-teal); text-decoration: underline;">$1</a>');
+                botResponse = botResponse.replace(/\\[(.*?)\\]\\(((?:\\([^()]*\\)|[^()]+)*)\\)/g, '<a href="$2" target="_blank" style="color: var(--color-teal); text-decoration: underline;">$1</a>');
 
                 // Format markdown highlights safely
                 botResponse = botResponse
@@ -3036,6 +3403,14 @@ HTML_CONTENT = """<!DOCTYPE html>
             }
         }
 
+        function toggleLogSort() {
+            const terminalPane = document.getElementById('terminal-pane');
+            if (terminalPane) {
+                terminalPane.classList.toggle('sort-oldest-first');
+                fetchStatus(); // Refresh to apply new sort
+            }
+        }
+
         // Initialize user preferences on DOM content loaded or script execution
         function initRetroPreferences() {
             // Restore theme preference (Default is theme-green)
@@ -3386,6 +3761,34 @@ LOGIN_HTML = """<!DOCTYPE html>
             0%, 100% { transform: translateX(0); }
             20%, 60% { transform: translateX(-10px); }
             40%, 80% { transform: translateX(10px); }
+        }
+
+        /* Mobile Optimization overrides for Security Login */
+        @media (max-width: 576px) {
+            .login-container {
+                max-width: 92% !important;
+                padding: 20px !important;
+                margin: 10px !important;
+            }
+            .brand-title {
+                font-size: 18px !important;
+            }
+            .theme-selector {
+                bottom: 12px !important;
+                right: 12px !important;
+            }
+            .auth-input {
+                font-size: 13px !important;
+                padding: 10px 10px 10px 24px !important;
+            }
+            .submit-btn {
+                padding: 10px !important;
+                font-size: 13px !important;
+            }
+            .terminal-logs {
+                height: 100px !important;
+                font-size: 10px !important;
+            }
         }
     </style>
 </head>

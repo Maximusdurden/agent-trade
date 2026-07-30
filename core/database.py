@@ -78,6 +78,14 @@ def init_db():
             )
         """)
         
+        # 6. System State Table (Global persistent parameters)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS system_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        
         conn.commit()
 
 def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process: str,
@@ -416,3 +424,78 @@ def log_watchlist(symbols: list[str]) -> int:
 
 # Auto-initialize database on import so the tables exist right away
 init_db()
+
+
+from typing import Optional
+
+def set_system_state(key: str, value: str) -> None:
+    """Set a key-value pair in the system_state table."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO system_state (key, value)
+            VALUES (?, ?)
+            """,
+            (key, value)
+        )
+        conn.commit()
+
+def get_system_state(key: str) -> Optional[str]:
+    """Get a value from the system_state table by key."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT value FROM system_state WHERE key = ?",
+                (key,)
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+        except sqlite3.OperationalError:
+            return None
+
+
+def get_latest_watchlist_raw() -> list[str]:
+    """Retrieves the latest watchlist as a raw list of strings."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT watchlist FROM watchlist_history ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row["watchlist"])
+    except Exception:
+        pass
+    return []
+
+
+class Database:
+    def __init__(self, db_path: Optional[str] = None):
+        from core import config
+        self.db_path = db_path or str(config.DATABASE_PATH)
+        
+    def log_decision(self, **kwargs) -> int:
+        return log_decision(**kwargs)
+        
+    def log_trade(self, **kwargs) -> int:
+        return log_trade(**kwargs)
+        
+    def get_recent_decisions(self, limit: int = 5) -> list[dict]:
+        return get_recent_decisions(limit)
+        
+    def get_recent_trades(self, limit: int = 15) -> list[dict]:
+        return get_recent_trades(limit)
+        
+    def log_portfolio_history(self, equity: float, cash: float, unrealized_pnl: float) -> Optional[int]:
+        return log_portfolio_history(equity, cash, unrealized_pnl)
+
+    def set_system_state(self, key: str, value: str) -> None:
+        set_system_state(key, value)
+
+    def get_system_state(self, key: str) -> Optional[str]:
+        return get_system_state(key)
+
+    def get_latest_watchlist_raw(self) -> list[str]:
+        return get_latest_watchlist_raw()
+

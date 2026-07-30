@@ -74,8 +74,19 @@ class RiskGuardrails:
             return False, f"Rejected: Unknown action '{action}'. Only BUY, SELL, or HOLD are permitted.", adjusted_decision
 
         # 3. Check Universe Restrictions
-        if symbol not in config.TRADING_UNIVERSE:
-            return False, f"Rejected: Symbol '{symbol}' is not in the allowed trading universe ({config.TRADING_UNIVERSE}).", adjusted_decision
+        # Allow trading if symbol is in config.TRADING_UNIVERSE or in the latest screened watchlist
+        from core import database
+        allowed_symbols = set(s.upper() for s in config.TRADING_UNIVERSE)
+        
+        latest_watchlist = database.get_latest_watchlist_raw()
+        for ws_symbol in latest_watchlist:
+            # Normalize watchlist symbols (e.g. SOL/USD -> SOLUSD) and add both forms
+            allowed_symbols.add(ws_symbol.upper())
+            allowed_symbols.add(ws_symbol.upper().replace('/', ''))
+            
+        normalized_symbol = symbol.upper().replace('/', '')
+        if symbol.upper() not in allowed_symbols and normalized_symbol not in allowed_symbols:
+            return False, f"Rejected: Symbol '{symbol}' is not in the allowed trading universe ({config.TRADING_UNIVERSE}) nor in the latest watchlist ({latest_watchlist}).", adjusted_decision
 
         # 3b. Check Market Hours for Equities (Crypto is 24/7)
         is_crypto = "SOL" in symbol or "USD" in symbol or "/" in symbol
@@ -170,6 +181,30 @@ class RiskGuardrails:
                                f"Scaling down quantity from {proposed_qty} to {max_allowed_qty}.")
                 proposed_qty = max_allowed_qty
                 proposed_trade_value = proposed_qty * current_price
+                
+            # Check per-ticker allocation limit
+            existing_position_value = 0.0
+            if symbol in current_positions:
+                existing_position_value = current_positions[symbol]["qty"] * current_price
+                
+            max_ticker_value = equity * config.MAX_TICKER_ALLOCATION_PCT
+            total_proposed_value = existing_position_value + proposed_trade_value
+            
+            if total_proposed_value > max_ticker_value:
+                max_allowed_value = max(0, max_ticker_value - existing_position_value)
+                if is_crypto:
+                    max_allowed_qty = round(max_allowed_value / current_price, 4)
+                else:
+                    max_allowed_qty = int(max_allowed_value // current_price)
+                    
+                logger.warning(f"Proposed total position value (${total_proposed_value:,.2f}) exceeds per-ticker limit (${max_ticker_value:,.2f}). "
+                               f"Scaling down quantity from {proposed_qty} to {max_allowed_qty}.")
+                proposed_qty = max_allowed_qty
+                proposed_trade_value = proposed_qty * current_price
+                
+                if proposed_qty <= 0:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, f"Rejected: Buy quantity scaled down to 0 because total position allocation for {symbol} would exceed the per-ticker limit of {config.MAX_TICKER_ALLOCATION_PCT * 100}% of equity.", adjusted_decision
 
             # Ensure we maintain the cash buffer
             min_cash_required = equity * config.MIN_CASH_BUFFER_PCT

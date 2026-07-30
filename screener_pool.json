@@ -4,5 +4,6 @@
     "PEP", "COST", "KO", "ADBE", "WMT", "MCD", "CSCO", "CRM", "BAC", "ACN",
     "TMO", "NFLX", "PFE", "ORCL", "AMD", "ABT", "NKE", "CMCSA", "DIS", "INTC",
     "CVX", "WFC", "QCOM", "TXN", "MS", "HON", "COP", "AMAT", "VZ", "RTX",
-    "VRTX", "NEE", "AMGN", "IBM", "PM", "GE", "UNP", "SPY", "QQQ", "SOL/USD"
+    "VRTX", "NEE", "AMGN", "IBM", "PM", "GE", "UNP", "SPY", "QQQ", "SOL/USD", "XRP/USD", "ETH/USD",
+    "BTC/USD", "ADA/USD", "DOGE/USD", "LTC/USD", "DOT/USD", "BNB/USD"
 ]

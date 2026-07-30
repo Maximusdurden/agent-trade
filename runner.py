@@ -1,15 +1,47 @@
 import time
 import argparse
+from core.database import Database
+
+database = Database()
 import logging
 import sys
 from datetime import datetime
 
 from core import config
-from core import database
 from core.alpaca_client import AlpacaClient
 from core.data_provider import DataProvider
 from core.guardrails import RiskGuardrails
 from core.trading_brain import TradingBrain
+
+def get_current_eastern_time() -> datetime:
+    """Returns the current datetime in America/New_York timezone."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+        return datetime.now(tz)
+    except Exception:
+        try:
+            import pytz
+            tz = pytz.timezone("America/New_York")
+            return datetime.now(tz)
+        except Exception:
+            return datetime.now()
+
+def format_positions(positions: dict) -> str:
+    """Formats the open positions dict into a clean human-readable string."""
+    if not positions:
+        return "None."
+    parts = []
+    for symbol, details in positions.items():
+        qty = details.get("qty", 0.0)
+        try:
+            qty = float(qty)
+            qty_str = f"{qty:.4f}".rstrip('0').rstrip('.')
+        except ValueError:
+            qty_str = str(qty)
+        parts.append(f"{symbol} ({qty_str} shares)")
+    return ", ".join(parts)
+
 
 # Setup Logging
 logging.basicConfig(
@@ -97,15 +129,58 @@ def check_execution_window(alpaca_client: AlpacaClient) -> tuple[bool, str]:
 def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                       brain: TradingBrain, guardrails: RiskGuardrails, dry_run: bool = False):
     """Executes a single workflow cycle of the autonomous trading agent."""
-    # Check execution window (09:00 - 16:30 ET, weekdays, market open)
-    is_allowed, reason = check_execution_window(alpaca_client)
     import os
-    if os.getenv("BYPASS_MARKET_WINDOW") == "True":
-        is_allowed, reason = True, "Execution window check bypassed via BYPASS_MARKET_WINDOW environment variable."
+    import json
+    from datetime import datetime
+    
+    market_states = []
+    
+    # 0. Sync Latest Database and State from GCS
+    try:
+        from core.gcs_sync import download_from_gcs
+        download_from_gcs()
+    except Exception as gcs_dl_err:
+        logger.error(f"Failed to download files from GCS: {gcs_dl_err}")
 
-    if not is_allowed:
-        logger.info(f"Trading cycle skipped: {reason}")
-        return
+    # 1. GCS Kill Switch Check
+    try:
+        from core.gcs_sync import check_kill_switch
+        ks_data = check_kill_switch()
+        if ks_data and ks_data.get("status") == "HALTED":
+            logger.info("Runner: Skipping execution cycle. System is Halted via GCS Kill Switch.")
+            return
+    except Exception as ks_err:
+        logger.warning(f"Failed to check GCS kill switch: {ks_err}")
+
+    # Paths for state files
+    skip_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weekend_skip.json")
+    cadence_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".daily_cadence.json")
+    
+    # Fetch current Eastern Time
+    now_et = get_current_eastern_time()
+    today_str = now_et.strftime('%Y-%m-%d')
+    current_minutes = now_et.hour * 60 + now_et.minute
+    
+    # 2. Weekend Smart Sleep Skip Check
+    if os.path.exists(skip_file_path):
+        is_monday_or_later = now_et.weekday() == 0  # Monday is 0
+        is_after_start = current_minutes >= (9 * 60)
+        
+        # If we have advanced past Monday 09:00 ET, or we are on Tuesday, etc. (weekday < 5)
+        if (is_monday_or_later and is_after_start) or (now_et.weekday() > 0 and now_et.weekday() < 5):
+            try:
+                os.remove(skip_file_path)
+                logger.info("Weekend Smart Sleep ended. Resuming trading...")
+            except Exception as rm_err:
+                logger.warning(f"Failed to delete {skip_file_path}: {rm_err}")
+        else:
+            logger.info("Runner: Skipping execution cycle. Weekend Smart Sleep active until Monday 09:00 ET.")
+            return
+
+    # Check execution window (09:00 - 16:30 ET, weekdays, market open)
+    is_market_open, market_reason = check_execution_window(alpaca_client)
+    if os.getenv("BYPASS_MARKET_WINDOW") == "True":
+        is_market_open = True
 
     logger.info("Starting autonomous trading cycle...")
     
@@ -132,6 +207,124 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     except Exception as e:
         logger.error(f"Error fetching positions: {e}. Proceeding with assumptions.")
         positions = {}
+
+    # Define weekend check parameters
+    weekday = now_et.weekday()
+    is_weekend_hours = False
+    if weekday >= 5: # Saturday or Sunday
+        is_weekend_hours = True
+    elif weekday == 4 and current_minutes >= (16 * 60 + 30): # Friday after 16:30
+        is_weekend_hours = True
+    elif weekday == 0 and current_minutes < (9 * 60): # Monday before 09:00
+        is_weekend_hours = True
+
+    # 3. Daily Status Cadence & Friday Smart Sleep Triggers
+    try:
+        # Load or initialize cadence state
+        cadence = {}
+        if os.path.exists(cadence_file_path):
+            try:
+                with open(cadence_file_path, "r", encoding="utf-8") as f:
+                    cadence = json.load(f)
+            except Exception:
+                pass
+
+        from core.discord_notifier import send_discord_message
+        positions_str = format_positions(positions)
+
+        # A. Morning Start Message (Weekdays Monday-Friday, at or after 09:00 ET)
+        if weekday < 5 and current_minutes >= (9 * 60):
+            last_sent = database.get_system_state("last_morning_sent")
+            if last_sent != today_str:
+                msg = (
+                    f"Good Morning! Agent-Trade Desk is active.\n"
+                    f"* **Total Equity**: ${equity:,.2f}\n"
+                    f"* **Cash Balance**: ${cash:,.2f}\n"
+                    f"* **Open Positions**: {positions_str}"
+                )
+                send_discord_message(msg)
+                database.set_system_state("last_morning_sent", today_str)
+
+        # B. Evening Shutdown Message / Friday Smart Sleep (Weekdays, at or after 16:30 ET)
+        if weekday < 5 and current_minutes >= (16 * 60 + 30):
+            if cadence.get("last_evening_sent") != today_str:
+                if weekday == 4: # Friday close
+                    crypto_positions = [
+                        sym for sym in positions.keys()
+                        if "/" in sym or "USD" in sym or "SOL" in sym
+                    ]
+                    if not crypto_positions:
+                        # Friday evening, no crypto held -> go to sleep!
+                        msg = (
+                            f"Good Evening! We are shutting down the equity desk for the day.\n"
+                            f"* **Closing Equity**: ${equity:,.2f}\n"
+                            f"* **Cash Balance**: ${cash:,.2f}\n"
+                            f"* **Open Positions**: None.\n\n"
+                            f"We're shutting down the equity desk for the day, and we hold no crypto positions over the weekend. "
+                            f"See you next Monday morning!"
+                        )
+                        send_discord_message(msg)
+                        # Write skip file
+                        try:
+                            with open(skip_file_path, "w", encoding="utf-8") as f:
+                                json.dump({"hibernating_since": now_et.isoformat()}, f, indent=2)
+                        except Exception as w_err:
+                            logger.warning(f"Failed to write skip file: {w_err}")
+                        
+                        cadence["last_evening_sent"] = today_str
+                        with open(cadence_file_path, "w", encoding="utf-8") as f:
+                            json.dump(cadence, f, indent=2)
+                        return # Exit cycle immediately since we are hibernating
+                    else:
+                        # Friday evening, crypto held -> crypto desk remains active
+                        msg = (
+                            f"Good Evening! We are shutting down the equity desk for the day.\n"
+                            f"* **Closing Equity**: ${equity:,.2f}\n"
+                            f"* **Cash Balance**: ${cash:,.2f}\n"
+                            f"* **Open Positions**: {positions_str}\n\n"
+                            f"We're shutting down the equity desk for the day. Equity market is closed, but we are holding crypto positions over the weekend. "
+                            f"Crypto desk remains active!"
+                        )
+                        send_discord_message(msg)
+                else:
+                    # Regular weekday evening shutdown
+                    msg = (
+                        f"Good Evening! We are shutting down the equity desk for the day.\n"
+                        f"* **Closing Equity**: ${equity:,.2f}\n"
+                        f"* **Cash Balance**: ${cash:,.2f}\n"
+                        f"* **Open Positions**: {positions_str}"
+                    )
+                    send_discord_message(msg)
+                
+                cadence["last_evening_sent"] = today_str
+                with open(cadence_file_path, "w", encoding="utf-8") as f:
+                    json.dump(cadence, f, indent=2)
+                    
+    except Exception as cadence_err:
+        logger.error(f"Error handling daily status cadence or smart Friday triggers: {cadence_err}")
+
+    # 4. Weekend Dynamic Hibernation (If we are inside weekend hours, and positions drop to 0)
+    if is_weekend_hours and not os.path.exists(skip_file_path):
+        crypto_positions = [
+            sym for sym in positions.keys()
+            if "/" in sym or "USD" in sym or "SOL" in sym
+        ]
+        if not crypto_positions:
+            logger.info("No active crypto positions held over the weekend. Entering Weekend Smart Sleep.")
+            try:
+                with open(skip_file_path, "w", encoding="utf-8") as f:
+                    json.dump({"hibernating_since": now_et.isoformat()}, f, indent=2)
+            except Exception as w_err:
+                logger.warning(f"Failed to write skip file: {w_err}")
+            
+            from core.discord_notifier import send_discord_message
+            send_discord_message("No active crypto positions held over the weekend. Entering Weekend Smart Sleep mode. Crypto desk hibernation active until Monday 09:00 ET.")
+            return # Exit cycle since we just entered sleep
+
+    # Check if we should allow trading for the current market state
+    if not is_market_open:
+        logger.info(f"US Equity Market is closed ({market_reason}). Continuing cycle for CRYPTO ONLY trading.")
+
 
     # 3. Fetch indicators and market state for the screened watchlist
     actual_market_open, _ = check_execution_window(alpaca_client)
@@ -323,6 +516,13 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             logger.critical(f"FATAL: Order execution failed! Error: {e}")
     else:
         logger.info("No order execution required for this cycle.")
+
+    # 9. Sync database and logs to GCS if configured
+    try:
+        from core.gcs_sync import upload_to_gcs
+        upload_to_gcs()
+    except Exception as gcs_err:
+        logger.error(f"Failed to sync to GCS: {gcs_err}")
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous Alpaca AI Trading Agent Runner")
