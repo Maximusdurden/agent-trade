@@ -21,13 +21,24 @@ Get-Content $EnvPath | ForEach-Object {
     }
 }
 
-if (-not $GcpProject) {
-    # Fallback default project name from service inspection if not in .env
-    $GcpProject = "treatmotivated-capital"
+if (-not [string]::IsNullOrEmpty($env:DEPLOY_GCP_PROJECT)) {
+    $GcpProject = $env:DEPLOY_GCP_PROJECT
+} else {
+    $GcpProject = "agenttrade-us"
+}
+
+if ($GcpProject) {
+    $env:CLOUDSDK_CORE_PROJECT = $GcpProject
 }
 
 $Region = "us-east1"
-$ServiceName = "treatmotivated-dashboard"
+
+if (-not [string]::IsNullOrEmpty($env:DEPLOY_SERVICE_NAME)) {
+    $ServiceName = $env:DEPLOY_SERVICE_NAME
+} else {
+    $ServiceName = "agenttrade-dashboard"
+}
+
 $ImageTag = "us-east1-docker.pkg.dev/" + $GcpProject + "/cloud-run-source-deploy/" + $ServiceName + ":latest"
 
 Write-Host "GCP Project: $GcpProject"

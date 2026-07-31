@@ -332,6 +332,20 @@ Generate your trade decision JSON:
                 # Calculate safe mock purchase qty (~5% of equity)
                 equity = account_state.get("equity", 100000.0)
                 qty = max(1.0, int((equity * 0.05) // current_price))
+                
+                # Check cash buffer requirement
+                cash_balance = account_state.get("cash", 0.0)
+                min_cash_buffer = equity * config.MIN_CASH_BUFFER_PCT
+                if cash_balance < min_cash_buffer:
+                    return {
+                        "thought_process": f"[Rule Fallback] Skipped BUY: Cash balance (${cash_balance:,.2f}) below required buffer (${min_cash_buffer:,.2f})",
+                        "action": "HOLD",
+                        "symbol": "",
+                        "quantity": 0.0,
+                        "take_profit_price": None,
+                        "stop_loss_price": None
+                    }
+                
                 tp = round(current_price * 1.05, 2)
                 sl = round(current_price * 0.97, 2)
                 return {
