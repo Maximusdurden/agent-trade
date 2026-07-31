@@ -42,6 +42,9 @@ trading_agent.db
 trading.log
 *.log
 
+# Scratch folder
+scratch/
+
 # Cache & Temp files
 daily_cash_reconstructed.json
 detailed_search_results.json
