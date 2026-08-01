@@ -10,6 +10,13 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def get_last_insert_id(cursor: sqlite3.Cursor) -> int:
+    """Return the inserted row ID, raising if SQLite did not provide one."""
+    lastrowid = cursor.lastrowid
+    if lastrowid is None:
+        raise RuntimeError("SQLite did not return an ID for the inserted row")
+    return lastrowid
+
 def init_db():
     """Initializes the database schema if tables don't exist."""
     with get_db_connection() as conn:
@@ -90,7 +97,7 @@ def init_db():
 
 def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process: str,
                  proposed_action: str, proposed_symbol: str, proposed_qty: float,
-                 is_approved: bool, rejection_reason: str = None) -> int:
+                 is_approved: bool, rejection_reason: str | None = None) -> int:
     """Logs the LLM decision to the SQLite database and returns the decision ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -111,7 +118,7 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             rejection_reason
         ))
         conn.commit()
-        return cursor.lastrowid
+        return get_last_insert_id(cursor)
 
 def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
               side: str, qty: float, filled_avg_price: float | None, status: str) -> int:
@@ -133,7 +140,7 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
             status
         ))
         conn.commit()
-        return cursor.lastrowid
+        return get_last_insert_id(cursor)
 
 def log_portfolio_history(equity: float, cash: float, unrealized_pnl: float):
     """Saves portfolio metrics history."""
@@ -185,7 +192,7 @@ def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules
             meta_reasoning
         ))
         conn.commit()
-        return cursor.lastrowid
+        return get_last_insert_id(cursor)
 
 def get_active_strategy(ticker: str) -> str:
     """Retrieves the most recent daily strategy rules for a ticker, falling back to default rules if none exists."""
@@ -199,11 +206,8 @@ def get_active_strategy(ticker: str) -> str:
         if row:
             return row["todays_rules"]
         
-        # High-quality default fallbacks
-        if ticker in ("SOL/USD", "SOLUSD"):
-            return "SOL is highly volatile. Trade only on major trend deviations (e.g. RSI below 35 or above 68) or strong MACD crossovers. Preserve cash when sideways."
-        else:
-            return "Focus on conservative capital growth. Trade SPY and QQQ indices when they drop to Support/Bollinger Low limits or exhibit oversold RSI trends (< 40). Avoid over-trading."
+        # Don't do any fallbacks!
+        return f"No active strategy rules defined for {ticker}."
 
 def get_performance_summary() -> dict:
     """
@@ -420,7 +424,7 @@ def log_watchlist(symbols: list[str]) -> int:
             json.dumps(symbols)
         ))
         conn.commit()
-        return cursor.lastrowid
+        return get_last_insert_id(cursor)
 
 # Auto-initialize database on import so the tables exist right away
 init_db()
@@ -498,4 +502,7 @@ class Database:
 
     def get_latest_watchlist_raw(self) -> list[str]:
         return get_latest_watchlist_raw()
+
+    def get_active_strategy(self, ticker: str) -> str:
+        return get_active_strategy(ticker)
 
