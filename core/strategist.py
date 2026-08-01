@@ -29,6 +29,14 @@ from core import logger_setup
 logger_setup.setup_logging(app_name="agent-trade", env="production")
 logger = logging.getLogger("MetaStrategist")
 
+
+def build_strategy_universe(positions: dict, watchlist_tickers: list[str]) -> list[str]:
+    """Return every configured, held, and watched symbol once in stable order."""
+    return list(dict.fromkeys(
+        ticker.upper()
+        for ticker in [*config.TRADING_UNIVERSE, *positions.keys(), *watchlist_tickers]
+    ))
+
 class MetaStrategist:
     """The high-level portfolio strategist that runs daily to audit performance and generate dynamic rules."""
     
@@ -62,7 +70,7 @@ class MetaStrategist:
                     self.is_mock = True
 
     def run_daily_strategy_refinement(self, alpaca_client: AlpacaClient):
-        """Runs the strategist routine for all tickers in the trading universe."""
+        """Runs the strategist routine for all relevant tickers (universe, holdings, and watchlist)."""
         logger.info("Executing daily strategy review and rule refinement...")
         
         # 1. Fetch account & portfolio state
@@ -81,8 +89,19 @@ class MetaStrategist:
             logger.error(f"Error fetching DB trade/decision records: {e}")
             recent_trades, recent_decisions = [], []
 
-        # 3. Process each ticker in the universe
-        for ticker in config.TRADING_UNIVERSE:
+        # Load watchlist tickers from screener pool
+        watchlist_tickers = []
+        try:
+            from core.screener import load_screener_pool
+            watchlist_tickers = load_screener_pool()
+        except Exception as se:
+            logger.warning(f"Could not load screener pool for daily strategist: {se}")
+
+        # Combine all relevant tickers: TRADING_UNIVERSE + active positions + watchlist tickers
+        all_tickers = build_strategy_universe(positions, watchlist_tickers)
+
+        # 3. Process each relevant ticker
+        for ticker in all_tickers:
             logger.info(f"Analyzing daily regime for {ticker}...")
             
             # A. Fetch historical bar data (last 30 daily candles)
@@ -93,8 +112,7 @@ class MetaStrategist:
                 logger.error(f"Failed to fetch market data for {ticker}: {e}")
                 continue
 
-            # B. Get active strategy rules from yesterday
-            # Since get_active_strategy has a default fallback, this will always return a valid starting rule
+            # B. Get active strategy rules from yesterday (or the explicit missing-rule notice)
             yesterdays_rules = database.get_active_strategy(ticker)
             
             # C. Generate refined strategy rules
@@ -108,12 +126,17 @@ class MetaStrategist:
                 account_state=account_state,
                 positions=positions
             )
+
+            todays_rules = result.get("todays_rules", "").strip()
+            if not todays_rules or todays_rules.startswith("No active strategy rules defined for "):
+                logger.error(f"Strategist did not generate a valid rule for {ticker}; leaving it missing for a later retry.")
+                continue
             
             # D. Log the new strategy into history
             db_id = database.log_strategy_history(
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
-                todays_rules=result["todays_rules"],
+                todays_rules=todays_rules,
                 meta_reasoning=result["meta_reasoning"]
             )
             
@@ -297,7 +320,7 @@ Schema:
                 "todays_rules": yesterdays_rules
             }
 
-    def run_single_ticker_refinement(self, ticker: str, alpaca_client: AlpacaClient):
+    def run_single_ticker_refinement(self, ticker: str, alpaca_client: AlpacaClient) -> bool:
         """Runs an emergency intraday strategy refinement for a single ticker."""
         ticker = ticker.upper()
         logger.info(f"[EMERGENCY] Intraday shock detected for {ticker}. Running immediate strategy re-evaluation...")
@@ -322,17 +345,24 @@ Schema:
                 account_state=account_state,
                 positions=positions
             )
+
+            todays_rules = result.get("todays_rules", "").strip()
+            if not todays_rules or todays_rules.startswith("No active strategy rules defined for "):
+                logger.error(f"Emergency strategist did not generate a valid rule for {ticker}.")
+                return False
             
             db_id = database.log_strategy_history(
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
-                todays_rules=result["todays_rules"],
+                todays_rules=todays_rules,
                 meta_reasoning=f"[EMERGENCY INTRADAY RE-EVALUATION] {result['meta_reasoning']}"
             )
             logger.info(f"Emergency rules updated for {ticker}. DB ID: {db_id}")
-            logger.info(f"Emergency Rules: {result['todays_rules']}\n")
+            logger.info(f"Emergency Rules: {todays_rules}\n")
+            return True
         except Exception as e:
             logger.error(f"Failed to run emergency refinement for {ticker}: {e}")
+            return False
 
     def _generate_mock_refinement(self, ticker: str, yesterdays_rules: str) -> dict:
         """Fallback mock rules generator if no Gemini API key is configured."""

@@ -54,8 +54,15 @@ class TradingBrain:
                     self.client = genai.Client(api_key=self.api_key)
                     logger.info(f"Successfully initialized Gemini Strategy Brain with model {self.model_name}.")
                 except Exception as e:
-                    logger.error(f"Failed to initialize Gemini Client: {e}. Falling back to rule-based brain.")
-                    self.is_mock = True
+                    logger.error(f"Failed to initialize Gemini Client: {e}. Attempting fallback to OpenRouter.")
+                    self.provider = "openrouter" # Fallback to OpenRouter
+                    try:
+                        from core.llm_client import SharedLLMClient
+                        self.llm_client = SharedLLMClient()
+                        logger.info("Successfully initialized OpenRouter SharedLLMClient for TradingBrain (Daily Driver Tier).")
+                    except Exception as e:
+                        logger.error(f"Failed to initialize OpenRouter SharedLLMClient: {e}. Falling back to mock rule-based brain.")
+                        self.is_mock = True
         else:
             logger.warning(f"Unsupported provider '{self.provider}'. Falling back to rule-based brain.")
             self.is_mock = True

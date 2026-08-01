@@ -195,7 +195,7 @@ def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules
         return get_last_insert_id(cursor)
 
 def get_active_strategy(ticker: str) -> str:
-    """Retrieves the most recent daily strategy rules for a ticker, falling back to default rules if none exists."""
+    """Retrieve the latest persisted strategy, without synthesizing fallback rules."""
     ticker = ticker.upper()
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -206,7 +206,6 @@ def get_active_strategy(ticker: str) -> str:
         if row:
             return row["todays_rules"]
         
-        # Don't do any fallbacks!
         return f"No active strategy rules defined for {ticker}."
 
 def get_performance_summary() -> dict:

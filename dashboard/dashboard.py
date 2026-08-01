@@ -288,8 +288,34 @@ def status_cache_worker():
                 print(f"[Dashboard Server] Failed to read kill switch: {ks_err}", file=sys.stderr)
 
             # Weekend Skip Check
-            skip_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".weekend_skip.json")
-            weekend_skip = os.path.exists(skip_file_path)
+            # Dynamic calculation matching runner's stateless hibernation logic
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo("America/New_York")
+                now_et = datetime.now(tz)
+            except Exception:
+                try:
+                    import pytz
+                    tz = pytz.timezone("America/New_York")
+                    now_et = datetime.now(tz)
+                except Exception:
+                    now_et = datetime.now()
+
+            weekday = now_et.weekday()
+            current_minutes = now_et.hour * 60 + now_et.minute
+            is_weekend_hours = False
+            if weekday >= 5: # Saturday or Sunday
+                is_weekend_hours = True
+            elif weekday == 4 and current_minutes >= (16 * 60 + 30): # Friday after 16:30
+                is_weekend_hours = True
+            elif weekday == 0 and current_minutes < (9 * 60): # Monday before 09:00
+                is_weekend_hours = True
+
+            crypto_positions = [
+                sym for sym in positions.keys()
+                if "/" in sym or "USD" in sym or "SOL" in sym
+            ]
+            weekend_skip = is_weekend_hours and not crypto_positions
 
             # Assemble payload
             payload = {

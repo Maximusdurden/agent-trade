@@ -539,7 +539,7 @@ class AlpacaClient:
                 logger.error(f"Fallback to historical bars failed for {symbol}: {bar_err}")
             raise ValueError(f"Could not resolve real-time or historical price for {symbol}: {e}")
 
-    def execute_market_order(self, symbol: str, qty: float, side: str, take_profit_price: float = None, stop_loss_price: float = None) -> dict:
+    def execute_market_order(self, symbol: str, qty: float, side: str, take_profit_price: float | None = None, stop_loss_price: float | None = None) -> dict:
         """Executes a market order, optionally adding bracket take-profit and stop-loss legs for BUY actions on non-crypto assets."""
         symbol = symbol.upper()
         side = side.lower()

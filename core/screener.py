@@ -154,7 +154,7 @@ def calculate_technical_score(row: pd.Series) -> float:
             
     return score
 
-def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_limit: int = 5, candidates: list[str] = None) -> list[str]:
+def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_limit: int = 5, candidates: list[str] | None = None) -> list[str]:
     """
     Runs the autonomous screener cycle:
     1. Loads candidates from screener_pool.json if none provided.
@@ -210,7 +210,15 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
         
         # Min Daily Dollar Volume threshold: $10,000,000 (10M)
         # For mock client, we can relax or skip this filter, but we also mock volume to be large
-        if avg_dollar_vol < 10000000.0:
+
+        # Check if the symbol is a cryptocurrency (e.g., SOL/USD)
+        is_crypto = '/' in symbol or symbol.endswith('USD')
+
+        # Apply volume filter only if it's not a cryptocurrency
+        if not is_crypto and avg_dollar_vol <= 10_000_000:
+            logger.debug(f"Skipping {symbol}: Avg daily dollar volume ${avg_dollar_vol:,.2f} is below $10M threshold.")
+            continue # Skip this symbol
+        if not is_crypto and avg_dollar_vol < 10000000.0:
             logger.debug(f"Filtering out {symbol}: Illiquid (Avg Dollar Vol: ${avg_dollar_vol:,.2f})")
             continue
             

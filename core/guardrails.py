@@ -207,7 +207,23 @@ class RiskGuardrails:
                     return False, f"Rejected: Buy quantity scaled down to 0 because total position allocation for {symbol} would exceed the per-ticker limit of {config.MAX_TICKER_ALLOCATION_PCT * 100}% of equity.", adjusted_decision
 
             # Ensure we maintain the cash buffer
-            min_cash_required = equity * config.MIN_CASH_BUFFER_PCT
+            # Calculate dynamic cash buffer based on number of open positions
+            num_open_positions = len(current_positions)
+            
+            # Base buffer percentage (e.g., 5%)
+            base_buffer_pct = 0.05
+            
+            # Additional buffer per open position (e.g., 1%)
+            per_position_buffer_pct = 0.01
+            
+            # Maximum buffer percentage (e.g., 25%)
+            max_buffer_pct = 0.25
+            
+            # Calculate dynamic buffer percentage
+            dynamic_buffer_pct = min(max_buffer_pct, base_buffer_pct + (num_open_positions * per_position_buffer_pct))
+            
+            min_cash_required = equity * dynamic_buffer_pct
+            
             available_spending_cash = cash - min_cash_required
             
             if available_spending_cash <= 0:

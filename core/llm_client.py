@@ -84,30 +84,31 @@ class SharedLLMClient:
         # 2. Enforce timeout with exponential backoff retries
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             retry_count = 0
-            while retry_count <= self.max_retries:
-                try:
-                    future = executor.submit(
-                        or_client.execute_completion,
-                        prompt=prompt,
-                        system_prompt=actual_system_prompt,
-                        tier=tier,
-                        stream=False,
-                        max_output_tokens=max_output_tokens
-                    )
-                    timeout = min(self.initial_timeout, self.max_backoff * (2 ** retry_count))
-                    logger.info(f"Attempt {retry_count + 1}/{self.max_retries + 1} with timeout: {timeout}s")
-                    logger.debug(f"Calculated timeout: {timeout}s (retry_count: {retry_count}, max_backoff: {self.max_backoff})")
-                    response_text = future.result(timeout=timeout)
-                    break
-                except concurrent.futures.TimeoutError as te:
-                    retry_count += 1
-                    if retry_count > self.max_retries:
-                        logger.critical(f"OpenRouter request timed out after {timeout}s (attempt {retry_count})")
-                        logger.debug(f"Request payload: {prompt[:500]}...")
-                        raise LLMClientError(f"OpenRouter request timed out after {timeout}s") from te
-                    delay = min(self.retry_delay * (2 ** retry_count), self.max_backoff)
-                    logger.warning(f"Timeout, retrying in {delay}s...")
-                    time.sleep(delay)
+            try:
+                while retry_count <= self.max_retries:
+                    try:
+                        future = executor.submit(
+                            or_client.execute_completion,
+                            prompt=prompt,
+                            system_prompt=actual_system_prompt,
+                            tier=tier,
+                            stream=False,
+                            max_output_tokens=max_output_tokens
+                        )
+                        timeout = min(self.initial_timeout, self.max_backoff * (2 ** retry_count))
+                        logger.info(f"Attempt {retry_count + 1}/{self.max_retries + 1} with timeout: {timeout}s")
+                        logger.debug(f"Calculated timeout: {timeout}s (retry_count: {retry_count}, max_backoff: {self.max_backoff})")
+                        response_text = future.result(timeout=timeout)
+                        break
+                    except concurrent.futures.TimeoutError as te:
+                        retry_count += 1
+                        if retry_count > self.max_retries:
+                            logger.critical(f"OpenRouter request timed out after {timeout}s (attempt {retry_count})")
+                            logger.debug(f"Request payload: {prompt[:500]}...")
+                            raise LLMClientError(f"OpenRouter request timed out after {timeout}s") from te
+                        delay = min(self.retry_delay * (2 ** retry_count), self.max_backoff)
+                        logger.warning(f"Timeout, retrying in {delay}s...")
+                        time.sleep(delay)
             except Exception as e:
                 logger.critical(f"OpenRouter client connection error: {e}")
                 raise LLMClientError(f"OpenRouter client connection error: {e}") from e

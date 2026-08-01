@@ -43,6 +43,49 @@ def format_positions(positions: dict) -> str:
     return ", ".join(parts)
 
 
+def is_crypto_symbol(symbol: str) -> bool:
+    """Return whether a symbol is a configured or slash-delimited crypto pair."""
+    normalized = symbol.strip().upper().replace("-", "/")
+    if "/" in normalized:
+        base, _, quote = normalized.partition("/")
+        return bool(base) and quote in {"USD", "USDT", "USDC", "BTC"}
+
+    compact_crypto_symbols = {
+        configured.upper().replace("/", "")
+        for configured in config.TRADING_UNIVERSE
+        if "/" in configured
+    }
+    return normalized in compact_crypto_symbols
+
+
+def build_appraisal_universe(screened_symbols: list[str], positions: dict,
+                             actual_market_open: bool) -> list[str]:
+    """Build a deduplicated universe, excluding equities whenever their market is closed."""
+    candidates = [*screened_symbols, *positions.keys()]
+    if not actual_market_open:
+        candidates = [symbol for symbol in candidates if is_crypto_symbol(symbol)]
+    return list(dict.fromkeys(candidates))
+
+
+def ensure_active_strategy(symbol: str, alpaca_client: AlpacaClient) -> bool:
+    """Generate a missing strategy on demand and confirm that it was persisted."""
+    missing_prefix = "No active strategy rules defined for "
+    if not database.get_active_strategy(symbol).startswith(missing_prefix):
+        return True
+
+    logger.warning(f"No active strategy rule found for {symbol} in database. Triggering on-demand/emergency strategist run...")
+    try:
+        from core.strategist import MetaStrategist
+        MetaStrategist().run_single_ticker_refinement(symbol, alpaca_client)
+    except Exception as err:
+        logger.error(f"Could not execute on-demand strategist update for {symbol}: {err}")
+
+    if database.get_active_strategy(symbol).startswith(missing_prefix):
+        logger.error(f"No valid strategy rule is available for {symbol}; skipping appraisal this cycle.")
+        return False
+    return True
+
+
 # Setup Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +101,7 @@ logger = logging.getLogger("Runner")
 
 def check_execution_window(alpaca_client: AlpacaClient) -> tuple[bool, str]:
     """
-    Checks if the current time is between 09:00 and 16:30 Eastern Time on a weekday
+    Checks if the current time is between 09:30 and 16:30 Eastern Time on a weekday
     when the US equity market is open today.
     """
     try:
@@ -80,13 +123,13 @@ def check_execution_window(alpaca_client: AlpacaClient) -> tuple[bool, str]:
     if weekday >= 5:
         return False, f"Weekend ({now.strftime('%A')})."
 
-    # 2. Time-of-day check (09:00 to 16:30 Eastern Time)
+    # 2. Time-of-day check (standard session open through the configured close buffer)
     current_minutes = now.hour * 60 + now.minute
-    start_minutes = 9 * 60          # 09:00
+    start_minutes = 9 * 60 + 30     # 09:30
     end_minutes = 16 * 60 + 30      # 16:30
     
     if current_minutes < start_minutes or current_minutes > end_minutes:
-        return False, f"Outside allowed window of 09:00 - 16:30 ET (Current Eastern Time: {now.strftime('%H:%M')})."
+        return False, f"Outside allowed window of 09:30 - 16:30 ET (Current Eastern Time: {now.strftime('%H:%M')})."
 
     # 3. Market Open Today Check (Alpaca Calendar)
     if alpaca_client.is_mock:
@@ -106,9 +149,11 @@ def check_execution_window(alpaca_client: AlpacaClient) -> tuple[bool, str]:
                 return False, f"Market is closed today ({today_date}) according to Alpaca calendar (Holiday)."
             
             # Additional check: verify if the calendar entry is indeed today
+            from typing import Any
             market_open_today = False
             for entry in calendar_entries:
-                entry_date = entry.date
+                entry_any: Any = entry
+                entry_date = entry_any.date
                 if isinstance(entry_date, str):
                     try:
                         entry_date = datetime.strptime(entry_date, "%Y-%m-%d").date()
@@ -139,6 +184,8 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     try:
         from core.gcs_sync import download_from_gcs
         download_from_gcs()
+        from core.database import init_db
+        init_db()
     except Exception as gcs_dl_err:
         logger.error(f"Failed to download files from GCS: {gcs_dl_err}")
 
@@ -152,35 +199,14 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     except Exception as ks_err:
         logger.warning(f"Failed to check GCS kill switch: {ks_err}")
 
-    # Paths for state files
-    skip_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weekend_skip.json")
-    cadence_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".daily_cadence.json")
-    
     # Fetch current Eastern Time
     now_et = get_current_eastern_time()
     today_str = now_et.strftime('%Y-%m-%d')
     current_minutes = now_et.hour * 60 + now_et.minute
     
-    # 2. Weekend Smart Sleep Skip Check
-    if os.path.exists(skip_file_path):
-        is_monday_or_later = now_et.weekday() == 0  # Monday is 0
-        is_after_start = current_minutes >= (9 * 60)
-        
-        # If we have advanced past Monday 09:00 ET, or we are on Tuesday, etc. (weekday < 5)
-        if (is_monday_or_later and is_after_start) or (now_et.weekday() > 0 and now_et.weekday() < 5):
-            try:
-                os.remove(skip_file_path)
-                logger.info("Weekend Smart Sleep ended. Resuming trading...")
-            except Exception as rm_err:
-                logger.warning(f"Failed to delete {skip_file_path}: {rm_err}")
-        else:
-            logger.info("Runner: Skipping execution cycle. Weekend Smart Sleep active until Monday 09:00 ET.")
-            return
-
-    # Check execution window (09:00 - 16:30 ET, weekdays, market open)
-    is_market_open, market_reason = check_execution_window(alpaca_client)
-    if os.getenv("BYPASS_MARKET_WINDOW") == "True":
-        is_market_open = True
+    # This actual exchange state always controls asset eligibility. A bypass must
+    # never make equities eligible while their market is closed.
+    actual_market_open, market_reason = check_execution_window(alpaca_client)
 
     logger.info("Starting autonomous trading cycle...")
     
@@ -218,17 +244,8 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     elif weekday == 0 and current_minutes < (9 * 60): # Monday before 09:00
         is_weekend_hours = True
 
-    # 3. Daily Status Cadence & Friday Smart Sleep Triggers
+    # 3. Daily Status Cadence & Friday Smart Sleep Triggers (fully DB backed)
     try:
-        # Load or initialize cadence state
-        cadence = {}
-        if os.path.exists(cadence_file_path):
-            try:
-                with open(cadence_file_path, "r", encoding="utf-8") as f:
-                    cadence = json.load(f)
-            except Exception:
-                pass
-
         from core.discord_notifier import send_discord_message
         positions_str = format_positions(positions)
 
@@ -247,11 +264,12 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
 
         # B. Evening Shutdown Message / Friday Smart Sleep (Weekdays, at or after 16:30 ET)
         if weekday < 5 and current_minutes >= (16 * 60 + 30):
-            if cadence.get("last_evening_sent") != today_str:
+            last_evening_sent = database.get_system_state("last_evening_sent")
+            if last_evening_sent != today_str:
                 if weekday == 4: # Friday close
                     crypto_positions = [
                         sym for sym in positions.keys()
-                        if "/" in sym or "USD" in sym or "SOL" in sym
+                        if is_crypto_symbol(sym)
                     ]
                     if not crypto_positions:
                         # Friday evening, no crypto held -> go to sleep!
@@ -264,16 +282,15 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                             f"See you next Monday morning!"
                         )
                         send_discord_message(msg)
-                        # Write skip file
-                        try:
-                            with open(skip_file_path, "w", encoding="utf-8") as f:
-                                json.dump({"hibernating_since": now_et.isoformat()}, f, indent=2)
-                        except Exception as w_err:
-                            logger.warning(f"Failed to write skip file: {w_err}")
+                        database.set_system_state("last_evening_sent", today_str)
+                        database.set_system_state("last_weekend_hibernate_notified", today_str)
                         
-                        cadence["last_evening_sent"] = today_str
-                        with open(cadence_file_path, "w", encoding="utf-8") as f:
-                            json.dump(cadence, f, indent=2)
+                        # Sync DB back to GCS and exit
+                        try:
+                            from core.gcs_sync import upload_to_gcs
+                            upload_to_gcs()
+                        except Exception as gcs_err:
+                            logger.error(f"Failed to sync to GCS: {gcs_err}")
                         return # Exit cycle immediately since we are hibernating
                     else:
                         # Friday evening, crypto held -> crypto desk remains active
@@ -286,6 +303,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                             f"Crypto desk remains active!"
                         )
                         send_discord_message(msg)
+                        database.set_system_state("last_evening_sent", today_str)
                 else:
                     # Regular weekday evening shutdown
                     msg = (
@@ -295,49 +313,57 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                         f"* **Open Positions**: {positions_str}"
                     )
                     send_discord_message(msg)
-                
-                cadence["last_evening_sent"] = today_str
-                with open(cadence_file_path, "w", encoding="utf-8") as f:
-                    json.dump(cadence, f, indent=2)
+                    database.set_system_state("last_evening_sent", today_str)
                     
     except Exception as cadence_err:
         logger.error(f"Error handling daily status cadence or smart Friday triggers: {cadence_err}")
 
     # 4. Weekend Dynamic Hibernation (If we are inside weekend hours, and positions drop to 0)
-    if is_weekend_hours and not os.path.exists(skip_file_path):
+    if is_weekend_hours:
         crypto_positions = [
             sym for sym in positions.keys()
-            if "/" in sym or "USD" in sym or "SOL" in sym
+            if is_crypto_symbol(sym)
         ]
         if not crypto_positions:
             logger.info("No active crypto positions held over the weekend. Entering Weekend Smart Sleep.")
-            try:
-                with open(skip_file_path, "w", encoding="utf-8") as f:
-                    json.dump({"hibernating_since": now_et.isoformat()}, f, indent=2)
-            except Exception as w_err:
-                logger.warning(f"Failed to write skip file: {w_err}")
             
-            from core.discord_notifier import send_discord_message
-            send_discord_message("No active crypto positions held over the weekend. Entering Weekend Smart Sleep mode. Crypto desk hibernation active until Monday 09:00 ET.")
+            # Send notification once per weekend
+            from datetime import timedelta
+            days_since_friday = (weekday - 4) % 7
+            last_friday = now_et - timedelta(days=days_since_friday)
+            weekend_key = f"weekend_hibernate_{last_friday.strftime('%Y-%m-%d')}"
+            
+            last_notified = database.get_system_state(weekend_key)
+            if last_notified != "notified":
+                from core.discord_notifier import send_discord_message
+                send_discord_message("No active crypto positions held over the weekend. Entering Weekend Smart Sleep mode. Crypto desk hibernation active until Monday 09:00 ET.")
+                database.set_system_state(weekend_key, "notified")
+                
+                # Sync database to GCS
+                try:
+                    from core.gcs_sync import upload_to_gcs
+                    upload_to_gcs()
+                except Exception as gcs_err:
+                    logger.error(f"Failed to sync to GCS: {gcs_err}")
+            
+            logger.info("Gracefully exiting runner during weekend sleep.")
             return # Exit cycle since we just entered sleep
 
     # Check if we should allow trading for the current market state
-    if not is_market_open:
+    if not actual_market_open:
         logger.info(f"US Equity Market is closed ({market_reason}). Continuing cycle for CRYPTO ONLY trading.")
 
 
-    # 3. Fetch indicators and market state for the screened watchlist
-    actual_market_open, _ = check_execution_window(alpaca_client)
-    
     # Run the dynamic AI screener to select top candidates
     try:
         from core.screener import run_screener, load_screener_pool
-        screener_candidates = None
+        screener_candidates = load_screener_pool()
+        
+        # Filter screener candidates to crypto only if outside market hours
         if not actual_market_open:
-            full_pool = load_screener_pool()
             screener_candidates = [
-                symbol for symbol in full_pool 
-                if "/" in symbol or "USD" in symbol or "SOL" in symbol
+                symbol for symbol in screener_candidates 
+                if is_crypto_symbol(symbol)
             ]
             logger.info(f"US Equity Market is closed/outside hours. Filtering screener candidates to CRYPTO ONLY: {screener_candidates}")
             
@@ -347,16 +373,18 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         logger.error(f"Screener execution failed: {screener_err}. Falling back to static TRADING_UNIVERSE.")
         screened_list = config.TRADING_UNIVERSE
         
-    filtered_universe = screened_list
-    if not actual_market_open:
-        filtered_universe = [
-            symbol for symbol in screened_list 
-            if "/" in symbol or "USD" in symbol or "SOL" in symbol
-        ]
-        logger.info(f"US Equity Market is closed/outside hours. Double-checking watchlist is filtered to CRYPTO ONLY: {filtered_universe}")
+    # Re-filter after the screener because its own error paths can return a static
+    # mixed-asset fallback universe.
+    filtered_universe = build_appraisal_universe(screened_list, positions, actual_market_open)
+    logger.info(f"Final tradeable appraisal universe: {filtered_universe}")
         
     market_states = []
     for symbol in filtered_universe:
+        # Check if an active strategy rule exists in the database for this symbol.
+        # If no rule exists, trigger on-demand strategist refinement to write a tailored rule immediately.
+        if not ensure_active_strategy(symbol, alpaca_client):
+            continue
+
         logger.info(f"Fetching market data and indicators for {symbol}...")
         state = data_provider.get_market_state(symbol)
         if state:
@@ -365,7 +393,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             
             # Intraday Shock Check (Triggering dynamic emergency strategist updates)
             # Threshold: 3.0% for stock indices (SPY/QQQ), 8.0% for highly volatile crypto (SOL)
-            is_crypto = "SOL" in symbol.upper() or "USD" in symbol.upper()
+            is_crypto = is_crypto_symbol(symbol)
             shock_threshold = 8.0 if is_crypto else 3.0
             daily_change = state["daily_return_pct"]
             
@@ -394,7 +422,10 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
 
     # 5. Let the AI Brain reason and generate a decision
     logger.info("Querying AI strategy brain for proposed action...")
-    decision = brain.make_decision(market_states, account_state, positions, recent_decisions)
+    appraised_positions = positions if actual_market_open else {
+        symbol: details for symbol, details in positions.items() if is_crypto_symbol(symbol)
+    }
+    decision = brain.make_decision(market_states, account_state, appraised_positions, recent_decisions)
     
     # Enrich decision with current pricing data for guardrail calculations
     target_symbol = decision.get("symbol", "").upper()
@@ -440,7 +471,11 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         take_profit_price = adjusted_decision.get("take_profit_price")
         stop_loss_price = adjusted_decision.get("stop_loss_price")
         
-        is_crypto = "/" in symbol or "USD" in symbol or "SOL" in symbol
+        is_crypto = is_crypto_symbol(symbol)
+
+        if not actual_market_open and not is_crypto:
+            logger.error(f"Blocking {action} for equity {symbol}: the US equity market is closed.")
+            return
         
         if action == "BUY" and not is_crypto:
             # Fetch the real-time latest trade price as base_price to prevent validation failure due to price drift.
