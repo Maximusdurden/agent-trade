@@ -14,6 +14,8 @@ $GcpProject = ""
 $AlpacaApiKey = ""
 $AlpacaSecretKey = ""
 $AlpacaPaper = ""
+$GeminiApiKey = ""
+$GeminiModel = ""
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -24,6 +26,8 @@ Get-Content $EnvPath | ForEach-Object {
         if ($Key -eq "ALPACA_API_KEY") { $AlpacaApiKey = $Val }
         if ($Key -eq "ALPACA_SECRET_KEY") { $AlpacaSecretKey = $Val }
         if ($Key -eq "ALPACA_PAPER") { $AlpacaPaper = $Val }
+        if ($Key -eq "GEMINI_API_KEY") { $GeminiApiKey = $Val }
+        if ($Key -eq "GEMINI_MODEL") { $GeminiModel = $Val }
     }
 }
 
@@ -119,7 +123,7 @@ gcloud run deploy $ServiceName `
     --image $ImageTag `
     --region $Region `
     --project $GcpProject `
-    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper" `
+    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper,GEMINI_API_KEY=$GeminiApiKey,GEMINI_MODEL=$GeminiModel" `
     --quiet
 
 # 7. Clean Staging Directory
