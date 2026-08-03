@@ -1,4 +1,12 @@
 .git
+.env
+.venv
+venv
+deploy/temp_staging*
+__pycache__
+*.pyc
+*.db
+*.log.git
 .gitignore
 venv/
 __pycache__/

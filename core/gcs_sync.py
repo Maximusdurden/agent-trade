@@ -11,8 +11,14 @@ def get_gcs_client():
     Returns a google.cloud.storage.Client instance.
     First tries service account credentials from GOOGLE_APPLICATION_CREDENTIALS.
     Falls back to default authentication (works on Cloud Run / environments with ADC).
+    Returns None if no credentials are available (e.g. local dev without ADC).
     """
-    from google.cloud import storage
+    try:
+        from google.cloud import storage
+    except ImportError:
+        logger.warning("google.cloud.storage not installed. GCS sync unavailable.")
+        return None
+
     try:
         # Try service account credentials first
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -20,11 +26,16 @@ def get_gcs_client():
             client = storage.Client.from_service_account_json(creds_path)
             return client
 
+        # Check if ADC is available before attempting default auth
+        if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and not os.getenv("GCS_BUCKET_NAME"):
+            return None
+
         # Fallback to default credentials
         client = storage.Client()
         return client
     except Exception as e:
-        raise RuntimeError(f"Failed to authenticate with GCS. Please ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly. Error details: {e}")
+        logger.warning(f"Failed to authenticate with GCS: {e}. GCS sync will be skipped.")
+        return None
 
 def download_from_gcs():
     """
@@ -39,6 +50,9 @@ def download_from_gcs():
     try:
         logger.info(f"Downloading database and balances from gs://{gcs_bucket}...")
         client = get_gcs_client()
+        if client is None:
+            logger.warning("GCS client unavailable. Skipping download.")
+            return
         bucket = client.bucket(gcs_bucket)
 
         # 1. Download database
@@ -76,6 +90,9 @@ def upload_to_gcs():
     try:
         logger.info(f"Uploading database and logs to gs://{gcs_bucket}...")
         client = get_gcs_client()
+        if client is None:
+            logger.warning("GCS client unavailable. Skipping upload.")
+            return
         bucket = client.bucket(gcs_bucket)
 
         # 1. Upload database
@@ -129,6 +146,15 @@ def check_kill_switch() -> dict:
 
     try:
         client = get_gcs_client()
+        if client is None:
+            logger.warning("GCS client unavailable. Falling back to local kill switch.")
+            if os.path.exists(local_path):
+                try:
+                    with open(local_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+            return {"status": "ACTIVE", "updated_at": "", "updated_by": "default"}
         bucket = client.bucket(gcs_bucket)
         blob = bucket.blob("kill_switch.json")
         if blob.exists():
@@ -179,6 +205,9 @@ def set_kill_switch_state(status: str, updated_by: str = "system") -> bool:
 
     try:
         client = get_gcs_client()
+        if client is None:
+            logger.warning("GCS client unavailable. Kill switch saved locally only.")
+            return True
         bucket = client.bucket(gcs_bucket)
         blob = bucket.blob("kill_switch.json")
         blob.upload_from_string(json.dumps(data, indent=2), content_type="application/json")

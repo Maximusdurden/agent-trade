@@ -11,8 +11,8 @@ from runner import (
     build_appraisal_universe,
     check_execution_window,
     ensure_active_strategy,
-    is_crypto_symbol,
 )
+from core.strategy_rules import is_crypto_symbol, normalize_symbol, validate_strategy_rule
 
 
 class TestWatchlistStrategyCoverage(unittest.TestCase):
@@ -57,6 +57,34 @@ class TestWatchlistStrategyCoverage(unittest.TestCase):
         self.assertFalse(is_crypto_symbol("USD"))
         self.assertFalse(is_crypto_symbol("USDP"))
         self.assertFalse(is_crypto_symbol("NEE"))
+
+    def test_crypto_symbol_normalization_accepts_compact_pairs(self):
+        self.assertEqual(normalize_symbol("btcusd"), "BTC/USD")
+        self.assertEqual(normalize_symbol("SOL-USD"), "SOL/USD")
+
+    def test_crypto_rule_rejects_equity_only_mandate(self):
+        valid, reason = validate_strategy_rule(
+            "BTC/USD",
+            "Only trade SPY and QQQ when their RSI is below 40; otherwise hold.",
+        )
+        self.assertFalse(valid)
+        self.assertEqual(reason, "crypto_rule_scoped_to_equity_indices")
+
+    def test_crypto_rule_rejects_observed_spy_qqq_rule_without_only_keyword(self):
+        valid, reason = validate_strategy_rule(
+            "ETH/USD",
+            "Focus on conservative growth. Trade SPY and QQQ when RSI is below 40. Avoid over-trading.",
+        )
+        self.assertFalse(valid)
+        self.assertEqual(reason, "crypto_rule_scoped_to_equity_indices")
+
+    def test_crypto_rule_accepts_ticker_specific_threshold(self):
+        valid, reason = validate_strategy_rule(
+            "BTC/USD",
+            "If BTC falls 3% below VWAP, then hold; buy BTC only near confirmed support.",
+        )
+        self.assertTrue(valid)
+        self.assertEqual(reason, "valid")
 
     @patch("runner.datetime")
     def test_equity_window_rejects_weekday_premarket(self, datetime_mock):

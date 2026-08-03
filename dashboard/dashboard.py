@@ -7,7 +7,7 @@ import sys
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Initialize google.cloud.storage first to prevent Python namespace conflicts with google-genai
 try:
@@ -189,6 +189,53 @@ def get_latest_watchlist():
         print(f"[Dashboard Server] Error fetching latest watchlist: {e}", file=sys.stderr)
     return []
 
+
+def get_data_freshness(heartbeat: dict, interval_minutes: int | None = None,
+                       now_utc: datetime | None = None) -> dict:
+    """Classify runner health independently from the latest trading decision.
+
+    Uses the cycle heartbeat (started_at / completed_at / status) rather than
+    the last trade timestamp so the dashboard can report STALE, RUNNING,
+    FAILED, or CRYPTO_ONLY_MONITORING even when no trades occurred. Staleness
+    is defined as 2× the configured interval plus a 5-minute grace period.
+    """
+    interval = interval_minutes or config.TRADING_INTERVAL_MINUTES
+    current_time = now_utc or datetime.now(timezone.utc)
+    completed_at = heartbeat.get("completed_at", "")
+    started_at = heartbeat.get("started_at", "")
+    status = heartbeat.get("status", "")
+    reference = completed_at or started_at
+    age_seconds = None
+    if reference:
+        try:
+            parsed = datetime.fromisoformat(reference.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_seconds = max(0, (current_time - parsed).total_seconds())
+        except ValueError:
+            pass
+
+    stale_after_seconds = (interval * 2 + 5) * 60
+    if not reference or age_seconds is None or age_seconds > stale_after_seconds:
+        state = "STALE"
+    elif status == "STARTED":
+        state = "RUNNING"
+    elif status in {"FAILED", "ACCOUNT_STATE_FAILED", "NO_MARKET_DATA", "GCS_UPLOAD_FAILED"}:
+        state = "FAILED"
+    elif status == "SKIPPED_KILL_SWITCH":
+        state = "KILL_SWITCH_HALTED"
+    elif heartbeat.get("asset_scope") == "CRYPTO_ONLY":
+        state = "CRYPTO_ONLY_MONITORING"
+    else:
+        state = "HEALTHY"
+
+    return {
+        "state": state,
+        "age_seconds": age_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "server_time_utc": current_time.isoformat().replace("+00:00", "Z"),
+    }
+
 def status_cache_worker():
     """Background thread that periodically fetches Alpaca status and SQLite data to update the global cache."""
     global LATEST_STATUS_CACHE
@@ -232,13 +279,40 @@ def status_cache_worker():
             trades = []
             history = []
             ticker_history = {}
+            broker_orders = []
             try:
                 decisions = database.get_recent_decisions(limit=15)
                 trades = database.get_recent_trades(limit=15)
                 history = get_portfolio_history()
                 ticker_history = get_ticker_history()
+                
+                # 2b. Fetch executed orders directly from Alpaca.  This catches
+                #     TP/SL bracket fills and broker-side sells that the runner
+                #     never logged to the local trades table.  Broker-supplied
+                #     orders are deduplicated by alpaca_order_id — the broker
+                #     wins and the local DB fills any gaps.
+                try:
+                    if not client.is_mock:
+                        alpaca_orders = client.get_executed_orders(limit=100)
+                        # Deduplicate by alpaca_order_id — broker wins, DB fills gaps
+                        db_ids = {t.get("alpaca_order_id") for t in trades if t.get("alpaca_order_id")}
+                        for ao in alpaca_orders:
+                            if ao.get("alpaca_order_id") not in db_ids:
+                                broker_orders.append(ao)
+                            # else: already in trades, skip duplicate
+                        print(f"[Dashboard Server] Fetched {len(alpaca_orders)} broker orders, {len(broker_orders)} new (not in DB).", flush=True)
+                except Exception as broker_err:
+                    print(f"[Dashboard Server] Broker order fetch failed (non-fatal): {broker_err}", file=sys.stderr)
+                    broker_orders = []
             except Exception as db_err:
                 print(f"[Dashboard Server] Database retrieval failed: {db_err}", file=sys.stderr)
+            except Exception as db_err:
+                print(f"[Dashboard Server] Database retrieval failed: {db_err}", file=sys.stderr)
+
+            heartbeat = database.get_cycle_heartbeat()
+            freshness = get_data_freshness(heartbeat)
+            latest_decision_at = decisions[0].get("timestamp", "") if decisions else ""
+            latest_portfolio_at = history[-1].get("timestamp", "") if history else ""
 
             # 3. Retrieve Latest Log Lines
             log_lines = []
@@ -287,42 +361,13 @@ def status_cache_worker():
             except Exception as ks_err:
                 print(f"[Dashboard Server] Failed to read kill switch: {ks_err}", file=sys.stderr)
 
-            # Weekend Skip Check
-            # Dynamic calculation matching runner's stateless hibernation logic
-            try:
-                from zoneinfo import ZoneInfo
-                tz = ZoneInfo("America/New_York")
-                now_et = datetime.now(tz)
-            except Exception:
-                try:
-                    import pytz
-                    tz = pytz.timezone("America/New_York")
-                    now_et = datetime.now(tz)
-                except Exception:
-                    now_et = datetime.now()
-
-            weekday = now_et.weekday()
-            current_minutes = now_et.hour * 60 + now_et.minute
-            is_weekend_hours = False
-            if weekday >= 5: # Saturday or Sunday
-                is_weekend_hours = True
-            elif weekday == 4 and current_minutes >= (16 * 60 + 30): # Friday after 16:30
-                is_weekend_hours = True
-            elif weekday == 0 and current_minutes < (9 * 60): # Monday before 09:00
-                is_weekend_hours = True
-
-            crypto_positions = [
-                sym for sym in positions.keys()
-                if "/" in sym or "USD" in sym or "SOL" in sym
-            ]
-            weekend_skip = is_weekend_hours and not crypto_positions
-
             # Assemble payload
             payload = {
                 "account": account,
                 "positions": positions,
                 "decisions": decisions,
                 "trades": trades,
+                "broker_orders": broker_orders,
                 "history": history,
                 "ticker_history": ticker_history,
                 "dod_balances": dod_balances,
@@ -334,7 +379,10 @@ def status_cache_worker():
                 "is_mock": is_mock,
                 "is_paper": config.ALPACA_PAPER,
                 "kill_switch": kill_switch_state,
-                "weekend_skip": weekend_skip,
+                "heartbeat": heartbeat,
+                "freshness": freshness,
+                "latest_decision_at": latest_decision_at,
+                "latest_portfolio_at": latest_portfolio_at,
                 "error": None
             }
 
@@ -351,6 +399,7 @@ def status_cache_worker():
                         "positions": {},
                         "decisions": [],
                         "trades": [],
+                        "broker_orders": [],
                         "history": [],
                         "ticker_history": {},
                         "logs": [f"[SERVER ERROR] Background cache failed to initialize: {e}"],
@@ -2094,7 +2143,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         function parseUtcTimestamp(ts) {
             if (!ts) return null;
             let str = ts.trim();
-            const hasOffset = /([+-]\d{2}:?\d{2})$/.test(str) || /[Zz]$/.test(str);
+            const hasOffset = /([+-]\\d{2}:?\\d{2})$/.test(str) || /[Zz]$/.test(str);
             if (!hasOffset) {
                 if (str.includes(' ') && !str.includes('T')) {
                     str = str.replace(' ', 'T');
@@ -2525,11 +2574,29 @@ HTML_CONTENT = """<!DOCTYPE html>
                         statusText.style.color = "var(--color-crimson)";
                         statusDot.style.backgroundColor = "var(--color-crimson)";
                         statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
-                    } else if (data.weekend_skip) {
-                        statusText.innerText = "WEEKEND HIBERNATION (SMART SLEEP)";
+                    } else if (data.freshness && data.freshness.state === "STALE") {
+                        statusText.innerText = "RUNNER STALE — HEARTBEAT OVERDUE";
+                        statusText.style.color = "var(--color-crimson)";
+                        statusDot.style.backgroundColor = "var(--color-crimson)";
+                        statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
+                    } else if (data.freshness && data.freshness.state === "FAILED") {
+                        statusText.innerText = "RUNNER FAILED — CHECK CLOUD LOGS";
+                        statusText.style.color = "var(--color-crimson)";
+                        statusDot.style.backgroundColor = "var(--color-crimson)";
+                        statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
+                    } else if (data.freshness && data.freshness.state === "RUNNING") {
+                        statusText.innerText = "TRADING CYCLE RUNNING";
                         statusText.style.color = "var(--color-gold)";
                         statusDot.style.backgroundColor = "var(--color-gold)";
                         statusDot.style.boxShadow = "0 0 10px var(--color-gold)";
+                    } else if (data.freshness && data.freshness.state === "CRYPTO_ONLY_MONITORING") {
+                        const heartbeatTime = data.heartbeat && data.heartbeat.completed_at
+                            ? formatToEastern(data.heartbeat.completed_at)
+                            : 'unknown';
+                        statusText.innerText = `CRYPTO-ONLY MONITORING — HEARTBEAT ${heartbeatTime}`;
+                        statusText.style.color = "var(--color-gold)";
+                        statusDot.style.backgroundColor = "var(--color-green)";
+                        statusDot.style.boxShadow = "0 0 10px var(--color-green)";
                     } else if (data.is_paper) {
                         if (data.is_mock) {
                             statusText.innerText = "SIMULATION LIVE (PAPER - MOCK)";
@@ -2716,22 +2783,36 @@ HTML_CONTENT = """<!DOCTYPE html>
                     }
                 }
 
-                // 4. Trades Database List
+                // 4. Trades Database List — Merge DB trades + live Alpaca broker orders
                 const tradesTbody = document.getElementById('trades-tbody');
                 if (tradesTbody) {
                     tradesTbody.innerHTML = '';
-                    const trades = (data && data.trades) || [];
-                    if (trades.length === 0) {
+                    const dbTrades = (data && data.trades) || [];
+                    const brokerOrders = (data && data.broker_orders) || [];
+                    
+                    // Merge: DB trades first, then broker orders not already in DB
+                    const dbOrderIds = new Set();
+                    dbTrades.forEach(t => { if (t.alpaca_order_id) dbOrderIds.add(t.alpaca_order_id); });
+                    const freshBroker = brokerOrders.filter(o => !dbOrderIds.has(o.alpaca_order_id));
+                    const allOrders = [...dbTrades, ...freshBroker];
+                    // Sort descending by timestamp (newest first)
+                    allOrders.sort((a, b) => {
+                        const tsA = a.timestamp || '';
+                        const tsB = b.timestamp || '';
+                        return tsB.localeCompare(tsA);
+                    });
+
+                    if (allOrders.length === 0) {
                         tradesTbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No orders registered in database.</td></tr>';
                     } else {
-                        trades.forEach(t => {
+                        allOrders.forEach(t => {
                             const side = t.side || 'buy';
                             const sideClass = side.toLowerCase() === 'buy' ? 'text-green' : 'text-crimson';
                             const dateStr = t.timestamp ? formatToEastern(t.timestamp) : 'N/A';
                             const fillPriceStr = t.filled_avg_price ? '$' + t.filled_avg_price.toFixed(2) : '<span style="color: var(--text-muted)">Unfilled</span>';
                             const symbol = t.symbol || 'N/A';
                             const qty = t.qty !== undefined ? t.qty : 0;
-                            const status = t.status || 'unknown';
+                            const status = t.status || 'filled';
                             const orderId = t.alpaca_order_id || 'N/A';
                             
                             tradesTbody.innerHTML += `
@@ -2748,12 +2829,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                         });
                     }
                     
-                    // Populate unique tickers in the select dropdown dynamically
+                    // Populate unique tickers in the select dropdown dynamically (from all orders)
                     const selectEl = document.getElementById('orders-ticker-select');
                     if (selectEl) {
                         const previousValue = selectEl.value;
                         const uniqueSymbols = new Set();
-                        trades.forEach(t => {
+                        allOrders.forEach(t => {
                             if (t.symbol) {
                                 uniqueSymbols.add(t.symbol.toUpperCase());
                             }
@@ -3148,12 +3229,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                 
                 // Convert HTML to clean markdown
                 let text = htmlContent
-                    .replace(/<br\s*\/?>/gi, '\\n')
-                    .replace(/<strong>(.*?)<\/strong>/gi, '**$1**')
-                    .replace(/<b>(.*?)<\/b>/gi, '**$1**')
-                    .replace(/<em>(.*?)<\/em>/gi, '*$1*')
-                    .replace(/<i>(.*?)<\/i>/gi, '*$1*')
-                    .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`')
+                    .replace(/<br\\s*\\/?>/gi, '\\n')
+                    .replace(/<strong>(.*?)<\\/strong>/gi, '**$1**')
+                    .replace(/<b>(.*?)<\\/b>/gi, '**$1**')
+                    .replace(/<em>(.*?)<\\/em>/gi, '*$1*')
+                    .replace(/<i>(.*?)<\\/i>/gi, '*$1*')
+                    .replace(/<code[^>]*>(.*?)<\\/code>/gi, '`$1`')
                     .replace(/<[^>]+>/g, ''); // strip any other tags
                 
                 // Decode basic HTML entities
@@ -4030,6 +4111,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                         "positions": {},
                         "decisions": [],
                         "trades": [],
+                        "broker_orders": [],
                         "history": [],
                         "ticker_history": {},
                         "logs": ["Dashboard server is initializing, please wait..."],

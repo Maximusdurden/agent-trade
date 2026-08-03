@@ -11,6 +11,9 @@ if (-not (Test-Path $EnvPath)) {
 
 Write-Host "--- Loading environment configurations from .env ---"
 $GcpProject = ""
+$AlpacaApiKey = ""
+$AlpacaSecretKey = ""
+$AlpacaPaper = ""
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -18,13 +21,18 @@ Get-Content $EnvPath | ForEach-Object {
         $Key = $Parts[0].Trim()
         $Val = $Parts[1].Trim().Trim("'`"")
         if ($Key -eq "GOOGLE_CLOUD_PROJECT") { $GcpProject = $Val }
+        if ($Key -eq "ALPACA_API_KEY") { $AlpacaApiKey = $Val }
+        if ($Key -eq "ALPACA_SECRET_KEY") { $AlpacaSecretKey = $Val }
+        if ($Key -eq "ALPACA_PAPER") { $AlpacaPaper = $Val }
     }
 }
 
 if (-not [string]::IsNullOrEmpty($env:DEPLOY_GCP_PROJECT)) {
     $GcpProject = $env:DEPLOY_GCP_PROJECT
-} else {
-    $GcpProject = "agenttrade-us"
+}
+
+if ([string]::IsNullOrEmpty($GcpProject)) {
+    Write-Error "GOOGLE_CLOUD_PROJECT is not configured."
 }
 
 if ($GcpProject) {
@@ -39,7 +47,8 @@ if (-not [string]::IsNullOrEmpty($env:DEPLOY_SERVICE_NAME)) {
     $ServiceName = "agenttrade-dashboard"
 }
 
-$ImageTag = "us-east1-docker.pkg.dev/" + $GcpProject + "/cloud-run-source-deploy/" + $ServiceName + ":latest"
+$BuildId = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+$ImageTag = "us-east1-docker.pkg.dev/" + $GcpProject + "/cloud-run-source-deploy/" + $ServiceName + ":" + $BuildId
 
 Write-Host "GCP Project: $GcpProject"
 Write-Host "Deployment Region: $Region"
@@ -61,10 +70,9 @@ New-Item -ItemType Directory -Path $StagingDir | Out-Null
 
 Write-Host "Copying agent-trade files to staging..."
 # Copy agent-trade contents except ignored directories (venv, .git, temp_staging)
-Copy-Item "Z:\python\projects\agent-trade\*" -Destination $StagingDir -Recurse -Force -Exclude "venv", ".git", "deploy", "trading_agent.db", "trading.log"
+Copy-Item "Z:\python\projects\agent-trade\*" -Destination $StagingDir -Recurse -Force -Exclude "venv", ".venv", ".git", "deploy", ".env", "trading_agent.db", "test_trading_agent.db", "trading.log", "__pycache__"
 
 Write-Host "Copying sibling dependencies to staging..."
-Copy-Item "Z:\python\projects\openrouter-workflow" -Destination (Join-Path $StagingDir "openrouter-workflow") -Recurse -Force -Exclude "venv", ".git"
 Copy-Item "Z:\python\projects\agent-jira-client" -Destination (Join-Path $StagingDir "agent-jira-client") -Recurse -Force -Exclude "venv", ".git"
 
 # 4. Write Custom Production Dockerfile
@@ -78,7 +86,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 # Copy local dependencies into image container
-COPY openrouter-workflow /src/openrouter-workflow
 COPY agent-jira-client /src/agent-jira-client
 
 # Copy requirements and remove relative editable flags
@@ -87,7 +94,6 @@ RUN python -c "lines = [l for l in open('requirements.txt') if '-e ' not in l]; 
 
 # Install packages
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir /src/openrouter-workflow
 RUN pip install --no-cache-dir /src/agent-jira-client
 
 # Copy main codebase
@@ -113,6 +119,7 @@ gcloud run deploy $ServiceName `
     --image $ImageTag `
     --region $Region `
     --project $GcpProject `
+    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper" `
     --quiet
 
 # 7. Clean Staging Directory
@@ -122,5 +129,6 @@ Remove-Item $StagingDir -Recurse -Force
 Write-Host "`n========================================================"
 Write-Host "DASHBOARD DEPLOYMENT COMPLETED SUCCESSFULLY!"
 Write-Host "- Cloud Run Service: $ServiceName has been updated."
-Write-Host "- Active Live Site: https://treatmotivated-dashboard-loenftvakq-ue.a.run.app"
+Write-Host "- Immutable Image: $ImageTag"
+Write-Host "- Query the deployed service URL with: gcloud run services describe $ServiceName --region $Region --project $GcpProject --format=value(status.url)"
 Write-Host "========================================================"

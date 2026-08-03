@@ -5,19 +5,14 @@ import logging
 import sys
 import time
 import concurrent.futures
+from openai import OpenAI
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
 
-# Import centralized client from the installed openrouter-workflow
-try:
-    # First try direct import (if installed as package)
-    from openrouter_workflow import client as or_client
-except ImportError:
-    try:
-        # Fallback to local path import
-        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../openrouter-workflow")))
-        import client as or_client
-    except ImportError as e:
-        logger.critical("Failed to import OpenRouter client. Please ensure openrouter-workflow is installed or in PYTHONPATH.")
-        raise ImportError("Failed to import OpenRouter client. Please ensure openrouter-workflow is installed or in PYTHONPATH.") from e
+# Ensure environment variables are loaded from .env file
+env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.env"))
+load_dotenv(env_path, override=True)
 
 logger = logging.getLogger("SharedLLMClient")
 
@@ -34,10 +29,120 @@ class SharedLLMClient:
     def __init__(self):
         self.api_key = os.getenv("OPENROUTER_API_KEY", "")
         self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.max_retries = 5
         self.retry_delay = 5  # seconds
         self.initial_timeout = 180  # seconds
         self.max_backoff = 60  # seconds
+        
+        # Initialize OpenAI client pointing to OpenRouter
+        self.client = None
+        if self.api_key and "your_openrouter_api_key_here" not in self.api_key:
+            try:
+                self.client = OpenAI(
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                )
+                logger.info("Successfully initialized OpenRouter client.")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenRouter client: {e}")
+                
+        # Initialize Gemini client as fallback
+        self.gemini_client = None
+        if self.gemini_api_key and "your_gemini_api_key_here" not in self.gemini_api_key:
+            try:
+                self.gemini_client = genai.Client(api_key=self.gemini_api_key)
+                logger.info("Successfully initialized Gemini client as fallback.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini client: {e}")
+                
+        if not self.client and not self.gemini_client:
+            logger.critical("Neither OpenRouter nor Gemini API keys are configured or valid.")
+            raise LLMClientError("Neither OpenRouter nor Gemini API keys are configured or valid.")
+        
+        # Map tiers to models from environment variables
+        self.tier_mapping = {
+            "heavyweight": os.getenv("MODEL_HEAVYWEIGHT", "deepseek/deepseek-r1"),
+            "daily_driver": os.getenv("MODEL_DAILY_DRIVER", "google/gemini-2.5-flash"),
+            "utility": os.getenv("MODEL_UTILITY", "openrouter/free")
+        }
+        
+    def _execute_completion(
+        self,
+        prompt: str,
+        system_prompt: str,
+        tier: str | None = None,
+        max_output_tokens: int | None = None
+    ) -> str:
+        """Execute a chat completion with OpenRouter primary, Gemini fallback.
+
+        Previously this delegated to the external ``openrouter-workflow`` package.
+        Now it uses the ``openai`` SDK pointed at OpenRouter directly so the
+        dependency is eliminated.  If the OpenRouter call fails (network, quota,
+        model overload) it falls through to the native ``google-genai`` client so
+        the trading cycle is never disrupted by a single provider outage.
+
+        Returns the raw text content of the model response.
+        """
+        resolved_tier = tier.lower() if tier else "daily_driver"
+        model_id = self.tier_mapping.get(resolved_tier, self.tier_mapping["daily_driver"])
+        
+        # Try OpenRouter first
+        if self.client:
+            try:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ]
+                
+                final_max_tokens = max_output_tokens or int(os.getenv("MAX_OUTPUT_TOKENS", "2048"))
+                
+                extra_headers = {
+                    "HTTP-Referer": "https://github.com/google-antigravity",
+                    "X-Title": "Antigravity CLI Agent Flow",
+                }
+                
+                response = self.client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    max_tokens=final_max_tokens,
+                    temperature=0.2,
+                    extra_headers=extra_headers
+                )
+                
+                return response.choices[0].message.content or ""
+            except Exception as e:
+                logger.warning(f"OpenRouter request failed: {e}. Falling back to Gemini.")
+                
+        # Fallback to Gemini
+        if self.gemini_client:
+            try:
+                # Map OpenRouter model names to Gemini models if needed, or use configured GEMINI_MODEL
+                gemini_model_name = self.gemini_model
+                if "gemini-2.5-flash" in model_id:
+                    gemini_model_name = "gemini-2.5-flash"
+                elif "gemini-2.5-pro" in model_id:
+                    gemini_model_name = "gemini-2.5-pro"
+                elif "gemini-3.5-flash" in model_id:
+                    gemini_model_name = "gemini-2.5-flash" # fallback to 2.5-flash if 3.5-flash is not supported yet
+                
+                logger.info(f"Executing fallback completion using Gemini model: {gemini_model_name}")
+                
+                response = self.gemini_client.models.generate_content(
+                    model=gemini_model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        temperature=0.2,
+                    )
+                )
+                return response.text or ""
+            except Exception as e:
+                logger.critical(f"Gemini fallback request failed: {e}")
+                raise LLMClientError(f"Both OpenRouter and Gemini fallback failed. Gemini error: {e}") from e
+                
+        raise LLMClientError("OpenRouter failed and Gemini fallback is not configured.")
         
     def generate_structured(
         self,
@@ -88,16 +193,15 @@ class SharedLLMClient:
                 while retry_count <= self.max_retries:
                     try:
                         future = executor.submit(
-                            or_client.execute_completion,
+                            self._execute_completion,
                             prompt=prompt,
                             system_prompt=actual_system_prompt,
                             tier=tier,
-                            stream=False,
                             max_output_tokens=max_output_tokens
                         )
-                        timeout = min(self.initial_timeout, self.max_backoff * (2 ** retry_count))
+                        # Enforce a strict 20s timeout per request as specified in the docstring
+                        timeout = 20
                         logger.info(f"Attempt {retry_count + 1}/{self.max_retries + 1} with timeout: {timeout}s")
-                        logger.debug(f"Calculated timeout: {timeout}s (retry_count: {retry_count}, max_backoff: {self.max_backoff})")
                         response_text = future.result(timeout=timeout)
                         break
                     except concurrent.futures.TimeoutError as te:
@@ -122,11 +226,10 @@ class SharedLLMClient:
             
             try:
                 future = executor.submit(
-                    or_client.execute_completion,
+                    self._execute_completion,
                     prompt=prompt,
                     system_prompt=actual_system_prompt,
                     tier=tier,
-                    stream=False,
                     max_output_tokens=max_output_tokens
                 )
                 response_text = future.result(timeout=timeout)

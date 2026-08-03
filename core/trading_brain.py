@@ -243,7 +243,12 @@ Ticker: {symbol}
         perf_summary = database.get_performance_summary()
         perf_summary_str = perf_summary.get("text_summary", "No performance history available.")
 
-        allowed_symbols_str = " | ".join([f'"{sym}"' for sym in config.TRADING_UNIVERSE]) + ' | ""'
+        active_symbols = list(dict.fromkeys(
+            data.get("symbol", "").upper()
+            for data in market_data_list
+            if data and data.get("symbol")
+        ))
+        allowed_symbols_str = " | ".join([f'"{sym}"' for sym in active_symbols]) + ' | ""'
         
         # Add crypto-specific instructions to the system prompt
         crypto_instructions = """

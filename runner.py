@@ -4,6 +4,7 @@ from core.database import Database
 
 database = Database()
 import logging
+import os
 import sys
 from datetime import datetime
 
@@ -12,6 +13,7 @@ from core.alpaca_client import AlpacaClient
 from core.data_provider import DataProvider
 from core.guardrails import RiskGuardrails
 from core.trading_brain import TradingBrain
+from core.strategy_rules import is_crypto_symbol, validate_strategy_rule
 
 def get_current_eastern_time() -> datetime:
     """Returns the current datetime in America/New_York timezone."""
@@ -43,21 +45,6 @@ def format_positions(positions: dict) -> str:
     return ", ".join(parts)
 
 
-def is_crypto_symbol(symbol: str) -> bool:
-    """Return whether a symbol is a configured or slash-delimited crypto pair."""
-    normalized = symbol.strip().upper().replace("-", "/")
-    if "/" in normalized:
-        base, _, quote = normalized.partition("/")
-        return bool(base) and quote in {"USD", "USDT", "USDC", "BTC"}
-
-    compact_crypto_symbols = {
-        configured.upper().replace("/", "")
-        for configured in config.TRADING_UNIVERSE
-        if "/" in configured
-    }
-    return normalized in compact_crypto_symbols
-
-
 def build_appraisal_universe(screened_symbols: list[str], positions: dict,
                              actual_market_open: bool) -> list[str]:
     """Build a deduplicated universe, excluding equities whenever their market is closed."""
@@ -69,19 +56,28 @@ def build_appraisal_universe(screened_symbols: list[str], positions: dict,
 
 def ensure_active_strategy(symbol: str, alpaca_client: AlpacaClient) -> bool:
     """Generate a missing strategy on demand and confirm that it was persisted."""
-    missing_prefix = "No active strategy rules defined for "
-    if not database.get_active_strategy(symbol).startswith(missing_prefix):
+    active_rule = database.get_active_strategy(symbol)
+    is_valid, validation_reason = validate_strategy_rule(symbol, active_rule)
+    if is_valid:
         return True
 
-    logger.warning(f"No active strategy rule found for {symbol} in database. Triggering on-demand/emergency strategist run...")
+    logger.warning(
+        f"No valid strategy rule found for {symbol} ({validation_reason}). "
+        "Triggering on-demand strategist run..."
+    )
     try:
         from core.strategist import MetaStrategist
         MetaStrategist().run_single_ticker_refinement(symbol, alpaca_client)
     except Exception as err:
         logger.error(f"Could not execute on-demand strategist update for {symbol}: {err}")
 
-    if database.get_active_strategy(symbol).startswith(missing_prefix):
-        logger.error(f"No valid strategy rule is available for {symbol}; skipping appraisal this cycle.")
+    repaired_rule = database.get_active_strategy(symbol)
+    is_valid, validation_reason = validate_strategy_rule(symbol, repaired_rule)
+    if not is_valid:
+        logger.error(
+            f"No valid strategy rule is available for {symbol} "
+            f"({validation_reason}); skipping appraisal this cycle."
+        )
         return False
     return True
 
@@ -171,8 +167,9 @@ def check_execution_window(alpaca_client: AlpacaClient) -> tuple[bool, str]:
 
     return True, "Within trading window and market is open today."
 
-def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
-                      brain: TradingBrain, guardrails: RiskGuardrails, dry_run: bool = False):
+def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProvider,
+                            brain: TradingBrain, guardrails: RiskGuardrails,
+                            dry_run: bool = False) -> tuple[str, str, str]:
     """Executes a single workflow cycle of the autonomous trading agent."""
     import os
     import json
@@ -195,7 +192,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         ks_data = check_kill_switch()
         if ks_data and ks_data.get("status") == "HALTED":
             logger.info("Runner: Skipping execution cycle. System is Halted via GCS Kill Switch.")
-            return
+            return "SKIPPED_KILL_SWITCH", "UNKNOWN", "System halted by GCS kill switch."
     except Exception as ks_err:
         logger.warning(f"Failed to check GCS kill switch: {ks_err}")
 
@@ -207,6 +204,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     # This actual exchange state always controls asset eligibility. A bypass must
     # never make equities eligible while their market is closed.
     actual_market_open, market_reason = check_execution_window(alpaca_client)
+    asset_scope = "EQUITIES_AND_CRYPTO" if actual_market_open else "CRYPTO_ONLY"
 
     logger.info("Starting autonomous trading cycle...")
     
@@ -224,7 +222,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             database.log_portfolio_history(equity, cash, unrealized_pnl)
     except Exception as e:
         logger.error(f"Critical error fetching account state: {e}. Aborting cycle.")
-        return
+        return "ACCOUNT_STATE_FAILED", asset_scope, str(e)
 
     # 2. Fetch current active positions
     try:
@@ -262,92 +260,24 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                 send_discord_message(msg)
                 database.set_system_state("last_morning_sent", today_str)
 
-        # B. Evening Shutdown Message / Friday Smart Sleep (Weekdays, at or after 16:30 ET)
+        # B. Evening equity-desk status. The scheduler and crypto desk remain active.
         if weekday < 5 and current_minutes >= (16 * 60 + 30):
             last_evening_sent = database.get_system_state("last_evening_sent")
             if last_evening_sent != today_str:
-                if weekday == 4: # Friday close
-                    crypto_positions = [
-                        sym for sym in positions.keys()
-                        if is_crypto_symbol(sym)
-                    ]
-                    if not crypto_positions:
-                        # Friday evening, no crypto held -> go to sleep!
-                        msg = (
-                            f"Good Evening! We are shutting down the equity desk for the day.\n"
-                            f"* **Closing Equity**: ${equity:,.2f}\n"
-                            f"* **Cash Balance**: ${cash:,.2f}\n"
-                            f"* **Open Positions**: None.\n\n"
-                            f"We're shutting down the equity desk for the day, and we hold no crypto positions over the weekend. "
-                            f"See you next Monday morning!"
-                        )
-                        send_discord_message(msg)
-                        database.set_system_state("last_evening_sent", today_str)
-                        database.set_system_state("last_weekend_hibernate_notified", today_str)
-                        
-                        # Sync DB back to GCS and exit
-                        try:
-                            from core.gcs_sync import upload_to_gcs
-                            upload_to_gcs()
-                        except Exception as gcs_err:
-                            logger.error(f"Failed to sync to GCS: {gcs_err}")
-                        return # Exit cycle immediately since we are hibernating
-                    else:
-                        # Friday evening, crypto held -> crypto desk remains active
-                        msg = (
-                            f"Good Evening! We are shutting down the equity desk for the day.\n"
-                            f"* **Closing Equity**: ${equity:,.2f}\n"
-                            f"* **Cash Balance**: ${cash:,.2f}\n"
-                            f"* **Open Positions**: {positions_str}\n\n"
-                            f"We're shutting down the equity desk for the day. Equity market is closed, but we are holding crypto positions over the weekend. "
-                            f"Crypto desk remains active!"
-                        )
-                        send_discord_message(msg)
-                        database.set_system_state("last_evening_sent", today_str)
-                else:
-                    # Regular weekday evening shutdown
-                    msg = (
-                        f"Good Evening! We are shutting down the equity desk for the day.\n"
-                        f"* **Closing Equity**: ${equity:,.2f}\n"
-                        f"* **Cash Balance**: ${cash:,.2f}\n"
-                        f"* **Open Positions**: {positions_str}"
-                    )
-                    send_discord_message(msg)
-                    database.set_system_state("last_evening_sent", today_str)
+                msg = (
+                    f"Good Evening! The equity desk is closed and crypto-only monitoring remains active.\n"
+                    f"* **Closing Equity**: ${equity:,.2f}\n"
+                    f"* **Cash Balance**: ${cash:,.2f}\n"
+                    f"* **Open Positions**: {positions_str}"
+                )
+                send_discord_message(msg)
+                database.set_system_state("last_evening_sent", today_str)
                     
     except Exception as cadence_err:
         logger.error(f"Error handling daily status cadence or smart Friday triggers: {cadence_err}")
 
-    # 4. Weekend Dynamic Hibernation (If we are inside weekend hours, and positions drop to 0)
     if is_weekend_hours:
-        crypto_positions = [
-            sym for sym in positions.keys()
-            if is_crypto_symbol(sym)
-        ]
-        if not crypto_positions:
-            logger.info("No active crypto positions held over the weekend. Entering Weekend Smart Sleep.")
-            
-            # Send notification once per weekend
-            from datetime import timedelta
-            days_since_friday = (weekday - 4) % 7
-            last_friday = now_et - timedelta(days=days_since_friday)
-            weekend_key = f"weekend_hibernate_{last_friday.strftime('%Y-%m-%d')}"
-            
-            last_notified = database.get_system_state(weekend_key)
-            if last_notified != "notified":
-                from core.discord_notifier import send_discord_message
-                send_discord_message("No active crypto positions held over the weekend. Entering Weekend Smart Sleep mode. Crypto desk hibernation active until Monday 09:00 ET.")
-                database.set_system_state(weekend_key, "notified")
-                
-                # Sync database to GCS
-                try:
-                    from core.gcs_sync import upload_to_gcs
-                    upload_to_gcs()
-                except Exception as gcs_err:
-                    logger.error(f"Failed to sync to GCS: {gcs_err}")
-            
-            logger.info("Gracefully exiting runner during weekend sleep.")
-            return # Exit cycle since we just entered sleep
+        logger.info("Weekend/off-hours mode active. Continuing 24/7 crypto-only monitoring.")
 
     # Check if we should allow trading for the current market state
     if not actual_market_open:
@@ -411,7 +341,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             
     if not market_states:
         logger.error("No market data available for any ticker in universe. Aborting cycle.")
-        return
+        return "NO_MARKET_DATA", asset_scope, "No eligible ticker produced market data."
 
     # 4. Fetch recent decisions for context memory
     try:
@@ -475,7 +405,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
 
         if not actual_market_open and not is_crypto:
             logger.error(f"Blocking {action} for equity {symbol}: the US equity market is closed.")
-            return
+            return "FAILED", asset_scope, f"Blocked off-hours equity action for {symbol}."
         
         if action == "BUY" and not is_crypto:
             # Fetch the real-time latest trade price as base_price to prevent validation failure due to price drift.
@@ -524,7 +454,7 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             logger.info(f"[DRY RUN] Would execute order: {action} {qty} shares of {symbol}")
             if action == "BUY" and not is_crypto:
                 logger.info(f"[DRY RUN] Bracket Order details -> TP: ${take_profit_price:.2f} | SL: ${stop_loss_price:.2f}")
-            return
+            return "COMPLETED", asset_scope, f"Dry-run decision {action} {symbol}."
             
         logger.info(f"EXECUTING ORDER: Submitting {action} order for {qty} shares of {symbol}...")
         try:
@@ -558,6 +488,46 @@ def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         upload_to_gcs()
     except Exception as gcs_err:
         logger.error(f"Failed to sync to GCS: {gcs_err}")
+
+    return "COMPLETED", asset_scope, f"Cycle completed with {action} decision."
+
+
+def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
+                      brain: TradingBrain, guardrails: RiskGuardrails,
+                      dry_run: bool = False):
+    """Run one observable cycle and persist a heartbeat on every exit path.
+
+    Wraps _run_trading_cycle_impl with a lifecycle heartbeat that records
+    STARTED before execution and FAILED/COMPLETED on every exit path (including
+    unhandled exceptions via finally). The heartbeat is persisted to the local
+    SQLite DB *and* synced to GCS so the dashboard can report freshness even if
+    the container is preempted.
+    """
+    execution_id = os.getenv("CLOUD_RUN_EXECUTION", os.getenv("K_REVISION", "local"))
+    status = "FAILED"
+    asset_scope = "UNKNOWN"
+    message = "Cycle terminated unexpectedly."
+    database.record_cycle_heartbeat("STARTED", asset_scope, "Cycle started.", execution_id)
+    try:
+        status, asset_scope, message = _run_trading_cycle_impl(
+            alpaca_client, data_provider, brain, guardrails, dry_run=dry_run
+        )
+        return status, asset_scope, message
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        logger.exception("Unhandled trading-cycle failure.")
+        raise
+    finally:
+        database.record_cycle_heartbeat(status, asset_scope, message, execution_id)
+        try:
+            from core.gcs_sync import upload_to_gcs
+            upload_to_gcs()
+        except Exception as sync_error:
+            logger.error(f"Final heartbeat sync to GCS failed: {sync_error}")
+        logger.info(
+            f"Cycle heartbeat finalized: execution={execution_id} "
+            f"scope={asset_scope} status={status} message={message}"
+        )
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous Alpaca AI Trading Agent Runner")

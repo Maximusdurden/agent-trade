@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from core.config import DATABASE_PATH
 
@@ -459,6 +459,45 @@ def get_system_state(key: str) -> Optional[str]:
             return None
 
 
+HEARTBEAT_KEYS = (
+    "last_cycle_started_at",
+    "last_cycle_completed_at",
+    "last_cycle_status",
+    "last_cycle_asset_scope",
+    "last_cycle_message",
+    "last_cycle_execution_id",
+)
+
+
+def record_cycle_heartbeat(status: str, asset_scope: str = "UNKNOWN",
+                           message: str = "", execution_id: str = "") -> None:
+    """Persist operational cycle state separately from trading decisions.
+
+    These heartbeat keys let the dashboard determine runner freshness
+    independently of whether the AI brain happened to generate a trade.
+    Every call to ``run_trading_cycle`` records STARTED before the impl
+    and FAILED or COMPLETED in a ``finally`` block.
+    """
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if status == "STARTED":
+        set_system_state("last_cycle_started_at", now_utc)
+        set_system_state("last_cycle_completed_at", "")
+    else:
+        set_system_state("last_cycle_completed_at", now_utc)
+    set_system_state("last_cycle_status", status)
+    set_system_state("last_cycle_asset_scope", asset_scope)
+    set_system_state("last_cycle_message", message)
+    set_system_state("last_cycle_execution_id", execution_id)
+
+
+def get_cycle_heartbeat() -> dict:
+    """Return a normalized heartbeat object, including for pre-heartbeat databases."""
+    return {
+        key.removeprefix("last_cycle_"): get_system_state(key) or ""
+        for key in HEARTBEAT_KEYS
+    }
+
+
 def get_latest_watchlist_raw() -> list[str]:
     """Retrieves the latest watchlist as a raw list of strings."""
     try:
@@ -498,6 +537,13 @@ class Database:
 
     def get_system_state(self, key: str) -> Optional[str]:
         return get_system_state(key)
+
+    def record_cycle_heartbeat(self, status: str, asset_scope: str = "UNKNOWN",
+                               message: str = "", execution_id: str = "") -> None:
+        record_cycle_heartbeat(status, asset_scope, message, execution_id)
+
+    def get_cycle_heartbeat(self) -> dict:
+        return get_cycle_heartbeat()
 
     def get_latest_watchlist_raw(self) -> list[str]:
         return get_latest_watchlist_raw()

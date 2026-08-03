@@ -6,7 +6,7 @@ import pandas as pd
 # Try importing alpaca-py clients. If not installed or fails, we provide a warning.
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
     from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
@@ -186,6 +186,54 @@ class AlpacaClient:
         except Exception as e:
             logger.error(f"Error fetching positions: {e}")
             return {}
+
+    def get_executed_orders(self, limit: int = 50) -> list[dict]:
+        """Fetches recently filled/closed orders directly from Alpaca.
+
+        This catches TP/SL bracket fills and broker-side sells that the
+        runner never logged to the local trades table. The dashboard uses
+        this to reconcile what actually happened vs what was locally recorded.
+
+        Duplicate detection happens at the call site (dashboard cache worker)
+        by comparing ``alpaca_order_id`` values.
+        """
+        if self.is_mock:
+            return []
+
+        try:
+            all_orders = self.trading_client.get_orders(
+                filter=GetOrdersRequest(
+                    status="closed",
+                    limit=limit
+                )
+            )
+            executed = []
+            for order in all_orders:
+                if order.filled_at is None:
+                    continue
+                # Map Alpaca's slashless crypto symbol back
+                sym = (order.symbol or "").upper()
+                trading_universe = getattr(config, "TRADING_UNIVERSE", [])
+                for u_symbol in trading_universe:
+                    if "/" in u_symbol and u_symbol.replace("/", "").upper() == sym:
+                        sym = u_symbol
+                        break
+                else:
+                    if sym.endswith("USD") and len(sym) >= 6 and "/" not in sym:
+                        sym = f"{sym[:-3]}/USD"
+                executed.append({
+                    "alpaca_order_id": str(order.id),
+                    "timestamp": str(order.filled_at.isoformat()) if hasattr(order.filled_at, "isoformat") else str(order.filled_at),
+                    "symbol": sym,
+                    "side": "buy" if order.side and str(order.side).lower() == "buy" else "sell",
+                    "qty": float(order.filled_qty or order.qty or 0),
+                    "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
+                    "status": str(order.status.value) if hasattr(order.status, "value") else str(order.status),
+                })
+            return executed
+        except Exception as e:
+            logger.error(f"Error fetching executed orders from Alpaca: {e}")
+            return []
 
     def get_historical_bars(self, symbol, limit: int = 100, timeframe_str: str = "day", max_retries: int = 3) -> pd.DataFrame:
         """Fetches historical daily or intraday bar data for a ticker or list of tickers (automatically handles Stocks or Crypto).

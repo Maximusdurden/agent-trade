@@ -31,7 +31,8 @@ if (-not $GcsBucket) {
 }
 
 $Region = "us-central1"
-$ImageTag = "gcr.io/$GcpProject/agent-trade:latest"
+$BuildId = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+$ImageTag = "gcr.io/$GcpProject/agent-trade:$BuildId"
 $JobName = "agent-trade-job"
 $SchedulerName = "agent-trade-scheduler"
 
@@ -58,10 +59,9 @@ New-Item -ItemType Directory -Path $StagingDir | Out-Null
 
 Write-Host "Copying agent-trade files to staging..."
 # Copy agent-trade contents except ignored directories (venv, .git, temp_staging)
-Copy-Item "Z:\python\projects\agent-trade\*" -Destination $StagingDir -Recurse -Force -Exclude "venv", ".git", "deploy", "trading_agent.db", "trading.log"
+Copy-Item "Z:\python\projects\agent-trade\*" -Destination $StagingDir -Recurse -Force -Exclude "venv", ".venv", ".git", "deploy", ".env", "trading_agent.db", "test_trading_agent.db", "trading.log", "__pycache__"
 
 Write-Host "Copying sibling dependencies to staging..."
-Copy-Item "Z:\python\projects\openrouter-workflow" -Destination (Join-Path $StagingDir "openrouter-workflow") -Recurse -Force -Exclude "venv", ".git"
 Copy-Item "Z:\python\projects\agent-jira-client" -Destination (Join-Path $StagingDir "agent-jira-client") -Recurse -Force -Exclude "venv", ".git"
 
 # 4. Write Custom Production Dockerfile
@@ -75,7 +75,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 # Copy local dependencies into image container
-COPY openrouter-workflow /src/openrouter-workflow
 COPY agent-jira-client /src/agent-jira-client
 
 # Copy requirements and remove relative editable flags
@@ -84,7 +83,6 @@ RUN python -c "lines = [l for l in open('requirements.txt') if '-e ' not in l]; 
 
 # Install packages
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir /src/openrouter-workflow
 RUN pip install --no-cache-dir /src/agent-jira-client
 
 # Copy main codebase
@@ -121,15 +119,21 @@ $EnvVariablesList = @(
     "BYPASS_MARKET_WINDOW=True"
 )
 
-# Extract other vital keys to pass to Cloud Run Job env
-Get-Content "$StagingDir\.env" | ForEach-Object {
+# Extract explicitly allowed non-secret runtime settings. Credentials must already
+# be configured on the Cloud Run Job through Secret Manager references.
+$AllowedRuntimeKeys = @(
+    "ALPACA_PAPER", "LLM_PROVIDER", "GEMINI_MODEL", "OPENROUTER_BASE_URL",
+    "MODEL_HEAVYWEIGHT", "MODEL_DAILY_DRIVER", "MODEL_UTILITY",
+    "ACTIVE_MODEL_TIER", "BRAIN_MODEL_TIER", "STRATEGIST_MODEL_TIER",
+    "TRADING_INTERVAL_MINUTES", "JIRA_URL", "JIRA_PROJECT_KEY"
+)
+Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
         $Parts = $Line.Split("=", 2)
         $Key = $Parts[0].Trim()
         $Val = $Parts[1].Trim().Trim("'`"")
-        # Do not copy empty, GCP core, or placeholder tokens
-        if ($Key -and $Val -and $Key -notmatch "GOOGLE_CLOUD_PROJECT" -and $Key -notmatch "GCS_BUCKET_NAME" -and -not $Val.StartsWith("your_")) {
+        if ($AllowedRuntimeKeys -contains $Key -and $Val -and -not $Val.StartsWith("your_")) {
             $EnvVariablesList += "$Key=$Val"
         }
     }
@@ -144,6 +148,9 @@ if ($JobExists) {
         --region $Region `
         --command python `
         --args "runner.py,--once" `
+        --tasks 1 `
+        --max-retries 1 `
+        --task-timeout 10m `
         --set-env-vars $EnvString
 } else {
     Write-Host "Creating new Cloud Run Job..."
@@ -152,6 +159,9 @@ if ($JobExists) {
         --region $Region `
         --command python `
         --args "runner.py,--once" `
+        --tasks 1 `
+        --max-retries 1 `
+        --task-timeout 10m `
         --set-env-vars $EnvString
 }
 
@@ -192,5 +202,6 @@ Write-Host "`n========================================================"
 Write-Host "DEPLOIMENT COMPLETED SUCCESSFULLY!"
 Write-Host "- Cloud Run Job: $JobName is deployed."
 Write-Host "- Cloud Scheduler: $SchedulerName is registered."
-Write-Host "- Trigger Interval: Every 15 minutes weekdays NY Time."
+Write-Host "- Immutable Image: $ImageTag"
+Write-Host "- Trigger Interval: Every 15 minutes, 24/7, NY Time."
 Write-Host "========================================================"

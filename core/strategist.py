@@ -8,6 +8,7 @@ from datetime import datetime
 from core import config
 from core import database
 from core.alpaca_client import AlpacaClient
+from core.strategy_rules import is_crypto_symbol, validate_strategy_rule
 
 try:
     from google import genai
@@ -128,8 +129,12 @@ class MetaStrategist:
             )
 
             todays_rules = result.get("todays_rules", "").strip()
-            if not todays_rules or todays_rules.startswith("No active strategy rules defined for "):
-                logger.error(f"Strategist did not generate a valid rule for {ticker}; leaving it missing for a later retry.")
+            is_valid, validation_reason = validate_strategy_rule(ticker, todays_rules)
+            if not is_valid:
+                logger.error(
+                    f"Strategist generated an invalid rule for {ticker} "
+                    f"({validation_reason}); leaving the active history unchanged."
+                )
                 continue
             
             # D. Log the new strategy into history
@@ -198,6 +203,13 @@ class MetaStrategist:
             p = positions[ticker]
             current_position_str = f"Currently holding {p['qty']} shares, value: ${p['market_value']:,.2f}, avg entry price: ${p['avg_entry_price']:,.2f}, unrealized PnL: ${p['unrealized_pnl']:,.2f}"
 
+        asset_context = (
+            f"{ticker} is a 24/7 crypto asset. The rule must govern {ticker} itself and must not "
+            "require SPY, QQQ, or equity-market data to permit a crypto action."
+            if is_crypto_symbol(ticker)
+            else f"{ticker} is an equity asset and may be traded only during its market window."
+        )
+
         prompt = f"""
 ROLE:
 You are the Lead Quantitative Portfolio Strategist for an elite AI trading desk. Your objective is to review the daily performance and market regime for ticker **{ticker}** and write a concise, high-impact **Trading Strategy Rule** paragraph for the Execution Brain to follow during its 15-minute tick loops.
@@ -212,6 +224,9 @@ You are the Lead Quantitative Portfolio Strategist for an elite AI trading desk.
 
 === MARKET REGIME FOR {ticker} (Last 30 Days) ===
 {bars_summary}
+
+=== REQUIRED ASSET SCOPE ===
+{asset_context}
 
 === ACTIVE HOLDINGS IN {ticker} ===
 {current_position_str}
@@ -233,8 +248,8 @@ DIRECTIONS:
    - If historical win rate is low (<50%) or max drawdown is high (>15%), design significantly more conservative rules with tighter, safer conditional thresholds to avoid over-allocating on speculative moves.
    - If our historical realized profit is negative, suggest smaller starter positions and require stronger support confirmations (e.g. confluences of Fibonacci support and psychological round numbers) before triggers.
    - Ensure the execution agent strictly avoids repeating previous errors or whipsaws.
-5. Write a single, highly refined paragraph of execution instructions. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" THRESHOLD for risk control based on price, intraday VWAP, or vwap_dist_pct (e.g. "If SPY breaks below $740, halt all buying immediately", "If QQQ price stretches >= 2% above its VWAP (vwap_dist_pct >= 2.0), sell 50% to lock in gains", or "If SOL drops below $75, exit 50% of positions and wait"). This is a deterministic condition that the tick loop brain can evaluate dynamically. Be extremely specific.
-6. If the ticker is Solana (SOL/USD), keep in mind it is a 24/7 crypto asset with higher volatility and wider swings than index stocks like SPY/QQQ. Suggest rules with slightly wider tolerance thresholds.
+5. Write a single, highly refined paragraph that applies ONLY to {ticker}. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" threshold for {ticker} based on price, intraday VWAP, or vwap_dist_pct. Do not substitute another ticker in the operative instruction.
+6. For any crypto ticker, preserve 24/7 operation and use volatility-appropriate thresholds without requiring equity-index data.
 
 OUTPUT FORMAT:
 Your response must be a single, valid JSON object ONLY.
@@ -347,8 +362,12 @@ Schema:
             )
 
             todays_rules = result.get("todays_rules", "").strip()
-            if not todays_rules or todays_rules.startswith("No active strategy rules defined for "):
-                logger.error(f"Emergency strategist did not generate a valid rule for {ticker}.")
+            is_valid, validation_reason = validate_strategy_rule(ticker, todays_rules)
+            if not is_valid:
+                logger.error(
+                    f"Emergency strategist generated an invalid rule for {ticker} "
+                    f"({validation_reason})."
+                )
                 return False
             
             db_id = database.log_strategy_history(

@@ -1,4 +1,4 @@
 {
-  "status": "HALTED",
-  "updated_by": "test"
+  "status": "ACTIVE",
+  "updated_by": "deployment_plan"
 }
