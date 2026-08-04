@@ -2086,24 +2086,23 @@ HTML_CONTENT = """<!DOCTYPE html>
                 </div>
                 <div style="background: rgba(10, 13, 22, 0.4); padding: 1rem; border-radius: 0.75rem; border: 1px solid var(--border-subtle);">
                     <div style="margin-bottom: 0.8rem;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
-                            <span style="color: var(--text-secondary); font-weight: 600;">Screener Universe (60 Tickers):</span>
-                            <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--text-muted);" id="pool-count">0/60</span>
+                        <div style="display: flex; align-items: center; margin-bottom: 0.5rem;">
+                            <span style="color: var(--text-secondary); font-weight: 600;">Screener Universe</span>
                         </div>
                         
-                        <!-- Color-coded Legend -->
+                        <!-- Color-coded Legend with counts -->
                         <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.5rem; font-size: 0.7rem;">
                             <span style="display: flex; align-items: center; gap: 0.25rem;">
                                 <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-green); display: inline-block; box-shadow: 0 0 5px var(--color-green);"></span>
-                                <span style="color: var(--color-green); font-weight: bold;">Holding</span>
+                                <span style="color: var(--color-green); font-weight: bold;">Holding: <span id="stat-holdings">0</span></span>
                             </span>
                             <span style="display: flex; align-items: center; gap: 0.25rem;">
                                 <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-blue); display: inline-block; box-shadow: 0 0 5px var(--color-blue);"></span>
-                                <span style="color: var(--color-blue); font-weight: bold;">Watchlist</span>
+                                <span style="color: var(--color-blue); font-weight: bold;">Watchlist: <span id="stat-watchlist">0</span></span>
                             </span>
                             <span style="display: flex; align-items: center; gap: 0.25rem;">
                                 <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-gold); display: inline-block; box-shadow: 0 0 5px var(--color-gold);"></span>
-                                <span style="color: var(--color-gold); font-weight: bold;">Screener Pool</span>
+                                <span style="color: var(--color-gold); font-weight: bold;">Screener Pool: <span id="stat-pool">0</span></span>
                             </span>
                         </div>
                         
@@ -2647,7 +2646,6 @@ HTML_CONTENT = """<!DOCTYPE html>
                 }
                 // Update Screener Pool Grid
                 const screenerPoolContainer = document.getElementById('screener-pool-container');
-                const poolCountEl = document.getElementById('pool-count');
                 if (screenerPoolContainer) {
                     screenerPoolContainer.innerHTML = '';
                     const screenerPool = (data && data.screener_pool) || [];
@@ -2655,9 +2653,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                     const positionsData = (data && data.positions) || {};
                     const holdings = Object.keys(positionsData).map(sym => sym.toUpperCase());
 
-                    if (poolCountEl) {
-                        poolCountEl.innerText = `${screenerPool.length}/60`;
-                    }
+                    // Update screener stats: pool, watchlist, holdings
+                    const statPool = document.getElementById('stat-pool');
+                    const statWatchlist = document.getElementById('stat-watchlist');
+                    const statHoldings = document.getElementById('stat-holdings');
+                    if (statPool) statPool.innerText = screenerPool.length;
+                    if (statWatchlist) statWatchlist.innerText = latestWatchlist.length;
+                    if (statHoldings) statHoldings.innerText = holdings.length;
 
                     if (screenerPool.length === 0) {
                         screenerPoolContainer.innerHTML = '<span style="color: var(--text-muted); font-size: 0.75rem;">No screener pool loaded.</span>';
