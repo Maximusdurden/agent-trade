@@ -1124,17 +1124,9 @@ HTML_CONTENT = """<!DOCTYPE html>
             line-height: 1.42;
             color: var(--crt-color);
             height: 350px;
-            display: flex;
-            flex-direction: column;
             overflow-y: auto;
             white-space: pre-wrap;
             word-break: break-all;
-            display: flex;
-            flex-direction: column-reverse;
-        }
-
-        .terminal-pane.sort-oldest-first {
-            flex-direction: column;
         }
 
         body.theme-modern .terminal-pane {
@@ -2374,6 +2366,24 @@ HTML_CONTENT = """<!DOCTYPE html>
                 }
             });
 
+            // Daily-resampled diagnostics: resample raw intraday history to one point per
+            // trading day (last observed equity for each date) so Win Rate, Sharpe, and
+            // Profit Factor are computed over equal-interval daily returns instead of
+            // mixed-sampling intraday noise.
+            function resampleToDaily(history) {
+                const dayMap = new Map();
+                for (const item of history) {
+                    const d = parseUtcTimestamp(item.timestamp);
+                    if (!d) continue;
+                    const dayKey = d.toLocaleDateString('en-CA', {timeZone: 'America/New_York'}); // YYYY-MM-DD
+                    // Always keep the latest record per day
+                    dayMap.set(dayKey, item);
+                }
+                return Array.from(dayMap.values());
+            }
+
+            const dailyHistory = resampleToDaily(chartHistory);
+
             // Mathematical performance diagnostics engine (TMCL-405)
             let totalReturn = 0;
             let maxDrawdown = 0;
@@ -2382,75 +2392,63 @@ HTML_CONTENT = """<!DOCTYPE html>
             let profitFactor = 1.00;
 
             if (chartHistory.length > 1) {
-                // 1. Total Net Return
-                const initialEquity = chartHistory[0].equity || 100000;
-                const finalEquity = chartHistory[chartHistory.length - 1].equity || 100000;
-                if (initialEquity > 0) {
-                    totalReturn = ((finalEquity - initialEquity) / initialEquity) * 100;
+                const firstEq = chartHistory[0].equity || 100000;
+                const lastEq = chartHistory[chartHistory.length - 1].equity || 100000;
+
+                // 1. Total Net Return (full data is fine – start-to-end)
+                if (firstEq > 0) {
+                    totalReturn = ((lastEq - firstEq) / firstEq) * 100;
                 }
 
-                // 2. Peak Drawdown
+                // 2. Peak Drawdown (full data is fine – peak/trough independent of rate)
                 let peak = -Infinity;
                 chartHistory.forEach(item => {
                     const eq = item.equity !== undefined ? item.equity : 100000;
-                    if (eq > peak) {
-                        peak = eq;
-                    }
+                    if (eq > peak) peak = eq;
                     if (peak > 0) {
                         const dd = ((peak - eq) / peak) * 100;
-                        if (dd > maxDrawdown) {
-                            maxDrawdown = dd;
-                        }
+                        if (dd > maxDrawdown) maxDrawdown = dd;
                     }
                 });
 
-                // 3. Cycle Win Rate
+                // ---- Daily-resampled stats below (Win Rate, Sharpe, Profit Factor) ----
+                const useDaily = dailyHistory.length > 1;
+                const perfData = useDaily ? dailyHistory : chartHistory;
+
+                // 3. Daily Win Rate (% of up days)
                 let wins = 0;
-                let steps = chartHistory.length - 1;
-                for (let i = 1; i < chartHistory.length; i++) {
-                    const prev = chartHistory[i-1].equity !== undefined ? chartHistory[i-1].equity : 100000;
-                    const curr = chartHistory[i].equity !== undefined ? chartHistory[i].equity : 100000;
-                    if (curr > prev) {
-                        wins++;
-                    }
+                const steps = perfData.length - 1;
+                for (let i = 1; i < perfData.length; i++) {
+                    const prev = perfData[i-1].equity !== undefined ? perfData[i-1].equity : 100000;
+                    const curr = perfData[i].equity !== undefined ? perfData[i].equity : 100000;
+                    if (curr > prev) wins++;
                 }
-                if (steps > 0) {
-                    winRate = (wins / steps) * 100;
-                }
+                if (steps > 0) winRate = (wins / steps) * 100;
 
-                // 4. Sharpe Ratio (Annualized)
-                const stepReturns = [];
-                for (let i = 1; i < chartHistory.length; i++) {
-                    const prev = chartHistory[i-1].equity !== undefined ? chartHistory[i-1].equity : 100000;
-                    const curr = chartHistory[i].equity !== undefined ? chartHistory[i].equity : 100000;
-                    if (prev > 0) {
-                        stepReturns.push((curr - prev) / prev);
-                    } else {
-                        stepReturns.push(0);
-                    }
+                // 4. Daily Sharpe Ratio (Annualized over ~252 trading days)
+                const dailyReturns = [];
+                for (let i = 1; i < perfData.length; i++) {
+                    const prev = perfData[i-1].equity !== undefined ? perfData[i-1].equity : 100000;
+                    const curr = perfData[i].equity !== undefined ? perfData[i].equity : 100000;
+                    if (prev > 0) dailyReturns.push((curr - prev) / prev);
                 }
-                if (stepReturns.length > 0) {
-                    const sum = stepReturns.reduce((a, b) => a + b, 0);
-                    const mean = sum / stepReturns.length;
-                    const variance = stepReturns.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / stepReturns.length;
+                if (dailyReturns.length > 0) {
+                    const sum = dailyReturns.reduce((a, b) => a + b, 0);
+                    const mean = sum / dailyReturns.length;
+                    const variance = dailyReturns.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / dailyReturns.length;
                     const std = Math.sqrt(variance);
-                    if (std > 0) {
-                        sharpeRatio = (mean / std) * Math.sqrt(6552);
-                    }
+                    if (std > 0) sharpeRatio = (mean / std) * Math.sqrt(252);
                 }
 
-                // 5. Profit Factor
+                // 5. Profit Factor (gross gains / gross losses on daily returns)
                 let grossGains = 0;
                 let grossLosses = 0;
-                for (let i = 1; i < chartHistory.length; i++) {
-                    const prev = chartHistory[i-1].equity !== undefined ? chartHistory[i-1].equity : 100000;
-                    const curr = chartHistory[i].equity !== undefined ? chartHistory[i].equity : 100000;
+                for (let i = 1; i < perfData.length; i++) {
+                    const prev = perfData[i-1].equity !== undefined ? perfData[i-1].equity : 100000;
+                    const curr = perfData[i].equity !== undefined ? perfData[i].equity : 100000;
                     const diff = curr - prev;
-                    if (diff > 0) {
-                        grossGains += diff;
-                    } else if (diff < 0) {
-                        grossLosses += Math.abs(diff);
-                    }
+                    if (diff > 0) grossGains += diff;
+                    else if (diff < 0) grossLosses += Math.abs(diff);
                 }
                 if (grossLosses > 0) {
                     profitFactor = grossGains / grossLosses;
@@ -2857,22 +2855,22 @@ HTML_CONTENT = """<!DOCTYPE html>
                     }
                 }
 
-                // 5. System Logs live tail
+                // 5. System Logs live tail — oldest-first, auto-scrolled to bottom
                 const terminalPane = document.getElementById('terminal-pane');
                 if (terminalPane) {
                     terminalPane.innerHTML = '';
                     const logs = (data && data.logs) || [];
-                    const shouldReverse = terminalPane.classList.contains('sort-oldest-first');
-                    const sortedLogs = shouldReverse ? [...logs].reverse() : logs;
-                    sortedLogs.forEach(line => {
+                    // Data comes oldest-first from backend; render in same order
+                    logs.forEach(line => {
                         let levelClass = 'terminal-info';
                         if (line.includes('[WARNING]') || line.includes('[WARN]')) levelClass = 'terminal-warn';
                         if (line.includes('[CRITICAL]') || line.includes('[ERROR]') || line.includes('FATAL')) levelClass = 'terminal-error';
                         
-                        // Simple escape HTML
                         const escapedLine = line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
                         terminalPane.innerHTML += `<div class="terminal-line ${levelClass}">${escapedLine}</div>`;
                     });
+                    // Auto-scroll to bottom so newest entry is always visible
+                    terminalPane.scrollTop = terminalPane.scrollHeight;
                 }
 
                 // Update Chart and cache
@@ -3511,11 +3509,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         function toggleLogSort() {
-            const terminalPane = document.getElementById('terminal-pane');
-            if (terminalPane) {
-                terminalPane.classList.toggle('sort-oldest-first');
-                fetchStatus(); // Refresh to apply new sort
-            }
+            // Sort toggle deprecated — logs are now always oldest-first, auto-scrolled to bottom.
         }
 
         // Initialize user preferences on DOM content loaded or script execution

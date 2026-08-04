@@ -119,10 +119,11 @@ $EnvVariablesList = @(
     "BYPASS_MARKET_WINDOW=True"
 )
 
-# Extract explicitly allowed non-secret runtime settings. Credentials must already
-# be configured on the Cloud Run Job through Secret Manager references.
+# Extract explicitly allowed non-secret runtime settings. API keys for Gemini
+# and OpenRouter are included so the brain can initialize in the cloud.
 $AllowedRuntimeKeys = @(
-    "ALPACA_PAPER", "LLM_PROVIDER", "GEMINI_MODEL", "OPENROUTER_BASE_URL",
+    "ALPACA_PAPER", "LLM_PROVIDER", "GEMINI_API_KEY", "GEMINI_MODEL",
+    "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL",
     "MODEL_HEAVYWEIGHT", "MODEL_DAILY_DRIVER", "MODEL_UTILITY",
     "ACTIVE_MODEL_TIER", "BRAIN_MODEL_TIER", "STRATEGIST_MODEL_TIER",
     "TRADING_INTERVAL_MINUTES", "JIRA_URL", "JIRA_PROJECT_KEY"

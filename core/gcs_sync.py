@@ -77,15 +77,87 @@ def download_from_gcs():
     except Exception as e:
         logger.error(f"Failed to download files from GCS: {e}")
 
+def build_dod_csv():
+    """Rebuild portfolio_dod_balances.csv from the portfolio_history table.
+
+    Picks the last record per trading day, computes DoD PnL, and writes the CSV
+    so it's always fresh before upload.
+    """
+    import csv
+    try:
+        db_path = str(config.DATABASE_PATH)
+        if not os.path.exists(db_path):
+            logger.warning("Cannot build DoD CSV: database not found at %s", db_path)
+            return False
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        days = conn.execute("""
+            SELECT DISTINCT substr(timestamp, 1, 10) as day
+            FROM portfolio_history ORDER BY day
+        """).fetchall()
+
+        records = []
+        for row in days:
+            day = row["day"]
+            last = conn.execute("""
+                SELECT equity, cash FROM portfolio_history
+                WHERE substr(timestamp, 1, 10) = ?
+                ORDER BY timestamp DESC LIMIT 1
+            """, (day,)).fetchone()
+            if not last:
+                continue
+            equity = round(last["equity"], 2)
+            cash = round(last["cash"], 2)
+            records.append({
+                "date": day,
+                "equity": equity,
+                "cash": cash,
+                "holdings": round(equity - cash, 2),
+            })
+
+        conn.close()
+
+        # Compute DoD PnL
+        prev_equity = None
+        for rec in records:
+            if prev_equity is None:
+                rec["dod_pnl_usd"] = 0.0
+                rec["dod_pnl_pct"] = 0.0
+            else:
+                chg = round(rec["equity"] - prev_equity, 2)
+                pct = round((chg / prev_equity) * 100, 4) if prev_equity > 0 else 0.0
+                rec["dod_pnl_usd"] = chg
+                rec["dod_pnl_pct"] = pct
+            prev_equity = rec["equity"]
+
+        csv_path = "portfolio_dod_balances.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["date", "equity", "cash", "holdings", "dod_pnl_usd", "dod_pnl_pct"])
+            w.writeheader()
+            w.writerows(records)
+
+        logger.info("Built DoD CSV with %d records (%.4s -> %.4s)", len(records), records[0]["date"], records[-1]["date"])
+        return True
+    except Exception as e:
+        logger.warning("Failed to build DoD CSV: %s", e)
+        return False
+
+
 def upload_to_gcs():
     """
-    Uploads the local database, trading log, and DoD balances to Google Cloud Storage
-    if GCS_BUCKET_NAME is configured.
+    Rebuilds the DoD CSV from DB, then uploads the database, trading log,
+    and DoD balances to Google Cloud Storage if GCS_BUCKET_NAME is configured.
     """
     gcs_bucket = os.getenv("GCS_BUCKET_NAME")
     if not gcs_bucket:
         logger.info("GCS_BUCKET_NAME not set. Skipping upload to GCS.")
         return
+
+    # Always rebuild the DoD CSV from the live DB before uploading
+    build_dod_csv()
 
     try:
         logger.info(f"Uploading database and logs to gs://{gcs_bucket}...")

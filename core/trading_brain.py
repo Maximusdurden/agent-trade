@@ -46,8 +46,15 @@ class TradingBrain:
                 logger.warning("google-genai package is not installed. Falling back to mock rule-based brain.")
                 self.is_mock = True
             elif not self.api_key or self.api_key == "your_gemini_api_key_here":
-                logger.warning("Gemini API key is missing. Falling back to mock rule-based brain.")
-                self.is_mock = True
+                logger.warning("Gemini API key is missing. Attempting fallback to OpenRouter.")
+                self.provider = "openrouter"
+                try:
+                    from core.llm_client import SharedLLMClient
+                    self.llm_client = SharedLLMClient()
+                    logger.info("Successfully initialized OpenRouter SharedLLMClient for TradingBrain (Daily Driver Tier).")
+                except Exception as e:
+                    logger.error(f"Failed to initialize OpenRouter SharedLLMClient: {e}. Falling back to mock rule-based brain.")
+                    self.is_mock = True
             else:
                 try:
                     # Use modern google-genai client
