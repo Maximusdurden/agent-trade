@@ -72,7 +72,13 @@ def sync_database_from_gcs():
         # 1. Download database
         blob = bucket.blob("trading_agent.db")
         os.makedirs(os.path.dirname(local_temp_db), exist_ok=True)
-        blob.download_to_filename(local_temp_db)
+        # Download to a temp file first, then atomically replace the live DB.
+        # This prevents readers (e.g. the chat handler) from opening a
+        # partially-written or locked SQLite file mid-download, which caused
+        # intermittent "database is locked" 500 errors on /api/chat.
+        tmp_db = local_temp_db + ".tmp"
+        blob.download_to_filename(tmp_db)
+        os.replace(tmp_db, local_temp_db)
         print(f"[GCS Sync] Successfully synchronized {local_temp_db} from Cloud Storage.", flush=True)
         
         # Ensure database tables exist in the downloaded database (Auto-Migration)
@@ -3007,10 +3013,16 @@ HTML_CONTENT = """<!DOCTYPE html>
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message: message })
                 });
-                if (!response.ok) {
-                    throw new Error(`Chat API responded with ${response.status}`);
+                let data = null;
+                try {
+                    data = await response.json();
+                } catch (parseErr) {
+                    data = null;
                 }
-                const data = await response.json();
+                if (!response.ok) {
+                    const serverMsg = (data && data.error) ? data.error : `Chat API responded with ${response.status}`;
+                    throw new Error(serverMsg);
+                }
                 
                 // Remove loading indicator
                 const loadingEl = document.getElementById(loadingId);
@@ -4236,10 +4248,26 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(json.dumps({"error": "Empty message."}).encode('utf-8'))
                     return
-                
+
+                # The SQLite DB is periodically replaced by the GCS sync worker.
+                # Retry transient "database is locked"/"unable to open" errors so
+                # a chat request that coincides with a sync doesn't 500.
+                def _db_read(fn, *args, **kwargs):
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            return fn(*args, **kwargs)
+                        except sqlite3.OperationalError as e:
+                            last_err = e
+                            if "locked" in str(e).lower() or "unable to open" in str(e).lower():
+                                time.sleep(0.3 * (attempt + 1))
+                                continue
+                            raise
+                    raise last_err
+
                 # Fetch recent decisions (SQLite)
-                decisions = database.get_recent_decisions(limit=10)
-                trades = database.get_recent_trades(limit=10)
+                decisions = _db_read(database.get_recent_decisions, limit=10)
+                trades = _db_read(database.get_recent_trades, limit=10)
                 
                 # Fetch live portfolio state
                 client = AlpacaClient()
@@ -4265,9 +4293,10 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     trade_summary += f"- [{t.get('timestamp')}] Ticker: {t.get('symbol')}, Side: {t.get('side')}, Qty: {t.get('qty')}, Fill Price: {t.get('filled_avg_price')}, Status: {t.get('status')}\n"
                 
                 # Fetch database performance summary (successes and failures)
-                perf_summary = database.get_performance_summary()
+                # Fetch database performance summary (successes and failures)
+                perf_summary = _db_read(database.get_performance_summary)
                 perf_summary_str = perf_summary.get("text_summary", "No performance history available.")
-                daily_performance_str = database.get_daily_performance_breakdown(limit=15)
+                daily_performance_str = _db_read(database.get_daily_performance_breakdown, limit=15)
 
                 system_instruction = (
                     "You are the cognitive co-pilot, visual strategist, and expert portfolio analyst for the AGE Desk Autonomous Trading Agent.\n"
@@ -4351,6 +4380,10 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(encoded_chat_res)
                 
             except Exception as e:
+                # Log the actual error so intermittent failures are diagnosable
+                import traceback
+                print(f"[Dashboard Server] /api/chat error: {e}", file=sys.stderr, flush=True)
+                traceback.print_exc()
                 encoded_chat_err = json.dumps({"error": str(e)}).encode('utf-8')
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')

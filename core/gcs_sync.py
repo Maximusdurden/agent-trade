@@ -60,7 +60,11 @@ def download_from_gcs():
         blob = bucket.blob("trading_agent.db")
         if blob.exists():
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
-            blob.download_to_filename(db_path)
+            # Download to a temp file first, then atomically replace the live DB
+            # to avoid readers hitting a partially-written/locked SQLite file.
+            tmp_db = db_path + ".tmp"
+            blob.download_to_filename(tmp_db)
+            os.replace(tmp_db, db_path)
             logger.info(f"Successfully synchronized {db_path} from GCS.")
         else:
             logger.info("No database file found on GCS.")
