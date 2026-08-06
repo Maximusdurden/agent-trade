@@ -663,24 +663,88 @@ class AlpacaClient:
                 "qty": qty,
                 "side": side,
                 "filled_avg_price": price,
-                "status": "filled"
+                "status": "filled",
+                "order_type": "market",
+                "fallback": False
             }
         
         try:
             order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
             is_crypto = "/" in symbol or "USD" in symbol or "SOL" in symbol
-            
+
+            def _submit_and_poll(req, order_type="market", fallback=False):
+                """Submit an order and poll for fill confirmation."""
+                order = self.trading_client.submit_order(order_data=req)
+                order_id = str(order.id)
+                logger.info(f"Market order submitted successfully to Alpaca. Order ID: {order_id}. Polling for fill confirmation...")
+
+                # Poll order details to guarantee we obtain a real filled_avg_price
+                filled_price = None
+                status_str = str(order.status.value)
+
+                for attempt in range(10):
+                    try:
+                        updated_order = self.trading_client.get_order_by_id(order_id)
+                        status_str = str(updated_order.status.value)
+                        if updated_order.filled_avg_price is not None:
+                            filled_price = float(updated_order.filled_avg_price)
+                        if status_str in ("filled", "partially_filled"):
+                            logger.info(f"Order {order_id} confirmed filled. Status: {status_str} | Avg Price: ${filled_price}")
+                            break
+                    except Exception as poll_err:
+                        logger.warning(f"Error polling order {order_id}: {poll_err}")
+                    time.sleep(0.5)
+
+                if filled_price is None:
+                    logger.warning(f"Order {order_id} polling complete but fill price is still None. Status is: {status_str}")
+
+                return {
+                    "id": order_id,
+                    "symbol": symbol,
+                    "qty": float(order.qty),
+                    "side": side,
+                    "filled_avg_price": filled_price,
+                    "status": status_str,
+                    "order_type": order_type,
+                    "fallback": fallback
+                }
+
             if side == "buy" and not is_crypto and take_profit_price is not None and stop_loss_price is not None:
-                market_order_data = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=order_side,
-                    time_in_force=TimeInForce.GTC,
-                    order_class=OrderClass.BRACKET,
-                    take_profit=TakeProfitRequest(limit_price=take_profit_price),
-                    stop_loss=StopLossRequest(stop_price=stop_loss_price)
-                )
-                logger.info(f"Submitting Exchange-Side Bracket Order for {symbol}: Buy {qty} shares, Take-Profit at ${take_profit_price:.2f}, Stop-Loss at ${stop_loss_price:.2f}.")
+                # Alpaca does not support fractional quantities for bracket (OCO)
+                # orders on equities. Round to whole shares for the bracket leg;
+                # fractional quantities are preserved for crypto and plain market orders.
+                bracket_qty = int(qty)
+                if bracket_qty < 1:
+                    logger.warning(f"Bracket order qty for {symbol} rounds to {bracket_qty} (<1). Falling back to plain market order.")
+                    market_order_data = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=order_side,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    return _submit_and_poll(market_order_data, order_type="market", fallback=True)
+
+                try:
+                    market_order_data = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=bracket_qty,
+                        side=order_side,
+                        time_in_force=TimeInForce.GTC,
+                        order_class=OrderClass.BRACKET,
+                        take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                        stop_loss=StopLossRequest(stop_price=stop_loss_price)
+                    )
+                    logger.info(f"Submitting Exchange-Side Bracket Order for {symbol}: Buy {bracket_qty} shares (rounded from {qty}), Take-Profit at ${take_profit_price:.2f}, Stop-Loss at ${stop_loss_price:.2f}.")
+                    return _submit_and_poll(market_order_data, order_type="bracket")
+                except Exception as bracket_err:
+                    logger.warning(f"Bracket order failed for {symbol}: {bracket_err}. Falling back to plain market order (no TP/SL).")
+                    market_order_data = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=bracket_qty,
+                        side=order_side,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    return _submit_and_poll(market_order_data, order_type="market", fallback=True)
             else:
                 time_in_force_val = TimeInForce.GTC if is_crypto else TimeInForce.DAY
                 market_order_data = MarketOrderRequest(
@@ -689,39 +753,7 @@ class AlpacaClient:
                     side=order_side,
                     time_in_force=time_in_force_val
                 )
-            
-            order = self.trading_client.submit_order(order_data=market_order_data)
-            order_id = str(order.id)
-            logger.info(f"Market order submitted successfully to Alpaca. Order ID: {order_id}. Polling for fill confirmation...")
-            
-            # Poll order details to guarantee we obtain a real filled_avg_price
-            filled_price = None
-            status_str = str(order.status.value)
-            
-            for attempt in range(10):
-                try:
-                    updated_order = self.trading_client.get_order_by_id(order_id)
-                    status_str = str(updated_order.status.value)
-                    if updated_order.filled_avg_price is not None:
-                        filled_price = float(updated_order.filled_avg_price)
-                    if status_str in ("filled", "partially_filled"):
-                        logger.info(f"Order {order_id} confirmed filled. Status: {status_str} | Avg Price: ${filled_price}")
-                        break
-                except Exception as poll_err:
-                    logger.warning(f"Error polling order {order_id}: {poll_err}")
-                time.sleep(0.5)
-                
-            if filled_price is None:
-                logger.warning(f"Order {order_id} polling complete but fill price is still None. Status is: {status_str}")
-                
-            return {
-                "id": order_id,
-                "symbol": symbol,
-                "qty": float(order.qty),
-                "side": side,
-                "filled_avg_price": filled_price,
-                "status": status_str
-            }
+                return _submit_and_poll(market_order_data, order_type="market")
         except Exception as e:
             err_msg = str(e)
             # Check if this is an Alpaca validation error about stop_loss.stop_price or take_profit.limit_price

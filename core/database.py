@@ -54,6 +54,29 @@ def init_db():
             )
         """)
         
+        # 2b. Executions Table (Per-attempt order execution log)
+        # Each decision can have MULTIPLE execution attempts (e.g. a failed
+        # bracket attempt followed by a plain-market fallback). This table
+        # records every attempt so the dashboard can reconcile what was
+        # decided vs what actually reached the broker.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id INTEGER,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,          -- buy or sell
+                qty REAL NOT NULL,
+                order_type TEXT,             -- bracket, market
+                status TEXT NOT NULL,        -- submitted, failed, filled, canceled
+                error TEXT,                  -- error message if failed
+                alpaca_order_id TEXT,
+                filled_avg_price REAL,
+                FOREIGN KEY (decision_id) REFERENCES decisions(id)
+            )
+        """)
+
         # 3. Portfolio History Table (Performance tracking)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS portfolio_history (
@@ -141,6 +164,58 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
         ))
         conn.commit()
         return get_last_insert_id(cursor)
+
+def log_execution(decision_id: int | None, attempt: int, symbol: str, side: str,
+                  qty: float, order_type: str | None, status: str,
+                  error: str | None = None, alpaca_order_id: str | None = None,
+                  filled_avg_price: float | None = None) -> int:
+    """Logs a single order-execution attempt to the executions table.
+
+    Records every attempt (including failures) so the dashboard can reconcile
+    decisions against what actually reached the broker.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO executions (
+                decision_id, attempt, timestamp, symbol, side, qty,
+                order_type, status, error, alpaca_order_id, filled_avg_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            decision_id,
+            attempt,
+            datetime.utcnow().isoformat(),
+            symbol.upper(),
+            side.lower(),
+            qty,
+            order_type,
+            status,
+            error,
+            alpaca_order_id,
+            filled_avg_price
+        ))
+        conn.commit()
+        return get_last_insert_id(cursor)
+
+def get_executions(limit: int = 50) -> list[dict]:
+    """Returns the most recent execution attempts as a list of dicts."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM executions ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+def get_executions_for_decision(decision_id: int) -> list[dict]:
+    """Returns all execution attempts for a given decision, oldest first."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM executions WHERE decision_id = ? ORDER BY id ASC
+        """, (decision_id,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
 def log_portfolio_history(equity: float, cash: float, unrealized_pnl: float):
     """Saves portfolio metrics history."""
@@ -522,7 +597,16 @@ class Database:
         
     def log_trade(self, **kwargs) -> int:
         return log_trade(**kwargs)
-        
+
+    def log_execution(self, **kwargs) -> int:
+        return log_execution(**kwargs)
+
+    def get_executions(self, limit: int = 50) -> list[dict]:
+        return get_executions(limit)
+
+    def get_executions_for_decision(self, decision_id: int) -> list[dict]:
+        return get_executions_for_decision(decision_id)
+
     def get_recent_decisions(self, limit: int = 5) -> list[dict]:
         return get_recent_decisions(limit)
         

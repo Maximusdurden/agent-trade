@@ -277,12 +277,14 @@ def status_cache_worker():
             # 2. Retrieve DB Decisions, Trades, and History (Completely local, shouldn't fail unless DB is locked/corrupt)
             decisions = []
             trades = []
+            executions = []
             history = []
             ticker_history = {}
             broker_orders = []
             try:
                 decisions = database.get_recent_decisions(limit=15)
                 trades = database.get_recent_trades(limit=15)
+                executions = database.get_executions(limit=50)
                 history = get_portfolio_history()
                 ticker_history = get_ticker_history()
                 
@@ -367,6 +369,7 @@ def status_cache_worker():
                 "positions": positions,
                 "decisions": decisions,
                 "trades": trades,
+                "executions": executions,
                 "broker_orders": broker_orders,
                 "history": history,
                 "ticker_history": ticker_history,
@@ -399,6 +402,7 @@ def status_cache_worker():
                         "positions": {},
                         "decisions": [],
                         "trades": [],
+                        "executions": [],
                         "broker_orders": [],
                         "history": [],
                         "ticker_history": {},
@@ -2743,6 +2747,16 @@ HTML_CONTENT = """<!DOCTYPE html>
                     if (decisions.length === 0) {
                         streamEl.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 2rem;">No historical trading thoughts logged yet.</div>';
                     } else {
+                        // Build a lookup of execution attempts keyed by decision_id
+                        const executions = (data && data.executions) || [];
+                        const execByDecision = {};
+                        executions.forEach(ex => {
+                            if (ex.decision_id != null) {
+                                if (!execByDecision[ex.decision_id]) execByDecision[ex.decision_id] = [];
+                                execByDecision[ex.decision_id].push(ex);
+                            }
+                        });
+
                         decisions.forEach(dec => {
                             const isApproved = dec.is_approved === 1;
                             const statusClass = isApproved ? 'approved' : 'rejected';
@@ -2753,11 +2767,26 @@ HTML_CONTENT = """<!DOCTYPE html>
                             if (action === 'BUY') actionBadgeClass = 'badge-buy';
                             if (action === 'SELL') actionBadgeClass = 'badge-sell';
 
+                            // Reconcile decision against execution attempts
+                            const decExecs = execByDecision[dec.id] || [];
+                            const hasFilled = decExecs.some(ex => ex.status === 'filled' || ex.status === 'partially_filled');
+                            const hasFailed = decExecs.some(ex => ex.status === 'failed');
+                            const hasSubmitted = decExecs.some(ex => ex.status === 'submitted');
+
                             let alertIcon = '';
                             if (!isApproved) {
                                 alertIcon = `<span class="badge" style="background: rgba(239, 68, 68, 0.15); color: var(--color-crimson); margin-left: 0.5rem; text-transform: none;">REJECTED BY RISK GUARDRAIL: ${dec.rejection_reason || 'Unknown'}</span>`;
                             } else if (action !== 'HOLD') {
-                                alertIcon = `<span class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--color-green); margin-left: 0.5rem; text-transform: none;">PASSED DE-RISK BOUNDARIES</span>`;
+                                if (hasFilled) {
+                                    alertIcon = `<span class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--color-green); margin-left: 0.5rem; text-transform: none;">EXECUTED</span>`;
+                                } else if (hasFailed) {
+                                    const err = decExecs.find(ex => ex.status === 'failed');
+                                    alertIcon = `<span class="badge" style="background: rgba(239, 68, 68, 0.15); color: var(--color-crimson); margin-left: 0.5rem; text-transform: none;">EXECUTION FAILED: ${(err && err.error) || 'Unknown'}</span>`;
+                                } else if (hasSubmitted) {
+                                    alertIcon = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: var(--color-amber); margin-left: 0.5rem; text-transform: none;">ORDER SUBMITTED (PENDING)</span>`;
+                                } else {
+                                    alertIcon = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: var(--color-amber); margin-left: 0.5rem; text-transform: none;">DECIDED - NOT EXECUTED</span>`;
+                                }
                             }
 
                             const symText = dec.proposed_symbol ? dec.proposed_symbol : 'PORTFOLIO HOLD';
@@ -4107,6 +4136,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                         "positions": {},
                         "decisions": [],
                         "trades": [],
+                        "executions": [],
                         "broker_orders": [],
                         "history": [],
                         "ticker_history": {},

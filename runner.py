@@ -464,7 +464,23 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                 stop_loss_price=stop_loss_price
             )
             logger.info(f"Order executed successfully! Details: {order_result}")
-            
+
+            # Record the execution attempt (bracket or market, incl. fallback)
+            try:
+                database.log_execution(
+                    decision_id=decision_id,
+                    attempt=1,
+                    symbol=symbol,
+                    side=action,
+                    qty=order_result.get("qty", qty),
+                    order_type=order_result.get("order_type", "market"),
+                    status=order_result.get("status", "submitted"),
+                    alpaca_order_id=order_result.get("id"),
+                    filled_avg_price=order_result.get("filled_avg_price")
+                )
+            except Exception as exec_log_err:
+                logger.error(f"Failed to log execution attempt to DB: {exec_log_err}")
+
             # Log executed trade to SQLite
             database.log_trade(
                 decision_id=decision_id,
@@ -479,6 +495,20 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
             
         except Exception as e:
             logger.critical(f"FATAL: Order execution failed! Error: {e}")
+            # Record the failed execution attempt so the dashboard can surface it
+            try:
+                database.log_execution(
+                    decision_id=decision_id,
+                    attempt=1,
+                    symbol=symbol,
+                    side=action,
+                    qty=qty,
+                    order_type="bracket" if (action == "BUY" and not is_crypto and take_profit_price and stop_loss_price) else "market",
+                    status="failed",
+                    error=str(e)
+                )
+            except Exception as exec_log_err:
+                logger.error(f"Failed to log failed execution attempt to DB: {exec_log_err}")
     else:
         logger.info("No order execution required for this cycle.")
 
