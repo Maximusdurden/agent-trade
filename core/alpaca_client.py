@@ -225,7 +225,9 @@ class AlpacaClient:
                     "alpaca_order_id": str(order.id),
                     "timestamp": str(order.filled_at.isoformat()) if hasattr(order.filled_at, "isoformat") else str(order.filled_at),
                     "symbol": sym,
-                    "side": "buy" if order.side and str(order.side).lower() == "buy" else "sell",
+                    # Use the enum's .value ("buy"/"sell") — str(OrderSide.BUY) is
+                    # "OrderSide.BUY", which would mislabel every order as "sell".
+                    "side": "buy" if (order.side and (getattr(order.side, "value", None) == "buy" or str(order.side).lower() == "buy")) else "sell",
                     "qty": float(order.filled_qty or order.qty or 0),
                     "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
                     "status": str(order.status.value) if hasattr(order.status, "value") else str(order.status),
