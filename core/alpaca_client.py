@@ -755,7 +755,27 @@ class AlpacaClient:
                     side=order_side,
                     time_in_force=time_in_force_val
                 )
-                return _submit_and_poll(market_order_data, order_type="market")
+                try:
+                    return _submit_and_poll(market_order_data, order_type="market")
+                except Exception as frac_err:
+                    # Alpaca only supports fractional quantities for eligible equities.
+                    # If a fractional plain-market equity order is rejected, fall back to
+                    # whole shares so the trade can still execute (without TP/SL legs).
+                    if not is_crypto and float(qty) != int(qty):
+                        whole_qty = int(qty)
+                        if whole_qty >= 1:
+                            logger.warning(
+                                f"Fractional market order for {symbol} (qty={qty}) rejected: {frac_err}. "
+                                f"Retrying with whole shares (qty={whole_qty})."
+                            )
+                            market_order_data = MarketOrderRequest(
+                                symbol=symbol,
+                                qty=whole_qty,
+                                side=order_side,
+                                time_in_force=time_in_force_val
+                            )
+                            return _submit_and_poll(market_order_data, order_type="market", fallback=True)
+                    raise
         except Exception as e:
             err_msg = str(e)
             # Check if this is an Alpaca validation error about stop_loss.stop_price or take_profit.limit_price

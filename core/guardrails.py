@@ -74,7 +74,12 @@ class RiskGuardrails:
             return False, f"Rejected: Unknown action '{action}'. Only BUY, SELL, or HOLD are permitted.", adjusted_decision
 
         # 3. Check Universe Restrictions
-        # Allow trading if symbol is in config.TRADING_UNIVERSE or in the latest screened watchlist
+        # Allow trading if symbol is in config.TRADING_UNIVERSE, in the latest
+        # screened watchlist, OR is a currently-held position. Held positions must
+        # always be tradable so the agent can manage (SELL) or add to (BUY) them,
+        # even if the symbol is not in the static universe or the latest top-N
+        # watchlist (e.g. a position opened earlier that later fell out of the
+        # top-N screener output).
         from core import database
         allowed_symbols = set(s.upper() for s in config.TRADING_UNIVERSE)
         
@@ -83,6 +88,11 @@ class RiskGuardrails:
             # Normalize watchlist symbols (e.g. SOL/USD -> SOLUSD) and add both forms
             allowed_symbols.add(ws_symbol.upper())
             allowed_symbols.add(ws_symbol.upper().replace('/', ''))
+            
+        # Add currently-held positions (both raw and normalized forms)
+        for pos_symbol in current_positions:
+            allowed_symbols.add(pos_symbol.upper())
+            allowed_symbols.add(pos_symbol.upper().replace('/', ''))
             
         normalized_symbol = symbol.upper().replace('/', '')
         if symbol.upper() not in allowed_symbols and normalized_symbol not in allowed_symbols:
@@ -172,10 +182,11 @@ class RiskGuardrails:
             
             # Check if transaction value exceeds max allocation limit
             if proposed_trade_value > max_trade_value:
-                if is_crypto:
-                    max_allowed_qty = round(max_trade_value / current_price, 4)
-                else:
-                    max_allowed_qty = int(max_trade_value // current_price)
+                # Fractional quantities are preserved for both crypto and equities.
+                # The broker layer (alpaca_client) handles eligibility: bracket (OCO)
+                # orders round to whole shares, and plain market orders fall back to
+                # whole shares if Alpaca rejects a fractional qty for a given equity.
+                max_allowed_qty = round(max_trade_value / current_price, 4)
                     
                 logger.warning(f"Proposed buy value (${proposed_trade_value:,.2f}) exceeds max trade size limit (${max_trade_value:,.2f}). "
                                f"Scaling down quantity from {proposed_qty} to {max_allowed_qty}.")
@@ -192,10 +203,8 @@ class RiskGuardrails:
             
             if total_proposed_value > max_ticker_value:
                 max_allowed_value = max(0, max_ticker_value - existing_position_value)
-                if is_crypto:
-                    max_allowed_qty = round(max_allowed_value / current_price, 4)
-                else:
-                    max_allowed_qty = int(max_allowed_value // current_price)
+                # Fractional quantities preserved for both crypto and equities (see note above).
+                max_allowed_qty = round(max_allowed_value / current_price, 4)
                     
                 logger.warning(f"Proposed total position value (${total_proposed_value:,.2f}) exceeds per-ticker limit (${max_ticker_value:,.2f}). "
                                f"Scaling down quantity from {proposed_qty} to {max_allowed_qty}.")
@@ -230,10 +239,8 @@ class RiskGuardrails:
                 return False, f"Rejected: Cash balance (${cash:,.2f}) is below or near the required cash buffer (${min_cash_required:,.2f}). Buying blocked.", adjusted_decision
                 
             if proposed_trade_value > available_spending_cash:
-                if is_crypto:
-                    max_cash_qty = round(available_spending_cash / current_price, 4)
-                else:
-                    max_cash_qty = int(available_spending_cash // current_price)
+                # Fractional quantities preserved for both crypto and equities (see note above).
+                max_cash_qty = round(available_spending_cash / current_price, 4)
                     
                 logger.warning(f"Proposed buy cost (${proposed_trade_value:,.2f}) exceeds available spending cash (${available_spending_cash:,.2f}). "
                                f"Scaling down quantity from {proposed_qty} to {max_cash_qty}.")

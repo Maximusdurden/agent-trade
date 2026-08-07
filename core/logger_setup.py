@@ -8,11 +8,13 @@ sys.path.insert(0, r"Z:\python\projects")
 sys.path.insert(0, r"Z:\python\projects\agent-jira-client")
 
 try:
-    from agent_jira.jira_logger import setup_global_handler, default_logger, setup_logger, log_exception
+    import agent_jira.jira_logger as jira_logger
+    from agent_jira.jira_logger import setup_global_handler, setup_logger, log_exception
     JIRA_LOGGER_AVAILABLE = True
 except ImportError:
     try:
-        from library.jira_logger import setup_global_handler, default_logger
+        import library.jira_logger as jira_logger
+        from library.jira_logger import setup_global_handler, setup_logger
         JIRA_LOGGER_AVAILABLE = True
     except ImportError:
         JIRA_LOGGER_AVAILABLE = False
@@ -60,7 +62,10 @@ class JiraLoggingHandler(logging.Handler):
             }
             
             # Send to Jira (Fingerprint grouping is handled automatically by JiraLogger)
-            default_logger.log_error(
+            # Reference the module-level singleton dynamically so we always use the
+            # instance configured by setup_logger() (which reassigns jira_logger.default_logger),
+            # rather than a stale copy captured at import time.
+            jira_logger.default_logger.log_error(
                 err_type=err_type,
                 err_message=err_message,
                 traceback_str=traceback_str,
