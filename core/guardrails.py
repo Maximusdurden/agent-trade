@@ -171,6 +171,27 @@ class RiskGuardrails:
             if qty_available == 0 or proposed_qty <= 0:
                 adjusted_decision["quantity"] = 0.0
                 return False, f"Rejected: Sell quantity scaled down to 0 because all owned shares ({owned_qty}) are currently locked/held in other open or pending-cancel orders.", adjusted_decision
+
+            # Dust-liquidation guardrail: if the whole position (or the proposed
+            # sell) is worth less than MIN_SELL_VALUE, escalate to a full exit so
+            # the agent never bleeds out a tiny fraction (e.g. 25% of a small
+            # position) every cycle. This is deterministic and protects against
+            # any LLM-generated rule emitting fractional sells.
+            position_value = owned_qty * current_price
+            escalated = False
+            if position_value <= config.MIN_SELL_VALUE:
+                logger.warning(f"Dust position for {symbol}: value ${position_value:.2f} <= MIN_SELL_VALUE ${config.MIN_SELL_VALUE:.2f}. Escalating SELL to full liquidation of {qty_available} shares.")
+                adjusted_decision["quantity"] = qty_available
+                proposed_qty = qty_available
+                escalated = True
+            elif proposed_qty * current_price < config.MIN_SELL_VALUE:
+                logger.warning(f"Proposed SELL value for {symbol} (${proposed_qty * current_price:.2f}) is below MIN_SELL_VALUE ${config.MIN_SELL_VALUE:.2f}. Escalating to full liquidation of {qty_available} shares.")
+                adjusted_decision["quantity"] = qty_available
+                proposed_qty = qty_available
+                escalated = True
+
+            if escalated:
+                return True, f"Approved: Dust-liquidation full exit of {proposed_qty} shares of {symbol} (position value ${position_value:.2f} <= MIN_SELL_VALUE ${config.MIN_SELL_VALUE:.2f}).", adjusted_decision
                 
             return True, f"Approved: Sell order of {proposed_qty} shares of {symbol} validated.", adjusted_decision
 

@@ -10,6 +10,7 @@ MAX_TRADE_ALLOCATION_PCT = 0.10  # Max % of equity per trade
 MAX_TICKER_ALLOCATION_PCT = 0.30  # Max % of equity per ticker (new)
 DAILY_LOSS_LIMIT_PCT = 0.05  # Max daily equity drawdown before blocking buys
 MIN_CASH_BUFFER_PCT = 0.20  # Minimum cash reserve % of equity
+MIN_SELL_VALUE = float(os.getenv("MIN_SELL_VALUE", "50.0"))  # Min $ value of a SELL position; dust below this is fully liquidated
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 
