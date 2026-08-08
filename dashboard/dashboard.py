@@ -117,15 +117,18 @@ def get_portfolio_history():
         conn = database.get_db_connection()
         try:
             cursor = conn.cursor()
-            # Fetch the most recent 500 records (to keep chart performance snappy)
-            cursor.execute("SELECT timestamp, equity, cash, unrealized_pnl FROM portfolio_history ORDER BY timestamp DESC LIMIT 500")
+            # Fetch ALL portfolio history records (oldest to newest) so the full
+            # equity valuation curve back to inception is always available and
+            # new records are always appended. No LIMIT cap so longer timeframes
+            # (5D/1M/ALL) are not truncated to the most recent few days.
+            cursor.execute("SELECT timestamp, equity, cash, unrealized_pnl FROM portfolio_history ORDER BY timestamp ASC")
             rows = cursor.fetchall()
             history = [dict(row) for row in rows]
         finally:
             conn.close() # Explicitly close SQLite connection securely
             
-        # Reverse so that chronological order is preserved for the Chart.js timeline (oldest to newest)
-        history.reverse()
+        # Rows are already in chronological order (oldest to newest), which the
+        # Chart.js timeline renders oldest -> newest.
         
         # Prevent co-mingling: if we have any active paper trading metrics (not exactly 100000.0),
         # filter out the baseline fallback 100k data points.
@@ -146,15 +149,16 @@ def get_ticker_history():
         conn = database.get_db_connection()
         try:
             cursor = conn.cursor()
-            # Fetch the most recent 500 records to reconstruct positions curves
-            cursor.execute("SELECT timestamp, portfolio_state FROM decisions ORDER BY timestamp DESC LIMIT 500")
+            # Fetch ALL decision records (oldest to newest) so ticker position
+            # curves reconstruct the full history back to inception. No LIMIT cap
+            # so per-ticker dropdowns and longer timeframes are not truncated.
+            cursor.execute("SELECT timestamp, portfolio_state FROM decisions ORDER BY timestamp ASC")
             rows = cursor.fetchall()
         finally:
             conn.close() # Explicitly close SQLite connection securely
             
-        # Reverse so that chronological order is preserved (oldest to newest)
+        # Already in chronological order (oldest to newest)
         rows = list(rows)
-        rows.reverse()
         
         for row in rows:
             ts = row['timestamp']
