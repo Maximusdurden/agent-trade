@@ -12,7 +12,7 @@ except ImportError:
 
 if GENAI_AVAILABLE:
     class TradingDecision(BaseModel):
-        thought_process: str = Field(description="Detailed explanation of technical indicators analyzed, how news and advanced anchors/pivots influenced direction, your confluence reasoning for the chosen dynamic trade size, and compliance with the mandatory strategy rule.")
+        thought_process: str = Field(description="Detailed explanation of technical indicators analyzed, how news and advanced anchors/pivots influenced direction, your confluence reasoning for the chosen dynamic trade size, and compliance with the mandatory strategy rule. MUST also explicitly state: (1) your conviction level and why, and (2) if the symbol is in the options universe, whether you'd express the view via options (leverage) vs shares, and why.")
         action: str = Field(description="The trading action: BUY, SELL, or HOLD.")
         symbol: str = Field(description="The ticker symbol to trade (must be one of the symbols provided in the active market data list, or an empty string).")
         quantity: float = Field(description="The quantity of shares or coins to trade (use 0 for HOLD).")
@@ -304,6 +304,7 @@ Ticker: {symbol}
         4. If conviction is high and the symbol is in the options universe, you may optionally request a specific DTE range via "option_dte_min" / "option_dte_max" (default {config.OPTIONS_DTE_MIN}-{config.OPTIONS_DTE_MAX} days) and OTM% via "option_strike_otm_pct".
         5. OPTIONS UNIVERSE: {universe_str}. Only symbols in this set are eligible for options.
         6. For a SELL of an existing option position, set direction opposite your view and keep conviction high; the executor sells the held contracts (never go short).
+        7. NARRATION: In "thought_process", always explicitly explain WHY you chose your conviction level and, for an options-universe symbol, whether you are leaning toward shares vs options (leverage) and why (e.g. trend strength, DTE compatibility, risk appetite). Be specific — mention the actual conviction number you are assigning and the stock-vs-option intent.
         """
         
         # Add crypto-specific instructions to the system prompt
@@ -340,12 +341,13 @@ DIRECTIONS:
 7. Be highly decisive but risk-conscious. Do not over-trade. Avoid whipsawing (reversing recent trades without strong technical reasons).
 8. You must trade ONLY one symbol from the provided tickers per step, or choose HOLD/NO_ACTION.
 9. YOU MUST COMPLY WITH THE MANDATORY TRADING RULE SPECIFIED FOR EACH TICKER. DO NOT FORMULATE A DECISION THAT CONTRADICTS THESE RULES.
+10. STATE YOUR CONVICTION & INSTRUMENT INTENT: Always clearly justify your conviction score in "thought_process" (e.g. "Confluence of support + oversold RSI -> conviction 0.8"). For any symbol in the options universe, explicitly state whether you'd prefer to express the move via shares or via options (leverage), and why. This decisioning narrative is displayed to the operator and must be specific and actionable.
 
 OUTPUT FORMAT:
 You must reply with a valid JSON object ONLY. Do not wrap in markdown blocks other than standard JSON mime type.
 JSON Schema:
 {{
-  "thought_process": "Detailed explanation of technical indicators analyzed, how news and advanced anchors/pivots influenced direction, your confluence reasoning for the chosen dynamic trade size, and compliance with the mandatory strategy rule.",
+  "thought_process": "Detailed explanation of technical indicators analyzed, how news and advanced anchors/pivots influenced direction, your confluence reasoning for the chosen dynamic trade size, compliance with the mandatory strategy rule, AND an explicit justification of your conviction score plus (for options-universe symbols) whether you lean toward shares vs options and why.",
   "action": "BUY" | "SELL" | "HOLD",
   "symbol": {allowed_symbols_str},
   "quantity": float (number of shares, use 0 for HOLD),
