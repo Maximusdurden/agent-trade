@@ -54,12 +54,68 @@ def build_appraisal_universe(screened_symbols: list[str], positions: dict,
     return list(dict.fromkeys(candidates))
 
 
+SHOCK_COOLDOWN_MINUTES = 60
+# Cooldown between on-demand strategy-refinement attempts for a missing rule.
+STRATEGY_REFRESH_COOLDOWN_MINUTES = 60
+
+
+def shock_cooldown_active(symbol: str) -> bool:
+    """Return True if the emergency strategist was triggered for ``symbol`` recently.
+
+    Uses the system_state table to dedupe repeated [SHOCK DETECTED] triggers for
+    the same ticker (e.g. a persistent -9% crash) so we don't fire an expensive
+    MetaStrategist LLM call every 15-min cycle. Returns True to SKIP re-triggering
+    while within the cooldown window.
+    """
+    last_key = f"shock_last_trigger_{symbol.upper()}"
+    last_ts = database.get_system_state(last_key)
+    if not last_ts:
+        return False
+    try:
+        last = datetime.fromisoformat(str(last_ts))
+    except ValueError:
+        return False
+    # System state stored in UTC (datetime.utcnow). Compare against naive now.
+    elapsed = datetime.utcnow() - last
+    return elapsed.total_seconds() < SHOCK_COOLDOWN_MINUTES * 60
+
+
+def mark_shock_triggered(symbol: str) -> None:
+    """Record that the emergency strategist ran for `symbol` (to enforce cooldown)."""
+    try:
+        database.set_system_state(f"shock_last_trigger_{symbol}",
+                                  datetime.utcnow().isoformat())
+    except Exception as e:
+        logger.debug(f"Could not persist shock cooldown for {symbol}: {e}")
+
+
 def ensure_active_strategy(symbol: str, alpaca_client: AlpacaClient) -> bool:
-    """Generate a missing strategy on demand and confirm that it was persisted."""
+    """Generate a missing strategy on demand and confirm that it was persisted.
+
+    Includes a cooldown so a ticker with a persistently-unproducible rule (e.g.
+    missing_rule) doesn't re-trigger an expensive MetaStrategist LLM call every
+    cycle. Once a refresh is attempted, we don't try again for
+    STRATEGY_REFRESH_COOLDOWN_MINUTES unless the rule actually repairs itself.
+    """
     active_rule = database.get_active_strategy(symbol)
     is_valid, validation_reason = validate_strategy_rule(symbol, active_rule)
     if is_valid:
         return True
+
+    # Cooldown: skip re-triggering if we already tried to refine this ticker recently.
+    last_attempt_key = f"strategy_refresh_attempt_{symbol.upper()}"
+    last_attempt = database.get_system_state(last_attempt_key)
+    if last_attempt:
+        try:
+            last = datetime.fromisoformat(str(last_attempt))
+            if (datetime.utcnow() - last).total_seconds() < STRATEGY_REFRESH_COOLDOWN_MINUTES * 60:
+                logger.info(
+                    f"No valid strategy rule for {symbol} ({validation_reason}) but "
+                    f"recently refreshed; skipping appraisal this cycle (cooldown)."
+                )
+                return False
+        except ValueError:
+            pass
 
     logger.warning(
         f"No valid strategy rule found for {symbol} ({validation_reason}). "
@@ -70,6 +126,11 @@ def ensure_active_strategy(symbol: str, alpaca_client: AlpacaClient) -> bool:
         MetaStrategist().run_single_ticker_refinement(symbol, alpaca_client)
     except Exception as err:
         logger.error(f"Could not execute on-demand strategist update for {symbol}: {err}")
+    # Mark the attempt regardless of success so we don't hammer the LLM each cycle.
+    try:
+        database.set_system_state(last_attempt_key, datetime.utcnow().isoformat())
+    except Exception:
+        pass
 
     repaired_rule = database.get_active_strategy(symbol)
     is_valid, validation_reason = validate_strategy_rule(symbol, repaired_rule)
@@ -91,6 +152,11 @@ logging.basicConfig(
         logging.FileHandler(config.LOG_FILE)
     ]
 )
+# Suppress noisy third-party deprecation warnings that are surfaced at INFO/WARNING
+# by the google-genai SDK (e.g. the "Direct use of automatic function calling (AFC)"
+# advisory). These are cosmetic and clutter the System Activity Logs.
+for _noisy_logger in ("google_genai.models", "google_genai", "genai"):
+    logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
 from core import logger_setup
 logger_setup.setup_logging(app_name="agent-trade", env="production")
 logger = logging.getLogger("Runner")
@@ -341,14 +407,21 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
             daily_change = state["daily_return_pct"]
             
             if abs(daily_change) >= shock_threshold:
-                logger.warning(f"[SHOCK DETECTED] INTRADAY REGIME SHOCK: {symbol} daily move is {daily_change:.2f}% (Limit: {shock_threshold}%). Triggering emergency strategist run...")
-                try:
-                    from core.strategist import MetaStrategist
-                    emergency_strategist = MetaStrategist()
-                    # Trigger an immediate real-time strategy rules rewrite!
-                    emergency_strategist.run_single_ticker_refinement(symbol, alpaca_client)
-                except Exception as err:
-                    logger.error(f"Could not execute emergency strategist update: {err}")
+                if shock_cooldown_active(symbol):
+                    logger.info(
+                        f"[SHOCK] {symbol} daily move is {daily_change:.2f}% (Limit: {shock_threshold}%) "
+                        f"but emergency strategist already ran recently; skipping (cooldown {SHOCK_COOLDOWN_MINUTES}m)."
+                    )
+                else:
+                    logger.warning(f"[SHOCK DETECTED] INTRADAY REGIME SHOCK: {symbol} daily move is {daily_change:.2f}% (Limit: {shock_threshold}%). Triggering emergency strategist run...")
+                    mark_shock_triggered(symbol)
+                    try:
+                        from core.strategist import MetaStrategist
+                        emergency_strategist = MetaStrategist()
+                        # Trigger an immediate real-time strategy rules rewrite!
+                        emergency_strategist.run_single_ticker_refinement(symbol, alpaca_client)
+                    except Exception as err:
+                        logger.error(f"Could not execute emergency strategist update: {err}")
         else:
             logger.warning(f"Failed to fetch market data for {symbol}.")
             

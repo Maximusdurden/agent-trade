@@ -106,8 +106,10 @@ class TestWatchlistStrategyCoverage(unittest.TestCase):
         self.assertTrue(allowed)
 
     @patch("core.strategist.MetaStrategist")
+    @patch("runner.database.get_system_state", return_value=None)
+    @patch("runner.database.set_system_state")
     @patch("runner.database.get_active_strategy")
-    def test_missing_strategy_is_regenerated_and_rechecked(self, get_rule, strategist_class):
+    def test_missing_strategy_is_regenerated_and_rechecked(self, get_rule, set_state, get_state, strategist_class):
         get_rule.side_effect = [
             "No active strategy rules defined for SOL/USD.",
             "If SOL/USD falls below support, then reduce exposure.",
@@ -118,8 +120,10 @@ class TestWatchlistStrategyCoverage(unittest.TestCase):
         self.assertEqual(get_rule.call_count, 2)
 
     @patch("core.strategist.MetaStrategist")
+    @patch("runner.database.get_system_state", return_value=None)
+    @patch("runner.database.set_system_state")
     @patch("runner.database.get_active_strategy")
-    def test_asset_is_skipped_when_regeneration_does_not_persist_rule(self, get_rule, strategist_class):
+    def test_asset_is_skipped_when_regeneration_does_not_persist_rule(self, get_rule, set_state, get_state, strategist_class):
         get_rule.return_value = "No active strategy rules defined for SOL/USD."
 
         self.assertFalse(ensure_active_strategy("SOL/USD", MagicMock()))

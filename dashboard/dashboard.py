@@ -332,7 +332,23 @@ def status_cache_worker():
                 log_file_path = "/tmp/trading.log" if os.getenv("GCS_BUCKET_NAME") else config.LOG_FILE
                 if os.path.exists(log_file_path):
                     with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        log_lines = f.readlines()[-60:]  # last 60 lines
+                        raw_lines = f.readlines()[-200:]  # pull more so filtering keeps 60 clean
+                    # Filter out stale local-test artifacts / benign noise so the
+                    # System Activity Logs tail isn't polluted by old mock-test runs
+                    # (e.g. "RuntimeError: boom", "execution=local", unittest mocks)
+                    # or repeated boilerplate. This keeps the live tail focused on
+                    # real operational output.
+                    _STALE_NOISE_PATTERNS = [
+                        "RuntimeError: boom",
+                        "unittest.mock",
+                        "execution=local scope=UNKNOWN",
+                        "Cycle heartbeat finalized: execution=local",
+                    ]
+                    filtered = [
+                        line for line in raw_lines
+                        if not any(p in line for p in _STALE_NOISE_PATTERNS)
+                    ]
+                    log_lines = filtered[-60:]
             except Exception as log_err:
                 print(f"[Dashboard Server] Log file retrieval failed: {log_err}", file=sys.stderr)
 
