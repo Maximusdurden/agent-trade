@@ -1833,6 +1833,14 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <div class="metric-value" id="val-pnl">$0.00</div>
                 <div class="metric-sub" id="sub-pnl">Open Intraday Profit / Loss</div>
             </div>
+            <div class="metric-card" id="options-metric-card">
+                <div class="metric-label">
+                    <i data-lucide="activity" style="width: 0.85rem; height: 0.85rem; color: #c084fc"></i>
+                    Options Exposure
+                </div>
+                <div class="metric-value" id="val-options">0 contracts</div>
+                <div class="metric-sub" id="sub-options">Active Option Positions</div>
+            </div>
             <div class="metric-card">
                 <div class="metric-label">
                     <i data-lucide="refresh-cw" style="width: 0.85rem; height: 0.85rem; color: var(--color-gold)"></i>
@@ -2658,6 +2666,27 @@ HTML_CONTENT = """<!DOCTYPE html>
                 if (valIntervalEl) {
                     valIntervalEl.innerText = ((data && data.interval) || 15) + ' mins';
                 }
+
+                // Options Exposure metric card
+                const positionsDataForOpt = (data && data.positions) || {};
+                let optContracts = 0;
+                let optPositions = 0;
+                Object.keys(positionsDataForOpt).forEach(sym => {
+                    const p = positionsDataForOpt[sym] || {};
+                    if (p.is_option) {
+                        optContracts += (p.qty || 0);
+                        optPositions += 1;
+                    }
+                });
+                const valOptionsEl = document.getElementById('val-options');
+                if (valOptionsEl) {
+                    valOptionsEl.innerText = optContracts + ' contract' + (optContracts === 1 ? '' : 's');
+                    valOptionsEl.className = 'metric-value ' + (optPositions > 0 ? 'text-gold' : '');
+                }
+                const subOptionsEl = document.getElementById('sub-options');
+                if (subOptionsEl) {
+                    subOptionsEl.innerText = optPositions > 0 ? (optPositions + ' active option position' + (optPositions === 1 ? '' : 's')) : 'No active option positions';
+                }
                 // Update Screener Pool Grid
                 const screenerPoolContainer = document.getElementById('screener-pool-container');
                 if (screenerPoolContainer) {
@@ -2734,16 +2763,29 @@ HTML_CONTENT = """<!DOCTYPE html>
                             const qty = pos.qty !== undefined ? pos.qty : 0;
                             const isOption = !!(pos.is_option);
                             const unitLabel = isOption ? 'contract(s)' : 'shares';
+                            // Option-specific detail (strike / DTE) if present
+                            let optionDetail = '';
+                            if (isOption) {
+                                const strike = pos.strike_price;
+                                const dte = pos.option_dte;
+                                const parts = [];
+                                if (strike) parts.push('Strike $' + Number(strike).toFixed(2));
+                                if (dte !== undefined && dte !== null) parts.push('DTE ' + dte + 'd');
+                                optionDetail = parts.length ? ' <span class="pos-opt-detail">(' + parts.join(', ') + ')</span>' : '';
+                            }
+                            const optBadge = isOption ? '<span class="badge" style="background: rgba(139, 92, 246, 0.2); color: #c084fc; margin-left: 0.4rem; text-transform: none;">OPT</span>' : '';
                             
                             posListEl.innerHTML += `
                                 <div class="position-row">
                                     <div class="position-symbol-side">
                                         <span class="pos-sym">${sym}</span>
                                         <span class="pos-qty">${qty} ${unitLabel} @ $${avgEntry.toFixed(2)}</span>
+                                        ${optBadge}
                                     </div>
                                     <div class="position-value-pnl">
                                         <span class="pos-val">$${marketVal.toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
                                         <span class="pos-pnl ${pnlClass}">${pnlSign}$${posPnl.toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
+                                        ${optionDetail}
                                     </div>
                                 </div>
                             `;
@@ -2804,6 +2846,18 @@ HTML_CONTENT = """<!DOCTYPE html>
                             const symText = dec.proposed_symbol ? dec.proposed_symbol : 'PORTFOLIO HOLD';
                             const qtyText = dec.proposed_qty > 0 ? dec.proposed_qty + ' shares' : '';
                             const thoughtText = dec.thought_process || 'No rationale logged.';
+                            // Option-routed decision tag (instrument resolved by guardrails)
+                            let optionTag = '';
+                            if (dec.instrument === 'option') {
+                                const optType = dec.option_type ? (dec.option_type.toUpperCase()) : '';
+                                optionTag = `<span class="badge" style="background: rgba(139, 92, 246, 0.2); color: #c084fc; margin-left: 0.5rem; text-transform: none;">OPTION ${optType}</span>`;
+                            }
+                            // Conviction/direction hint
+                            let convictionTag = '';
+                            if (dec.conviction !== undefined && dec.conviction !== null) {
+                                const dir = dec.direction ? dec.direction.toUpperCase() : '';
+                                convictionTag = `<span class="badge" style="background: rgba(59, 130, 246, 0.12); color: var(--text-secondary); margin-left: 0.5rem; text-transform: none;">${dir} ${(dec.conviction * 100).toFixed(0)}%</span>`;
+                            }
 
                             streamEl.innerHTML += `
                                 <div class="thought-card ${statusClass}">
@@ -2812,6 +2866,8 @@ HTML_CONTENT = """<!DOCTYPE html>
                                             <div class="thought-ticker">
                                                 ${symText} 
                                                 <span class="badge ${actionBadgeClass}">${action} ${qtyText}</span>
+                                                ${optionTag}
+                                                ${convictionTag}
                                                 ${alertIcon}
                                             </div>
                                             <span class="thought-time">${dateStr}</span>
