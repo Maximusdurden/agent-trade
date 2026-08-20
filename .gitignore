@@ -38,8 +38,11 @@ env/
 !.env.template
 
 # Local Database & Logs
+*.db
 trading_agent.db
 test_trading_agent.db
+test_per_ticker.db
+trading_agent_live.db
 trading.log
 *.log
 

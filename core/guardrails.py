@@ -56,10 +56,17 @@ class RiskGuardrails:
             
         return True, "Market is open."
 
-    def validate_and_adjust_decision(self, decision: dict, account_state: dict, current_positions: dict) -> tuple[bool, str, dict]:
+    def validate_and_adjust_decision(self, decision: dict, account_state: dict, current_positions: dict,
+                                     cycle_context: dict | None = None) -> tuple[bool, str, dict]:
         """
         Validates the proposed decision from the LLM trading brain against risk limits.
         If necessary, it safely scales down trade size (shares) to comply with guidelines.
+        
+        Args:
+            cycle_context (optional): mutable dict tracking cumulative spend / trade
+                count across ALL decisions in the current cycle. Passed by the runner
+                so multiple per-ticker BUYs share ONE budget. Expected keys:
+                {"spent": float, "trades_executed": int, "equity": float}.
         
         Returns:
             - is_approved (bool)
@@ -75,10 +82,22 @@ class RiskGuardrails:
         adjusted_decision["symbol"] = symbol
         adjusted_decision["quantity"] = proposed_qty
 
+        # Cycle-level limits: enforce MAX_TRADES_PER_CYCLE + cumulative budget.
+        # cycle_context is shared across all decisions in this cycle.
+        cycle_context = cycle_context if isinstance(cycle_context, dict) else {}
+
         # 1. HOLD/NO_ACTION requires no guardrail checks
         if action in ("HOLD", "NO_ACTION"):
             adjusted_decision["quantity"] = 0.0
             return True, "Approved: No action taken.", adjusted_decision
+
+        # 1b. Per-cycle trade cap
+        max_trades = int(getattr(config, "MAX_TRADES_PER_CYCLE", 1))
+        trades_so_far = int(cycle_context.get("trades", 0))
+        if action in ("BUY", "SELL") and proposed_qty > 0 and trades_so_far >= max_trades:
+            adjusted_decision["quantity"] = 0.0
+            return False, (f"Rejected: Per-cycle trade cap reached ({trades_so_far} >= "
+                           f"MAX_TRADES_PER_CYCLE {max_trades}). No more executable trades this cycle."), adjusted_decision
 
         # 2. Check Action validity
         if action not in ("BUY", "SELL"):
@@ -259,6 +278,28 @@ class RiskGuardrails:
                                f"Scaling down quantity from {proposed_qty} to {max_allowed_qty}.")
                 proposed_qty = max_allowed_qty
                 proposed_trade_value = proposed_qty * current_price
+
+            # Cumulative cycle budget: cap total spend across ALL buys this cycle so
+            # N per-ticker BUYs can't each pass the per-trade check while summing far
+            # beyond acceptable exposure.
+            spent_so_far = float(cycle_context.get("spent", 0.0))
+            # Total allowed cycle spend = per-trade cap * max trades (bounded by none).
+            max_cycle_budget = max_trade_value * int(getattr(config, "MAX_TRADES_PER_CYCLE", 1))
+            if spent_so_far + proposed_trade_value > max_cycle_budget:
+                allowed_for_cycle = max(0.0, max_cycle_budget - spent_so_far)
+                if allowed_for_cycle <= 0:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, (f"Rejected: Cumulative cycle spend budget exhausted "
+                                   f"(${spent_so_far:,.2f} spent / ${max_cycle_budget:,.2f})."), adjusted_decision
+                max_allowed_qty = round(allowed_for_cycle / current_price, 4)
+                logger.warning(f"Cycle spend budget would be exceeded (${spent_so_far+proposed_trade_value:,.2f} > ${max_cycle_budget:,.2f}). "
+                               f"Scaling buy for {symbol} to ${allowed_for_cycle:,.2f}.")
+                proposed_qty = max(0.0, max_allowed_qty)
+                proposed_trade_value = proposed_qty * current_price
+                if proposed_qty <= 0:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, f"Rejected: Cumulative cycle budget exhausted for {symbol}.", adjusted_decision
+                
                 
             # Check per-ticker allocation limit
             existing_position_value = 0.0

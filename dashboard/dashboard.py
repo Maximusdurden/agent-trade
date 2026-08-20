@@ -291,12 +291,18 @@ def status_cache_worker():
             history = []
             ticker_history = {}
             broker_orders = []
+            ticker_convictions = []
             try:
                 decisions = database.get_recent_decisions(limit=15)
                 trades = database.get_recent_trades(limit=15)
                 executions = database.get_executions(limit=50)
                 history = get_portfolio_history()
                 ticker_history = get_ticker_history()
+                try:
+                    ticker_convictions = database.get_ticker_convictions(limit=200)
+                except Exception as tc_err:
+                    print(f"[Dashboard Server] Ticker convictions fetch failed (non-fatal): {tc_err}", file=sys.stderr)
+                    ticker_convictions = []
                 
                 # 2b. Fetch executed orders directly from Alpaca.  This catches
                 #     TP/SL bracket fills and broker-side sells that the runner
@@ -316,8 +322,6 @@ def status_cache_worker():
                 except Exception as broker_err:
                     print(f"[Dashboard Server] Broker order fetch failed (non-fatal): {broker_err}", file=sys.stderr)
                     broker_orders = []
-            except Exception as db_err:
-                print(f"[Dashboard Server] Database retrieval failed: {db_err}", file=sys.stderr)
             except Exception as db_err:
                 print(f"[Dashboard Server] Database retrieval failed: {db_err}", file=sys.stderr)
 
@@ -396,6 +400,7 @@ def status_cache_worker():
                 "decisions": decisions,
                 "trades": trades,
                 "executions": executions,
+                "ticker_convictions": ticker_convictions,
                 "broker_orders": broker_orders,
                 "history": history,
                 "ticker_history": ticker_history,
@@ -2827,6 +2832,21 @@ HTML_CONTENT = """<!DOCTYPE html>
                             }
                         });
 
+                        // Build a per-symbol "previous cycle" conviction lookup from
+                        // ticker_convictions so we can flag conviction/direction
+                        // changes (Δ) vs the prior cycle. Rows are newest-first.
+                        const tickerConvictions = (data && data.ticker_convictions) || [];
+                        const prevConvictionBySymbol = {};
+                        const seenSymbols = {};
+                        tickerConvictions.forEach(tc => {
+                            const sym = (tc.symbol || '').toUpperCase();
+                            if (!sym) return;
+                            if (!seenSymbols[sym]) {
+                                seenSymbols[sym] = true;
+                                prevConvictionBySymbol[sym] = tc;
+                            }
+                        });
+
                         decisions.forEach(dec => {
                             const isApproved = dec.is_approved === 1;
                             const statusClass = isApproved ? 'approved' : 'rejected';
@@ -2874,6 +2894,25 @@ HTML_CONTENT = """<!DOCTYPE html>
                                 const dir = dec.direction ? dec.direction.toUpperCase() : '';
                                 convictionTag = `<span class="badge" style="background: rgba(59, 130, 246, 0.12); color: var(--text-secondary); margin-left: 0.5rem; text-transform: none;">${dir} ${(dec.conviction * 100).toFixed(0)}%</span>`;
                             }
+                            // Conviction-change (Δ) indicator vs the prior cycle
+                            let changeTag = '';
+                            if (dec.proposed_symbol) {
+                                const sym = dec.proposed_symbol.toUpperCase();
+                                const prev = prevConvictionBySymbol[sym];
+                                if (prev && prev.cycle_id !== dec.cycle_id) {
+                                    const prevDir = (prev.direction || '').toUpperCase();
+                                    const curDir = (dec.direction || '').toUpperCase();
+                                    const prevC = prev.conviction != null ? prev.conviction : null;
+                                    const curC = dec.conviction != null ? dec.conviction : null;
+                                    const dirChanged = prevDir && curDir && prevDir !== curDir;
+                                    const convChanged = prevC != null && curC != null && Math.abs(prevC - curC) >= 0.05;
+                                    if (dirChanged || convChanged) {
+                                        const delta = (prevC != null && curC != null) ? ((curC - prevC) * 100).toFixed(0) : '';
+                                        const arrow = (delta && delta > 0) ? '▲' : (delta && delta < 0) ? '▼' : 'Δ';
+                                        changeTag = `<span class="badge" style="background: rgba(250, 204, 21, 0.12); color: #facc15; margin-left: 0.5rem; text-transform: none;" title="Conviction changed vs prior cycle">${arrow}${delta ? ' ' + delta + '%' : ''}</span>`;
+                                    }
+                                }
+                            }
 
                             streamEl.innerHTML += `
                                 <div class="thought-card ${statusClass}">
@@ -2884,6 +2923,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                                                 <span class="badge ${actionBadgeClass}">${action} ${qtyText}</span>
                                                 ${optionTag}
                                                 ${convictionTag}
+                                                ${changeTag}
                                                 ${alertIcon}
                                             </div>
                                             <span class="thought-time">${dateStr}</span>

@@ -37,7 +37,9 @@ def init_db():
                 rejection_reason TEXT,   -- Why did it fail guardrails, if any
                 direction TEXT,          -- bullish | bearish | neutral (conviction model)
                 conviction REAL,         -- 0.0-1.0 conviction score
-                instrument TEXT          -- stock | crypto | option (resolved by guardrails)
+                instrument TEXT,         -- stock | crypto | option (resolved by guardrails)
+                cycle_id TEXT,           -- groups a batch of per-ticker decisions from one cycle
+                reasoning TEXT           -- per-ticker narrative from the brain
             )
         """)
         
@@ -123,6 +125,26 @@ def init_db():
             )
         """)
 
+        # 7. Ticker Convictions Table (per-ticker conviction/direction per cycle)
+        # Powers the dashboard's per-ticker conviction badges and "conviction
+        # changed" (Δ) indicators by comparing a ticker's latest cycle vs the
+        # prior cycle.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ticker_convictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT,          -- bullish | bearish | neutral
+                conviction REAL,         -- 0.0-1.0
+                reasoning TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ticker_convictions_cycle
+            ON ticker_convictions (cycle_id, symbol)
+        """)
+
         # --- Migrations for pre-existing databases ---
         def add_column_if_missing(table: str, column: str, decl: str) -> None:
             cols = [r[1] for r in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -132,6 +154,8 @@ def init_db():
         add_column_if_missing("decisions", "direction", "TEXT")
         add_column_if_missing("decisions", "conviction", "REAL")
         add_column_if_missing("decisions", "instrument", "TEXT")
+        add_column_if_missing("decisions", "cycle_id", "TEXT")
+        add_column_if_missing("decisions", "reasoning", "TEXT")
         add_column_if_missing("trades", "option_type", "TEXT")
         add_column_if_missing("trades", "option_dte", "INTEGER")
         add_column_if_missing("trades", "strike", "REAL")
@@ -143,7 +167,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
                  proposed_action: str, proposed_symbol: str, proposed_qty: float,
                  is_approved: bool, rejection_reason: str | None = None,
                  direction: str | None = None, conviction: float | None = None,
-                 instrument: str | None = None) -> int:
+                 instrument: str | None = None, cycle_id: str | None = None,
+                 reasoning: str | None = None) -> int:
     """Logs the LLM decision to the SQLite database and returns the decision ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -151,8 +176,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             INSERT INTO decisions (
                 timestamp, ticker_indicators, portfolio_state, thought_process,
                 proposed_action, proposed_symbol, proposed_qty, is_approved, rejection_reason,
-                direction, conviction, instrument
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                direction, conviction, instrument, cycle_id, reasoning
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             json.dumps(ticker_indicators),
@@ -165,10 +190,53 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             rejection_reason,
             direction,
             conviction,
-            instrument
+            instrument,
+            cycle_id,
+            reasoning
         ))
         conn.commit()
         return get_last_insert_id(cursor)
+
+def log_ticker_conviction(cycle_id: str, symbol: str, direction: str | None,
+                          conviction: float | None, reasoning: str | None = None) -> int:
+    """Records a per-ticker conviction/direction for a cycle (dashboard badges)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO ticker_convictions (cycle_id, timestamp, symbol, direction, conviction, reasoning)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            cycle_id,
+            datetime.utcnow().isoformat(),
+            symbol.upper(),
+            direction,
+            conviction,
+            reasoning
+        ))
+        conn.commit()
+        return get_last_insert_id(cursor)
+
+def get_ticker_convictions(limit: int = 200) -> list[dict]:
+    """Returns the most recent per-ticker conviction rows (newest first)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM ticker_convictions ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+def get_latest_cycle_id() -> str | None:
+    """Returns the most recent cycle_id recorded in decisions, if any."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT cycle_id FROM decisions
+            WHERE cycle_id IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+        """)
+        row = cursor.fetchone()
+        return row["cycle_id"] if row else None
 
 def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
               side: str, qty: float, filled_avg_price: float | None, status: str,
@@ -665,6 +733,16 @@ class Database:
 
     def get_latest_watchlist_raw(self) -> list[str]:
         return get_latest_watchlist_raw()
+
+    def log_ticker_conviction(self, cycle_id: str, symbol: str, direction: str | None,
+                              conviction: float | None, reasoning: str | None = None) -> int:
+        return log_ticker_conviction(cycle_id, symbol, direction, conviction, reasoning)
+
+    def get_ticker_convictions(self, limit: int = 200) -> list[dict]:
+        return get_ticker_convictions(limit)
+
+    def get_latest_cycle_id(self) -> str | None:
+        return get_latest_cycle_id()
 
     def get_active_strategy(self, ticker: str) -> str:
         return get_active_strategy(ticker)

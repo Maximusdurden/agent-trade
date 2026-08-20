@@ -41,6 +41,11 @@ OPTIONS_AUTO_CLOSE_DTE = int(os.getenv("OPTIONS_AUTO_CLOSE_DTE", "3"))
 OPTIONS_OTM_PERCENT_MIN = float(os.getenv("OPTIONS_OTM_PERCENT_MIN", "0.01"))
 OPTIONS_OTM_PERCENT_MAX = float(os.getenv("OPTIONS_OTM_PERCENT_MAX", "0.10"))
 
+# Max number of executable (non-HOLD) decisions allowed per cycle.
+# Staged rollout: start at 1 (mirrors old single-decision behavior), then raise
+# to 3-5 once multi-decision behavior is trusted on paper.
+MAX_TRADES_PER_CYCLE = int(os.getenv("MAX_TRADES_PER_CYCLE", "1"))
+
 # Trading Universe
 TRADING_UNIVERSE = [
     "SPY", "QQQ", "DIA", "IWM",  # ETFs

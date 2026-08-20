@@ -436,162 +436,174 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         logger.error(f"Error retrieving recent decisions from DB: {e}")
         recent_decisions = []
 
-    # 5. Let the AI Brain reason and generate a decision
-    logger.info("Querying AI strategy brain for proposed action...")
+    # 5. Let the AI Brain reason and generate per-ticker decisions (Option B)
+    logger.info("Querying AI strategy brain for proposed actions...")
     appraised_positions = positions if actual_market_open else {
         symbol: details for symbol, details in positions.items() if is_crypto_symbol(symbol)
     }
-    decision = brain.make_decision(market_states, account_state, appraised_positions, recent_decisions)
-    
-    # Enrich decision with current pricing data for guardrail calculations
-    target_symbol = decision.get("symbol", "").upper()
-    current_price = 0.0
-    for state in market_states:
-        if state["symbol"] == target_symbol:
-            current_price = state["current_price"]
-            break
-    decision["current_price"] = current_price
+    decisions = brain.make_decision(market_states, account_state, appraised_positions, recent_decisions)
+    if not isinstance(decisions, list):
+        decisions = [decisions]  # tolerate a single dict fallback
 
-    # 6. Filter proposed decision through Risk Guardrails
-    logger.info("Evaluating decision with deterministic Risk Guardrails...")
-    is_approved, status_msg, adjusted_decision = guardrails.validate_and_adjust_decision(
-        decision, account_state, positions
-    )
-    
-    action = adjusted_decision.get("action", "HOLD")
-    symbol = adjusted_decision.get("symbol", "")
-    qty = adjusted_decision.get("quantity", 0.0)
-    thought_process = adjusted_decision.get("thought_process", "")
-    
-    logger.info(f"Guardrails Result: {status_msg}")
+    # Shared cycle context for cumulative budget / per-cycle trade cap across all
+    # per-ticker decisions this cycle. A single cycle_id groups this batch of
+    # per-ticker decisions so the dashboard can read them as one "cycle run".
+    cycle_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    cycle_context = {"spent": 0.0, "trades": 0}
 
-    # 7. Log decision to SQLite Database
-    try:
-        decision_id = database.log_decision(
-            ticker_indicators={s["symbol"]: s["indicators"] for s in market_states},
-            portfolio_state={"cash": cash, "equity": equity, "positions": positions},
-            thought_process=thought_process,
-            proposed_action=action,
-            proposed_symbol=symbol,
-            proposed_qty=qty,
-            is_approved=is_approved,
-            rejection_reason=status_msg if not is_approved else None,
-            direction=adjusted_decision.get("direction"),
-            conviction=adjusted_decision.get("conviction"),
-            instrument=adjusted_decision.get("instrument"),
+    executed_results = []
+    rejected_count = 0
+    hold_count = 0
+
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        # Enrich decision with current pricing data for guardrail calculations
+        target_symbol = decision.get("symbol", "").upper()
+        current_price = 0.0
+        for state in market_states:
+            if state["symbol"] == target_symbol:
+                current_price = state["current_price"]
+                break
+        decision["current_price"] = current_price
+
+        # 6. Filter proposed decision through Risk Guardrails
+        is_approved, status_msg, adjusted_decision = guardrails.validate_and_adjust_decision(
+            decision, account_state, positions, cycle_context=cycle_context
         )
-        logger.info(f"Decision logged successfully. DB ID: {decision_id}")
-    except Exception as e:
-        logger.error(f"Failed to log decision to DB: {e}")
+
+        action = adjusted_decision.get("action", "HOLD")
+        symbol = adjusted_decision.get("symbol", "")
+        qty = adjusted_decision.get("quantity", 0.0)
+        thought_process = adjusted_decision.get("thought_process", "")
+        reasoning = adjusted_decision.get("reasoning") or adjusted_decision.get("thought_process")
+        logger.info(f"[{symbol or 'PORTFOLIO'}] Guardrails Result: {status_msg}")
+
+        # 7. Log decision to SQLite Database
         decision_id = None
+        try:
+            decision_id = database.log_decision(
+                ticker_indicators={s["symbol"]: s["indicators"] for s in market_states},
+                portfolio_state={"cash": cash, "equity": equity, "positions": positions},
+                thought_process=thought_process,
+                proposed_action=action,
+                proposed_symbol=symbol,
+                proposed_qty=qty,
+                is_approved=is_approved,
+                rejection_reason=status_msg if not is_approved else None,
+                direction=adjusted_decision.get("direction"),
+                conviction=adjusted_decision.get("conviction"),
+                instrument=adjusted_decision.get("instrument"),
+                cycle_id=cycle_id,
+                reasoning=reasoning,
+            )
+        except Exception as e:
+            logger.error(f"Failed to log decision to DB: {e}")
 
-    # 8. Execution Phase (only if approved and not a HOLD)
-    if is_approved and action in ("BUY", "SELL") and qty > 0:
-        take_profit_price = adjusted_decision.get("take_profit_price")
-        stop_loss_price = adjusted_decision.get("stop_loss_price")
-        
-        is_crypto = is_crypto_symbol(symbol)
+        # Record per-ticker conviction for dashboard badges / change indicators
+        if symbol:
+            try:
+                database.log_ticker_conviction(
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    direction=adjusted_decision.get("direction"),
+                    conviction=adjusted_decision.get("conviction"),
+                    reasoning=reasoning,
+                )
+            except Exception as e:
+                logger.error(f"Failed to log ticker conviction for {symbol}: {e}")
 
-        # 8a. OPTIONS PATH: route to the option executor when instrument resolves
-        # to an option (BUY-to-open of a new position or SELL-to-close of an
-        # existing OCC contract). Guardrails set "instrument" = "option".
-        instrument = adjusted_decision.get("instrument")
+        if not is_approved or action in ("HOLD", "NO_ACTION"):
+            if is_approved and action in ("HOLD", "NO_ACTION"):
+                hold_count += 1
+            else:
+                rejected_count += 1
+            continue
+
+        # 8. Execution Phase (only if approved and action not HOLD)
+        if not (action in ("BUY", "SELL") and qty > 0):
+            continue
+
+        # Option vs stock routing
         from core.guardrails import is_occ_symbol as _occ_hint
-        is_option = instrument == "option" or _occ_hint(symbol)
-        if is_option:
-            logger.info(f"Routing {action} decision for {symbol} through the OPTION executor.")
+        is_crypto = is_crypto_symbol(symbol)
+        option_executed = False
+
+        if adjusted_decision.get("instrument") == "option" or _occ_hint(symbol):
             try:
                 from core.option_executor import OptionExecutor
                 option_executor = OptionExecutor(alpaca_client)
                 option_result = option_executor.execute(adjusted_decision, account_state)
-                logger.info(f"Option order result: {option_result}")
-                order_result = option_result.get("order_info", option_result)
-                # Log the option execution
+                logger.info(f"Option order result for {symbol}: {option_result}")
                 try:
                     database.log_execution(
-                        decision_id=decision_id, attempt=1, symbol=option_result.get("symbol", symbol),
-                        side=action.lower(), qty=option_result.get("contracts", qty),
-                        order_type="option",
+                        decision_id=decision_id, attempt=1,
+                        symbol=option_result.get("symbol", symbol), side=action.lower(),
+                        qty=option_result.get("contracts", qty), order_type="option",
                         status=str(option_result.get("status", "submitted")),
                         error=None if option_result.get("status") != "failed" else option_result.get("summary"),
-                        alpaca_order_id=option_result.get("order_info", {}).get("id") or option_result.get("order_info", {}).get("id"),
+                        alpaca_order_id=option_result.get("order_info", {}).get("id"),
                     )
                 except Exception as log_ex:
                     logger.error(f"Failed to log option execution: {log_ex}")
-                return "COMPLETED", asset_scope, f"Option {action} of {qty} contracts for {symbol} processed."
+                executed_results.append(f"OPTION {action} {option_result.get('contracts', qty)}x {symbol}")
+                option_executed = True
             except Exception as e:
                 logger.error(f"Option execution failed for {symbol}: {e}")
-                return "FAILED", "option", f"Option execution failed for {symbol}: {e}"
+                executed_results.append(f"OPTION-FAIL {symbol}: {e}")
+                option_executed = True  # count as handled so we skip stock path below
+
+        if option_executed:
+            cycle_context["trades"] = int(cycle_context.get("trades", 0)) + 1
+            continue
 
         if not actual_market_open and not is_crypto:
-            logger.error(f"Blocking {action} for equity {symbol}: the US equity market is closed.")
-            return "FAILED", asset_scope, f"Blocked off-hours equity action for {symbol}."
-        
+            logger.error(f"Blocking {action} for equity {symbol}: market closed.")
+            continue
+
         if action == "BUY" and not is_crypto:
-            # Fetch the real-time latest trade price as base_price to prevent validation failure due to price drift.
+            # Rebase TP/SL on a fresh price to avoid validation drift
             try:
                 base_price = alpaca_client.get_latest_price(symbol)
-                logger.info(f"Fetched real-time latest price for {symbol} as base_price: ${base_price:.2f} (originally ${current_price:.2f})")
-            except Exception as price_err:
-                logger.warning(f"Could not fetch real-time price: {price_err}. Falling back to cached current_price: ${current_price:.2f}")
+            except Exception:
                 base_price = float(current_price)
-            
-            # Since the entry base_price might have changed, we should recalculate TP/SL targets 
-            # to preserve the relative distance (percentage offsets) intended by the Strategy Brain.
+            take_profit_price = adjusted_decision.get("take_profit_price")
+            stop_loss_price = adjusted_decision.get("stop_loss_price")
             cached_base = float(current_price) if current_price > 0 else base_price
-            
-            # Calculate original target percent offsets if they were provided
             if take_profit_price:
-                tp_pct = float(take_profit_price) / cached_base
-                take_profit_price = round(base_price * tp_pct, 2)
+                take_profit_price = round(base_price * (float(take_profit_price)/cached_base), 2)
             else:
                 take_profit_price = round(base_price * 1.05, 2)
-                logger.info(f"Applying default 5% Take-Profit fallback target at ${take_profit_price:.2f}.")
-
             if stop_loss_price:
-                sl_pct = float(stop_loss_price) / cached_base
-                stop_loss_price = round(base_price * sl_pct, 2)
+                stop_loss_price = round(base_price * (float(stop_loss_price)/cached_base), 2)
             else:
                 stop_loss_price = round(base_price * 0.97, 2)
-                logger.info(f"Applying default 3% Stop-Loss fallback target at ${stop_loss_price:.2f}.")
-
-            min_allowed_tp = round(base_price + 0.05, 2)
-            if take_profit_price < min_allowed_tp:
-                logger.info(f"Take-Profit price ${take_profit_price:.2f} is too close to entry or below entry. Raising to ${min_allowed_tp:.2f} to satisfy Alpaca validation with a safety buffer.")
-                take_profit_price = min_allowed_tp
-
-            # Safeguard: Alpaca requires stop_loss.stop_price <= base_price - 0.01 for equities
-            # We use a 0.5% or 5-cent buffer (whichever is more conservative) to handle live market spread fluctuations
             max_allowed_stop = round(min(base_price * 0.995, base_price - 0.05), 2)
             if stop_loss_price > max_allowed_stop:
-                logger.info(f"Stop-Loss price ${stop_loss_price:.2f} is too close to entry or above entry. Capping at ${max_allowed_stop:.2f} to satisfy Alpaca validation with a safety buffer.")
                 stop_loss_price = max_allowed_stop
+            min_allowed_tp = round(base_price + 0.05, 2)
+            if take_profit_price < min_allowed_tp:
+                take_profit_price = min_allowed_tp
         else:
             take_profit_price = None
             stop_loss_price = None
 
         if dry_run:
-            logger.info(f"[DRY RUN] Would execute order: {action} {qty} shares of {symbol}")
-            if action == "BUY" and not is_crypto:
-                logger.info(f"[DRY RUN] Bracket Order details -> TP: ${take_profit_price:.2f} | SL: ${stop_loss_price:.2f}")
-            return "COMPLETED", asset_scope, f"Dry-run decision {action} {symbol}."
-            
-        logger.info(f"EXECUTING ORDER: Submitting {action} order for {qty} shares of {symbol}...")
+            logger.info(f"[DRY RUN] Would execute order: {action} {qty} of {symbol}")
+            executed_results.append(f"DRY {action} {qty}x {symbol}")
+            continue
+
+        logger.info(f"EXECUTING ORDER: {action} {qty} {symbol}...")
         try:
             order_result = alpaca_client.execute_market_order(
                 symbol, qty, action,
                 take_profit_price=take_profit_price,
                 stop_loss_price=stop_loss_price
             )
-            logger.info(f"Order executed successfully! Details: {order_result}")
-
-            # Record the execution attempt (bracket or market, incl. fallback)
+            logger.info(f"Order executed: {order_result}")
             try:
                 database.log_execution(
-                    decision_id=decision_id,
-                    attempt=1,
-                    symbol=symbol,
-                    side=action,
+                    decision_id=decision_id, attempt=1, symbol=symbol, side=action,
                     qty=order_result.get("qty", qty),
                     order_type=order_result.get("order_type", "market"),
                     status=order_result.get("status", "submitted"),
@@ -599,38 +611,27 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                     filled_avg_price=order_result.get("filled_avg_price")
                 )
             except Exception as exec_log_err:
-                logger.error(f"Failed to log execution attempt to DB: {exec_log_err}")
-
-            # Log executed trade to SQLite
+                logger.error(f"Failed to log execution: {exec_log_err}")
             database.log_trade(
-                decision_id=decision_id,
-                alpaca_order_id=order_result["id"],
-                symbol=symbol,
-                side=action,
-                qty=qty,
+                decision_id=decision_id, alpaca_order_id=order_result["id"], symbol=symbol,
+                side=action, qty=qty,
                 filled_avg_price=order_result.get("filled_avg_price"),
                 status=order_result.get("status", "submitted")
             )
-            logger.info("Trade transaction logged to database.")
-            
+            executed_results.append(f"{action} {qty} {symbol}")
+            # Account this executed trade toward the per-cycle cap and cumulative budget
+            cycle_context["trades"] = int(cycle_context.get("trades", 0)) + 1
+            cycle_context["spent"] = float(cycle_context.get("spent", 0.0)) + qty * float(order_result.get("filled_avg_price", current_price) or current_price)
         except Exception as e:
-            logger.critical(f"FATAL: Order execution failed! Error: {e}")
-            # Record the failed execution attempt so the dashboard can surface it
+            logger.critical(f"FATAL: Order execution failed for {symbol}: {e}")
             try:
                 database.log_execution(
-                    decision_id=decision_id,
-                    attempt=1,
-                    symbol=symbol,
-                    side=action,
-                    qty=qty,
+                    decision_id=decision_id, attempt=1, symbol=symbol, side=action, qty=qty,
                     order_type="bracket" if (action == "BUY" and not is_crypto and take_profit_price and stop_loss_price) else "market",
-                    status="failed",
-                    error=str(e)
+                    status="failed", error=str(e)
                 )
             except Exception as exec_log_err:
-                logger.error(f"Failed to log failed execution attempt to DB: {exec_log_err}")
-    else:
-        logger.info("No order execution required for this cycle.")
+                logger.error(f"Failed to log failed execution: {exec_log_err}")
 
     # 9. Sync database and logs to GCS if configured
     try:
@@ -639,7 +640,11 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
     except Exception as gcs_err:
         logger.error(f"Failed to sync to GCS: {gcs_err}")
 
-    return "COMPLETED", asset_scope, f"Cycle completed with {action} decision."
+    if not executed_results:
+        logger.info("No order was executed this cycle.")
+    else:
+        logger.info(f"Executed in this cycle: {executed_results}")
+    return "COMPLETED", asset_scope, ("Cycle completed. Executed: " + (", ".join(executed_results) if executed_results else "no trades"))
 
 
 def run_trading_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,

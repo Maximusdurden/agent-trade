@@ -28,6 +28,15 @@ if GENAI_AVAILABLE:
         option_dte_max: int | None = Field(default=None, description="Optional requested maximum days-to-expiry for an option (overrides the default window within hard safety bounds). Null to use the configured default.")
         option_strike_otm_pct: float | None = Field(default=None, description="Optional requested OTM% for strike selection (e.g. 0.05 = 5% out-of-the-money). Null to use the configured default.")
 
+    class TradingDecisionSet(BaseModel):
+        """Container for MULTIPLE per-ticker trading decisions (Option B).
+
+        The agent emits one decision per appraised ticker. Each is validated
+        and executed independently by the runner.
+        """
+        decisions: list[TradingDecision] = Field(default_factory=list,
+            description="One trading decision for each appraised ticker in the market data list. Must include EVERY ticker (even HOLDs). Each may have a different action, direction, and conviction.")
+
 from core import config
 from core import database
 
@@ -83,9 +92,39 @@ class TradingBrain:
             logger.warning(f"Unsupported provider '{self.provider}'. Falling back to rule-based brain.")
             self.is_mock = True
 
-    def make_decision(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict]) -> dict:
+    @staticmethod
+    def _normalize_decision(decision: dict) -> dict:
+        """Normalizes a single per-ticker decision dict (shared by providers)."""
+        decision = dict(decision)
+        decision["action"] = str(decision.get("action", "HOLD")).upper()
+        decision["symbol"] = str(decision.get("symbol", "")).upper()
+        try:
+            decision["quantity"] = float(decision.get("quantity", 0.0))
+        except (TypeError, ValueError):
+            decision["quantity"] = 0.0
+
+        tp = decision.get("take_profit_price")
+        sl = decision.get("stop_loss_price")
+        decision["take_profit_price"] = float(tp) if tp is not None else None
+        decision["stop_loss_price"] = float(sl) if sl is not None else None
+
+        decision["direction"] = str(decision.get("direction", "neutral")).lower()
+        if decision["direction"] not in ("bullish", "bearish", "neutral"):
+            decision["direction"] = "neutral"
+        try:
+            decision["conviction"] = float(decision.get("conviction", 0.0))
+        except (TypeError, ValueError):
+            decision["conviction"] = 0.0
+        decision["conviction"] = max(0.0, min(1.0, decision["conviction"]))
+        for f in ("option_dte_min", "option_dte_max", "option_strike_otm_pct"):
+            v = decision.get(f)
+            decision[f] = float(v) if v is not None else None
+        return decision
+
+    def make_decision(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict]) -> list[dict]:
         """
-        Formulates the prompt, calls the LLM (or mock fallback), and returns a structured decision.
+        Formulates the prompt, calls the LLM (or mock fallback), and returns a
+        LIST of structured per-ticker decisions (one per appraised symbol).
         """
         if self.is_mock:
             return self._make_mock_decision(market_data_list, account_state, positions)
@@ -95,38 +134,18 @@ class TradingBrain:
         
         if self.provider == "openrouter":
             try:
-                # Call generate_structured using TradingDecision model under the configured brain model tier
-                decision = self.llm_client.generate_structured(
+                # Call generate_structured using TradingDecisionSet (list) model
+                result = self.llm_client.generate_structured(
                     prompt=prompt,
-                    response_model=TradingDecision,
+                    response_model=TradingDecisionSet,
                     tier=config.BRAIN_MODEL_TIER
                 )
-                
-                # Normalize fields
-                decision["action"] = decision.get("action", "HOLD").upper()
-                decision["symbol"] = decision.get("symbol", "").upper()
-                decision["quantity"] = float(decision.get("quantity", 0.0))
-                
-                tp = decision.get("take_profit_price")
-                sl = decision.get("stop_loss_price")
-                decision["take_profit_price"] = float(tp) if tp is not None else None
-                decision["stop_loss_price"] = float(sl) if sl is not None else None
-
-                # Normalize conviction-threshold fields (additive)
-                decision["direction"] = str(decision.get("direction", "neutral")).lower()
-                if decision["direction"] not in ("bullish", "bearish", "neutral"):
-                    decision["direction"] = "neutral"
-                try:
-                    decision["conviction"] = float(decision.get("conviction", 0.0))
-                except (TypeError, ValueError):
-                    decision["conviction"] = 0.0
-                decision["conviction"] = max(0.0, min(1.0, decision["conviction"]))
-                for f in ("option_dte_min", "option_dte_max", "option_strike_otm_pct"):
-                    v = decision.get(f)
-                    decision[f] = float(v) if v is not None else None
-                
-                logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']} | direction: {decision['direction']} conviction: {decision['conviction']}")
-                return decision
+                raw_decisions = result.get("decisions", []) if isinstance(result, dict) else []
+                decisions = [self._normalize_decision(d) for d in raw_decisions if isinstance(d, dict)]
+                logger.info(f"Brain generated {len(decisions)} per-ticker decision(s).")
+                for d in decisions:
+                    logger.info(f"  -> {d['action']} {d['quantity']} {d['symbol']} | dir={d['direction']} conv={d['conviction']}")
+                return decisions
             except Exception as e:
                 logger.error(f"Error in OpenRouter LLM decision making: {e}. Falling back to safe rule-based decision.")
                 try:
@@ -149,39 +168,25 @@ class TradingBrain:
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=TradingDecision
+                    response_schema=TradingDecisionSet
                 )
             )
             decision_json = response.text
             
             # Parse response
-            decision = json.loads(decision_json)
-            
-            # Normalize fields
-            decision["action"] = decision.get("action", "HOLD").upper()
-            decision["symbol"] = decision.get("symbol", "").upper()
-            decision["quantity"] = float(decision.get("quantity", 0.0))
-            
-            tp = decision.get("take_profit_price")
-            sl = decision.get("stop_loss_price")
-            decision["take_profit_price"] = float(tp) if tp is not None else None
-            decision["stop_loss_price"] = float(sl) if sl is not None else None
-
-            # Normalize conviction-threshold fields (additive)
-            decision["direction"] = str(decision.get("direction", "neutral")).lower()
-            if decision["direction"] not in ("bullish", "bearish", "neutral"):
-                decision["direction"] = "neutral"
-            try:
-                decision["conviction"] = float(decision.get("conviction", 0.0))
-            except (TypeError, ValueError):
-                decision["conviction"] = 0.0
-            decision["conviction"] = max(0.0, min(1.0, decision["conviction"]))
-            for f in ("option_dte_min", "option_dte_max", "option_strike_otm_pct"):
-                v = decision.get(f)
-                decision[f] = float(v) if v is not None else None
-            
-            logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']} | direction: {decision['direction']} conviction: {decision['conviction']}")
-            return decision
+            result = json.loads(decision_json)
+            # Support both wrapper {"decisions": [...]} and a bare list fallback
+            if isinstance(result, dict):
+                raw_decisions = result.get("decisions", [])
+            elif isinstance(result, list):
+                raw_decisions = result
+            else:
+                raw_decisions = []
+            decisions = [self._normalize_decision(d) for d in raw_decisions if isinstance(d, dict)]
+            logger.info(f"Brain generated {len(decisions)} per-ticker decision(s).")
+            for d in decisions:
+                logger.info(f"  -> {d['action']} {d['quantity']} {d['symbol']} | dir={d['direction']} conv={d['conviction']}")
+            return decisions
             
         except Exception as e:
             logger.error(f"Error in LLM decision making: {e}. Falling back to safe rule-based decision.")
@@ -321,7 +326,7 @@ Ticker: {symbol}
 {crypto_instructions}
 {options_instructions}
 ROLE:
-You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate a single high-conviction trade choice (BUY, SELL, or HOLD) that yields a profitable and stable trading strategy.
+You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate an independent high-conviction trade choice (BUY, SELL, or HOLD) for EVERY ticker in the provided market data. You output a "decisions" array with one decision object per appraised ticker.
 
 DIRECTIONS:
 1. Analyze the technical indicators (RSI, Moving Averages, MACD, Bollinger Bands, and intraday VWAP with standard deviation ±1σ and ±2σ bands) to judge trends, support/resistance, and overbought/oversold levels. Target buying below VWAP and selling above it, flagging standard deviation stretches of >= ±2σ as highly overextended mean-reversion setups.
@@ -339,25 +344,29 @@ DIRECTIONS:
    - If our historical win rate is low (<50%) or max drawdown is high (>15%), you MUST be extremely conservative: scale down trade sizes to 1-3%, avoid buying any asset with high recent failures, and keep a larger cash buffer.
    - Adjust your buy thresholds and exit levels dynamically to avoid repeating past whipsaws and losing patterns.
 7. Be highly decisive but risk-conscious. Do not over-trade. Avoid whipsawing (reversing recent trades without strong technical reasons).
-8. You must trade ONLY one symbol from the provided tickers per step, or choose HOLD/NO_ACTION.
+8. You MUST output a decision object for EVERY ticker provided in the market data (even HOLDs with quantity 0). Do not combine tickers into a single decision.
 9. YOU MUST COMPLY WITH THE MANDATORY TRADING RULE SPECIFIED FOR EACH TICKER. DO NOT FORMULATE A DECISION THAT CONTRADICTS THESE RULES.
-10. STATE YOUR CONVICTION & INSTRUMENT INTENT: Always clearly justify your conviction score in "thought_process" (e.g. "Confluence of support + oversold RSI -> conviction 0.8"). For any symbol in the options universe, explicitly state whether you'd prefer to express the move via shares or via options (leverage), and why. This decisioning narrative is displayed to the operator and must be specific and actionable.
+10. STATE YOUR CONVICTION & INSTRUMENT INTENT: For each ticker, clearly justify its conviction score in "thought_process" (e.g. "Confluence of support + oversold RSI -> conviction 0.8"). For any options-universe symbol, explicitly state whether you'd prefer shares vs options (leverage), and why. This decisioning narrative is displayed to the operator and must be specific and actionable.
 
 OUTPUT FORMAT:
-You must reply with a valid JSON object ONLY. Do not wrap in markdown blocks other than standard JSON mime type.
+You must reply with a valid JSON object ONLY. Do not wrap in markdown blocks other than standard JSON mime type. The output is an object with a "decisions" array (one element per ticker).
 JSON Schema:
 {{
-  "thought_process": "Detailed explanation of technical indicators analyzed, how news and advanced anchors/pivots influenced direction, your confluence reasoning for the chosen dynamic trade size, compliance with the mandatory strategy rule, AND an explicit justification of your conviction score plus (for options-universe symbols) whether you lean toward shares vs options and why.",
-  "action": "BUY" | "SELL" | "HOLD",
-  "symbol": {allowed_symbols_str},
-  "quantity": float (number of shares, use 0 for HOLD),
-  "take_profit_price": float or null (propose a dynamic take-profit target price for BUY actions on equities based on Fibonacci ratios or psychological resistance; null otherwise),
-  "stop_loss_price": float or null (propose a dynamic stop-loss price for BUY actions on equities based on Fibonacci/psychological levels or recent swing lows; null otherwise),
-  "direction": "bullish" or "bearish" or "neutral" (directional view for the symbol),
-  "conviction": float 0.0-1.0 (how strongly you believe in the direction),
-  "option_dte_min": integer or null (optional requested min days-to-expiry for an option),
-  "option_dte_max": integer or null (optional requested max days-to-expiry for an option),
-  "option_strike_otm_pct": float or null (optional requested OTM percent for strike selection)
+  "decisions": [
+    {{
+      "thought_process": "Per-ticker reasoning: indicators, news, anchors, trade sizing, compliance with the mandatory rule, an explicit justification of your conviction score, and (for options-universe symbols) whether you lean toward shares vs options and why.",
+      "action": "BUY" | "SELL" | "HOLD",
+      "symbol": {allowed_symbols_str},
+      "quantity": float (number of shares, use 0 for HOLD),
+      "take_profit_price": float or null,
+      "stop_loss_price": float or null,
+      "direction": "bullish" or "bearish" or "neutral",
+      "conviction": float 0.0-1.0,
+      "option_dte_min": integer or null,
+      "option_dte_max": integer or null,
+      "option_strike_otm_pct": float or null
+    }}
+  ]
 }}
 """
 
@@ -387,11 +396,16 @@ Generate your trade decision JSON:
         """Fallback rule-based trading agent (useful for testing or if LLM config is missing)."""
         logger.info("Running rule-based strategy fallback.")
         
-        # Super simple rule-based strategy:
-        # If QQQ or SPY RSI < 35 -> Buy a few shares (oversold)
-        # If QQQ or SPY RSI > 70 and we own it -> Sell a few shares (overbought)
-        # Else -> HOLD
-        
+        # Simple rule-based strategy:
+        # - RSI < 42 -> BUY a small position (oversold)
+        # - RSI > 62 and owned -> SELL half (overbought)
+        # - otherwise -> HOLD
+        # Emits a LIST of per-ticker decisions (Option B).
+        decisions = []
+        equity = account_state.get("equity", 100000.0)
+        cash_balance = account_state.get("cash", 0.0)
+        min_cash_buffer = equity * config.MIN_CASH_BUFFER_PCT
+
         for data in market_data_list:
             if not data:
                 continue
@@ -399,59 +413,52 @@ Generate your trade decision JSON:
             current_price = data["current_price"]
             ind = data.get("indicators", {})
             rsi = ind.get("rsi_14", 50)
-            
             if rsi is None:
                 rsi = 50
-                
-            # Buy signal (RSI < 42 / Oversold-ish)
+
+            direction = "neutral"
+            conviction = 0.5
+
             if rsi < 42:
-                # Calculate safe mock purchase qty (~5% of equity)
-                equity = account_state.get("equity", 100000.0)
+                # Buy signal
                 qty = max(1.0, int((equity * 0.05) // current_price))
-                
-                # Check cash buffer requirement
-                cash_balance = account_state.get("cash", 0.0)
-                min_cash_buffer = equity * config.MIN_CASH_BUFFER_PCT
                 if cash_balance < min_cash_buffer:
-                    return {
-                        "thought_process": f"[Rule Fallback] Skipped BUY: Cash balance (${cash_balance:,.2f}) below required buffer (${min_cash_buffer:,.2f})",
-                        "action": "HOLD",
-                        "symbol": "",
-                        "quantity": 0.0,
-                        "take_profit_price": None,
-                        "stop_loss_price": None
-                    }
-                
-                tp = round(current_price * 1.05, 2)
-                sl = round(current_price * 0.97, 2)
-                return {
-                    "thought_process": f"[Rule Fallback] {symbol} RSI is oversold ({rsi:.1f}). Buying a small safe position of {qty} shares.",
-                    "action": "BUY",
-                    "symbol": symbol,
-                    "quantity": float(qty),
-                    "take_profit_price": float(tp),
-                    "stop_loss_price": float(sl)
-                }
-            
-            # Sell signal (RSI > 62 / Overbought-ish)
+                    decisions.append({
+                        "thought_process": f"[Rule Fallback] Skipped BUY {symbol}: cash (${cash_balance:,.2f}) below buffer.",
+                        "action": "HOLD", "symbol": symbol, "quantity": 0.0,
+                        "take_profit_price": None, "stop_loss_price": None,
+                        "direction": "neutral", "conviction": 0.4,
+                    })
+                    continue
+                decisions.append({
+                    "thought_process": f"[Rule Fallback] {symbol} RSI is oversold ({rsi:.1f}). Buying {qty} shares.",
+                    "action": "BUY", "symbol": symbol, "quantity": float(qty),
+                    "take_profit_price": float(round(current_price * 1.05, 2)),
+                    "stop_loss_price": float(round(current_price * 0.97, 2)),
+                    "direction": "bullish", "conviction": 0.7,
+                })
             elif rsi > 62 and symbol in positions:
                 owned_qty = positions[symbol]["qty"]
-                qty = max(1.0, int(owned_qty * 0.5))  # sell half the position
-                return {
-                    "thought_process": f"[Rule Fallback] {symbol} RSI is overbought ({rsi:.1f}) and we own {owned_qty} shares. Selling {qty} shares.",
-                    "action": "SELL",
-                    "symbol": symbol,
-                    "quantity": float(qty),
-                    "take_profit_price": None,
-                    "stop_loss_price": None
-                }
+                qty = max(1.0, int(owned_qty * 0.5))  # sell half
+                decisions.append({
+                    "thought_process": f"[Rule Fallback] {symbol} RSI is overbought ({rsi:.1f}); selling {qty} shares.",
+                    "action": "SELL", "symbol": symbol, "quantity": float(qty),
+                    "take_profit_price": None, "stop_loss_price": None,
+                    "direction": "bearish", "conviction": 0.6,
+                })
+            else:
+                decisions.append({
+                    "thought_process": f"[Rule Fallback] {symbol} has no clear signal (RSI {rsi:.1f}). Holding.",
+                    "action": "HOLD", "symbol": symbol, "quantity": 0.0,
+                    "take_profit_price": None, "stop_loss_price": None,
+                    "direction": direction, "conviction": conviction,
+                })
 
-        # Default action
-        return {
-            "thought_process": "[Rule Fallback] No clear oversold or overbought conditions detected. Holding current positions.",
-            "action": "HOLD",
-            "symbol": "",
-            "quantity": 0.0,
-            "take_profit_price": None,
-            "stop_loss_price": None
-        }
+        if not decisions:
+            decisions.append({
+                "thought_process": "[Rule Fallback] No appraised tickers. Holding.",
+                "action": "HOLD", "symbol": "", "quantity": 0.0,
+                "take_profit_price": None, "stop_loss_price": None,
+                "direction": "neutral", "conviction": 0.5,
+            })
+        return decisions
