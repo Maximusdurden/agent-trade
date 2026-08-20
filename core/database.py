@@ -34,7 +34,10 @@ def init_db():
                 proposed_symbol TEXT,    -- Symbol to trade
                 proposed_qty REAL,       -- Quantity to trade
                 is_approved INTEGER,     -- 1 if passed guardrails, 0 if rejected
-                rejection_reason TEXT    -- Why did it fail guardrails, if any
+                rejection_reason TEXT,   -- Why did it fail guardrails, if any
+                direction TEXT,          -- bullish | bearish | neutral (conviction model)
+                conviction REAL,         -- 0.0-1.0 conviction score
+                instrument TEXT          -- stock | crypto | option (resolved by guardrails)
             )
         """)
         
@@ -50,6 +53,10 @@ def init_db():
                 qty REAL NOT NULL,
                 filled_avg_price REAL,
                 status TEXT NOT NULL,     -- filled, failed, open, canceled
+                option_type TEXT,         -- call | put (options only)
+                option_dte INTEGER,       -- days-to-expiry (options only)
+                strike REAL,              -- strike price (options only)
+                contract_symbol TEXT,     -- underlying root (options only)
                 FOREIGN KEY (decision_id) REFERENCES decisions(id)
             )
         """)
@@ -115,20 +122,37 @@ def init_db():
                 value TEXT NOT NULL
             )
         """)
-        
+
+        # --- Migrations for pre-existing databases ---
+        def add_column_if_missing(table: str, column: str, decl: str) -> None:
+            cols = [r[1] for r in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
+            if column not in cols:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+        add_column_if_missing("decisions", "direction", "TEXT")
+        add_column_if_missing("decisions", "conviction", "REAL")
+        add_column_if_missing("decisions", "instrument", "TEXT")
+        add_column_if_missing("trades", "option_type", "TEXT")
+        add_column_if_missing("trades", "option_dte", "INTEGER")
+        add_column_if_missing("trades", "strike", "REAL")
+        add_column_if_missing("trades", "contract_symbol", "TEXT")
+
         conn.commit()
 
 def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process: str,
                  proposed_action: str, proposed_symbol: str, proposed_qty: float,
-                 is_approved: bool, rejection_reason: str | None = None) -> int:
+                 is_approved: bool, rejection_reason: str | None = None,
+                 direction: str | None = None, conviction: float | None = None,
+                 instrument: str | None = None) -> int:
     """Logs the LLM decision to the SQLite database and returns the decision ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO decisions (
                 timestamp, ticker_indicators, portfolio_state, thought_process,
-                proposed_action, proposed_symbol, proposed_qty, is_approved, rejection_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                proposed_action, proposed_symbol, proposed_qty, is_approved, rejection_reason,
+                direction, conviction, instrument
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             json.dumps(ticker_indicators),
@@ -138,20 +162,26 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             proposed_symbol.upper() if proposed_symbol else None,
             proposed_qty,
             1 if is_approved else 0,
-            rejection_reason
+            rejection_reason,
+            direction,
+            conviction,
+            instrument
         ))
         conn.commit()
         return get_last_insert_id(cursor)
 
 def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
-              side: str, qty: float, filled_avg_price: float | None, status: str) -> int:
+              side: str, qty: float, filled_avg_price: float | None, status: str,
+              option_type: str | None = None, option_dte: int | None = None,
+              strike: float | None = None, contract_symbol: str | None = None) -> int:
     """Logs an executed trade to the SQLite database."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO trades (
-                decision_id, alpaca_order_id, timestamp, symbol, side, qty, filled_avg_price, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                decision_id, alpaca_order_id, timestamp, symbol, side, qty, filled_avg_price, status,
+                option_type, option_dte, strike, contract_symbol
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             decision_id,
             alpaca_order_id,
@@ -160,7 +190,11 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
             side.lower(),
             qty,
             filled_avg_price,
-            status
+            status,
+            option_type,
+            option_dte,
+            strike,
+            contract_symbol
         ))
         conn.commit()
         return get_last_insert_id(cursor)

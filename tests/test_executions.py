@@ -2,6 +2,9 @@
 import sys
 import os
 
+# Use a SEPARATE test database so tests never pollute the live trading DB.
+os.environ["DATABASE_FILENAME"] = "test_trading_agent.db"
+
 sys.path.insert(0, r"Z:\python\projects")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 

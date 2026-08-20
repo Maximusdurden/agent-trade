@@ -39,6 +39,7 @@ env/
 
 # Local Database & Logs
 trading_agent.db
+test_trading_agent.db
 trading.log
 *.log
 

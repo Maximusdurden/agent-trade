@@ -224,6 +224,19 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         logger.error(f"Critical error fetching account state: {e}. Aborting cycle.")
         return "ACCOUNT_STATE_FAILED", asset_scope, str(e)
 
+    # 1b. Options auto-close sweep (deterministic safety net for expiry)
+    if getattr(config, "OPTIONS_ENABLED", False):
+        try:
+            from core.option_lifecycle import OptionLifecycle
+            lifecycle = OptionLifecycle(alpaca_client)
+            closed_options = lifecycle.sweep()
+            if closed_options:
+                logger.info(f"Option auto-close sweep closed {len(closed_options)} position(s).")
+                for c in closed_options:
+                    logger.info(f"  - Auto-close: {c.get('summary', c)}")
+        except Exception as ec:
+            logger.warning(f"Options auto-close sweep failed: {ec}")
+
     # 2. Fetch current active positions
     try:
         positions = alpaca_client.get_positions()
@@ -389,7 +402,10 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
             proposed_symbol=symbol,
             proposed_qty=qty,
             is_approved=is_approved,
-            rejection_reason=status_msg if not is_approved else None
+            rejection_reason=status_msg if not is_approved else None,
+            direction=adjusted_decision.get("direction"),
+            conviction=adjusted_decision.get("conviction"),
+            instrument=adjusted_decision.get("instrument"),
         )
         logger.info(f"Decision logged successfully. DB ID: {decision_id}")
     except Exception as e:
@@ -402,6 +418,37 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         stop_loss_price = adjusted_decision.get("stop_loss_price")
         
         is_crypto = is_crypto_symbol(symbol)
+
+        # 8a. OPTIONS PATH: route to the option executor when instrument resolves
+        # to an option (BUY-to-open of a new position or SELL-to-close of an
+        # existing OCC contract). Guardrails set "instrument" = "option".
+        instrument = adjusted_decision.get("instrument")
+        from core.guardrails import is_occ_symbol as _occ_hint
+        is_option = instrument == "option" or _occ_hint(symbol)
+        if is_option:
+            logger.info(f"Routing {action} decision for {symbol} through the OPTION executor.")
+            try:
+                from core.option_executor import OptionExecutor
+                option_executor = OptionExecutor(alpaca_client)
+                option_result = option_executor.execute(adjusted_decision, account_state)
+                logger.info(f"Option order result: {option_result}")
+                order_result = option_result.get("order_info", option_result)
+                # Log the option execution
+                try:
+                    database.log_execution(
+                        decision_id=decision_id, attempt=1, symbol=option_result.get("symbol", symbol),
+                        side=action.lower(), qty=option_result.get("contracts", qty),
+                        order_type="option",
+                        status=str(option_result.get("status", "submitted")),
+                        error=None if option_result.get("status") != "failed" else option_result.get("summary"),
+                        alpaca_order_id=option_result.get("order_info", {}).get("id") or option_result.get("order_info", {}).get("id"),
+                    )
+                except Exception as log_ex:
+                    logger.error(f"Failed to log option execution: {log_ex}")
+                return "COMPLETED", asset_scope, f"Option {action} of {qty} contracts for {symbol} processed."
+            except Exception as e:
+                logger.error(f"Option execution failed for {symbol}: {e}")
+                return "FAILED", "option", f"Option execution failed for {symbol}: {e}"
 
         if not actual_market_open and not is_crypto:
             logger.error(f"Blocking {action} for equity {symbol}: the US equity market is closed.")

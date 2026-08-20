@@ -18,6 +18,15 @@ if GENAI_AVAILABLE:
         quantity: float = Field(description="The quantity of shares or coins to trade (use 0 for HOLD).")
         take_profit_price: float | None = Field(default=None, description="Propose a dynamic take-profit target price for BUY actions on equities/non-crypto assets based on Fibonacci or psychological levels; null otherwise.")
         stop_loss_price: float | None = Field(default=None, description="Propose a dynamic stop-loss price for BUY actions on equities/non-crypto assets based on Fibonacci or psychological levels; null otherwise.")
+        # --- Conviction-threshold model (options-aware) ---
+        # The agent expresses a directional view + conviction score. It does NOT
+        # choose the instrument (stock vs option) directly — a deterministic rule
+        # maps conviction -> instrument. This prevents stock<->option whipsaw.
+        direction: str = Field(default="neutral", description="Directional view for the symbol: 'bullish', 'bearish', or 'neutral'. This expresses market view, not an instrument choice.")
+        conviction: float = Field(default=0.0, description="Conviction score 0.0-1.0 indicating how strongly you believe in the direction. High conviction (>= config threshold) may be expressed via options for leverage; lower conviction via shares.")
+        option_dte_min: int | None = Field(default=None, description="Optional requested minimum days-to-expiry for an option (overrides the default window within hard safety bounds). Null to use the configured default.")
+        option_dte_max: int | None = Field(default=None, description="Optional requested maximum days-to-expiry for an option (overrides the default window within hard safety bounds). Null to use the configured default.")
+        option_strike_otm_pct: float | None = Field(default=None, description="Optional requested OTM% for strike selection (e.g. 0.05 = 5% out-of-the-money). Null to use the configured default.")
 
 from core import config
 from core import database
@@ -102,8 +111,21 @@ class TradingBrain:
                 sl = decision.get("stop_loss_price")
                 decision["take_profit_price"] = float(tp) if tp is not None else None
                 decision["stop_loss_price"] = float(sl) if sl is not None else None
+
+                # Normalize conviction-threshold fields (additive)
+                decision["direction"] = str(decision.get("direction", "neutral")).lower()
+                if decision["direction"] not in ("bullish", "bearish", "neutral"):
+                    decision["direction"] = "neutral"
+                try:
+                    decision["conviction"] = float(decision.get("conviction", 0.0))
+                except (TypeError, ValueError):
+                    decision["conviction"] = 0.0
+                decision["conviction"] = max(0.0, min(1.0, decision["conviction"]))
+                for f in ("option_dte_min", "option_dte_max", "option_strike_otm_pct"):
+                    v = decision.get(f)
+                    decision[f] = float(v) if v is not None else None
                 
-                logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']}")
+                logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']} | direction: {decision['direction']} conviction: {decision['conviction']}")
                 return decision
             except Exception as e:
                 logger.error(f"Error in OpenRouter LLM decision making: {e}. Falling back to safe rule-based decision.")
@@ -144,8 +166,21 @@ class TradingBrain:
             sl = decision.get("stop_loss_price")
             decision["take_profit_price"] = float(tp) if tp is not None else None
             decision["stop_loss_price"] = float(sl) if sl is not None else None
+
+            # Normalize conviction-threshold fields (additive)
+            decision["direction"] = str(decision.get("direction", "neutral")).lower()
+            if decision["direction"] not in ("bullish", "bearish", "neutral"):
+                decision["direction"] = "neutral"
+            try:
+                decision["conviction"] = float(decision.get("conviction", 0.0))
+            except (TypeError, ValueError):
+                decision["conviction"] = 0.0
+            decision["conviction"] = max(0.0, min(1.0, decision["conviction"]))
+            for f in ("option_dte_min", "option_dte_max", "option_strike_otm_pct"):
+                v = decision.get(f)
+                decision[f] = float(v) if v is not None else None
             
-            logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']}")
+            logger.info(f"Brain generated decision: {decision['action']} {decision['quantity']} {decision['symbol']} | TP: {decision['take_profit_price']} | SL: {decision['stop_loss_price']} | direction: {decision['direction']} conviction: {decision['conviction']}")
             return decision
             
         except Exception as e:
@@ -256,6 +291,20 @@ Ticker: {symbol}
             if data and data.get("symbol")
         ))
         allowed_symbols_str = " | ".join([f'"{sym}"' for sym in active_symbols]) + ' | ""'
+
+        # Options guidance block (only relevant when options trading is enabled)
+        options_instructions = ""
+        if getattr(config, "OPTIONS_ENABLED", False):
+            universe_str = " | ".join(f'"{s}"' for s in getattr(config, "OPTIONS_UNIVERSE", []))
+            options_instructions = f"""
+        OPTIONS-ENABLED RULES (LONG CALLS & PUTS ONLY):
+        1. You express a DIRECTIONAL VIEW + CONVICTION score. You do NOT choose the instrument.
+        2. Output "direction": "bullish"/"bearish"/"neutral" and "conviction": 0.0-1.0.
+        3. High conviction (>= {config.OPTIONS_CONVICTION_THRESHOLD}) on a symbol in the options universe may be expressed via options (leverage). Lower conviction uses shares.
+        4. If conviction is high and the symbol is in the options universe, you may optionally request a specific DTE range via "option_dte_min" / "option_dte_max" (default {config.OPTIONS_DTE_MIN}-{config.OPTIONS_DTE_MAX} days) and OTM% via "option_strike_otm_pct".
+        5. OPTIONS UNIVERSE: {universe_str}. Only symbols in this set are eligible for options.
+        6. For a SELL of an existing option position, set direction opposite your view and keep conviction high; the executor sells the held contracts (never go short).
+        """
         
         # Add crypto-specific instructions to the system prompt
         crypto_instructions = """
@@ -269,6 +318,7 @@ Ticker: {symbol}
         
         system_instruction = f"""
 {crypto_instructions}
+{options_instructions}
 ROLE:
 You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate a single high-conviction trade choice (BUY, SELL, or HOLD) that yields a profitable and stable trading strategy.
 
@@ -300,7 +350,12 @@ JSON Schema:
   "symbol": {allowed_symbols_str},
   "quantity": float (number of shares, use 0 for HOLD),
   "take_profit_price": float or null (propose a dynamic take-profit target price for BUY actions on equities based on Fibonacci ratios or psychological resistance; null otherwise),
-  "stop_loss_price": float or null (propose a dynamic stop-loss price for BUY actions on equities based on Fibonacci/psychological levels or recent swing lows; null otherwise)
+  "stop_loss_price": float or null (propose a dynamic stop-loss price for BUY actions on equities based on Fibonacci/psychological levels or recent swing lows; null otherwise),
+  "direction": "bullish" or "bearish" or "neutral" (directional view for the symbol),
+  "conviction": float 0.0-1.0 (how strongly you believe in the direction),
+  "option_dte_min": integer or null (optional requested min days-to-expiry for an option),
+  "option_dte_max": integer or null (optional requested max days-to-expiry for an option),
+  "option_strike_otm_pct": float or null (optional requested OTM percent for strike selection)
 }}
 """
 

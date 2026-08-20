@@ -261,3 +261,55 @@ class DataProvider:
         }
         
         return result
+
+
+def get_earnings_dates(tickers=None, days_ahead=7) -> pd.DataFrame:
+    """Fetches upcoming earnings dates for tickers within ``days_ahead`` days.
+
+    Lightweight wrapper around yfinance (optional dependency). Returns an empty
+    DataFrame if yfinance is unavailable or no earnings are found, so callers
+    can fail-open safely (used by the options earnings/IV filter).
+    """
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "earnings_date"])
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance not installed. Earnings filter disabled (fail-open).")
+        return pd.DataFrame(columns=["ticker", "earnings_date"])
+    except Exception as e:
+        logger.warning(f"Failed to import yfinance for earnings check: {e}")
+        return pd.DataFrame(columns=["ticker", "earnings_date"])
+
+    results = []
+    from datetime import datetime, timedelta, date as _date
+    now = datetime.now()
+    horizon = now + timedelta(days=days_ahead)
+    for ticker in (tickers if isinstance(tickers, (list, tuple)) else [tickers]):
+        try:
+            stock = yf.Ticker(ticker)
+            cal = stock.calendar
+            if cal is None:
+                continue
+            earnings = cal.get("Earnings Date")
+            if earnings is None:
+                continue
+            # yfinance 0.2.x returns a pandas Index or list of dates
+            dates = list(earnings) if getattr(earnings, "__iter__", None) else [earnings]
+            for d in dates:
+                if d is None:
+                    continue
+                if isinstance(d, pd.Timestamp):
+                    d = d.to_pydatetime()
+                elif not isinstance(d, datetime):
+                    # 'YYYY-MM-DD' string or python date
+                    try:
+                        d = datetime.combine(_date.fromisoformat(str(d)[:10]), datetime.min.time())
+                    except ValueError:
+                        continue
+                # Compare on date only (ignore intraday tz complexity)
+                if now.date() <= d.date() <= horizon.date():
+                    results.append({"ticker": str(ticker).upper(), "earnings_date": d.date()})
+        except Exception as e:
+            logger.warning(f"Could not fetch earnings for {ticker}: {e}")
+    return pd.DataFrame(results)

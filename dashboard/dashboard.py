@@ -2732,12 +2732,14 @@ HTML_CONTENT = """<!DOCTYPE html>
                             const avgEntry = pos.avg_entry_price !== undefined ? pos.avg_entry_price : 0.0;
                             const marketVal = pos.market_value !== undefined ? pos.market_value : 0.0;
                             const qty = pos.qty !== undefined ? pos.qty : 0;
+                            const isOption = !!(pos.is_option);
+                            const unitLabel = isOption ? 'contract(s)' : 'shares';
                             
                             posListEl.innerHTML += `
                                 <div class="position-row">
                                     <div class="position-symbol-side">
                                         <span class="pos-sym">${sym}</span>
-                                        <span class="pos-qty">${qty} shares @ $${avgEntry.toFixed(2)}</span>
+                                        <span class="pos-qty">${qty} ${unitLabel} @ $${avgEntry.toFixed(2)}</span>
                                     </div>
                                     <div class="position-value-pnl">
                                         <span class="pos-val">$${marketVal.toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
@@ -4282,7 +4284,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 if not positions:
                     positions_summary = "No open positions."
                 for sym, pos in positions.items():
-                    positions_summary += f"- {sym}: {pos['qty']} shares @ ${pos['avg_entry_price']} (Current Val: ${pos['market_value']}, PnL: ${pos['unrealized_pnl']})\n"
+                    unit = "contract(s)" if pos.get("is_option") else "shares"
+                    positions_summary += f"- {sym}: {pos['qty']} {unit} @ ${pos['avg_entry_price']} (Current Val: ${pos['market_value']}, PnL: ${pos['unrealized_pnl']})\n"
                 
                 dec_summary = ""
                 if not decisions:

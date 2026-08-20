@@ -14,6 +14,33 @@ MIN_SELL_VALUE = float(os.getenv("MIN_SELL_VALUE", "50.0"))  # Min $ value of a 
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 
+# Options Trading Configuration
+# Kill-switch: when False, the brain never outputs option decisions and guardrails reject them.
+OPTIONS_ENABLED = os.getenv("OPTIONS_ENABLED", "false").lower() == "true"
+# Curated liquid options universe (long calls/puts only). Subset of the most actively-traded options.
+OPTIONS_UNIVERSE = [
+    "NVDA", "TSLA", "AAPL", "SPY", "QQQ",
+    "AMZN", "MSFT", "META", "GOOGL", "AMD",
+]
+# Default DTE (days-to-expiry) window for option selection.
+OPTIONS_DTE_MIN = int(os.getenv("OPTIONS_DTE_MIN", "30"))
+OPTIONS_DTE_MAX = int(os.getenv("OPTIONS_DTE_MAX", "45"))
+# Hard safety bounds on DTE. The agent may override within these bounds only.
+OPTIONS_DTE_HARD_MIN = int(os.getenv("OPTIONS_DTE_HARD_MIN", "14"))
+OPTIONS_DTE_HARD_MAX = int(os.getenv("OPTIONS_DTE_HARD_MAX", "90"))
+# Max % of equity allocated to a single option position (cost = ask * 100 * contracts).
+OPTIONS_MAX_ALLOCATION_PCT = float(os.getenv("OPTIONS_MAX_ALLOCATION_PCT", "0.05"))
+# Max number of option contracts per ticker.
+OPTIONS_MAX_CONTRACTS_PER_TICKER = int(os.getenv("OPTIONS_MAX_CONTRACTS_PER_TICKER", "5"))
+# Conviction threshold (0.0-1.0): conviction >= threshold routes to the option path (leverage).
+# Below threshold routes to the stock path. Deterministic mapping prevents stock<->option whipsaw.
+OPTIONS_CONVICTION_THRESHOLD = float(os.getenv("OPTIONS_CONVICTION_THRESHOLD", "0.7"))
+# Auto-close: close option positions when DTE <= this value to avoid exercise/assignment.
+OPTIONS_AUTO_CLOSE_DTE = int(os.getenv("OPTIONS_AUTO_CLOSE_DTE", "3"))
+# OTM% window for strike selection (1% - 10% out-of-the-money).
+OPTIONS_OTM_PERCENT_MIN = float(os.getenv("OPTIONS_OTM_PERCENT_MIN", "0.01"))
+OPTIONS_OTM_PERCENT_MAX = float(os.getenv("OPTIONS_OTM_PERCENT_MAX", "0.10"))
+
 # Trading Universe
 TRADING_UNIVERSE = [
     "SPY", "QQQ", "DIA", "IWM",  # ETFs

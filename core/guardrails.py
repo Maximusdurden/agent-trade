@@ -1,8 +1,19 @@
 import logging
+import re
+from datetime import datetime, timedelta
 from core import config
-from datetime import datetime
 
 logger = logging.getLogger("Guardrails")
+
+# OCC option symbol detection: 6-char root (padded), 6-digit date, C/P, 8-digit strike
+OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$", re.IGNORECASE)
+
+
+def is_occ_symbol(symbol: str) -> bool:
+    """Return True if a symbol is an OCC option contract."""
+    clean = (symbol or "").upper().replace(" ", "")
+    return bool(OCC_SYMBOL_RE.match(clean)) and not clean.endswith("USD")
+
 
 class RiskGuardrails:
     """Deterministic security/risk layer between LLM decisions and execution."""
@@ -72,6 +83,41 @@ class RiskGuardrails:
         # 2. Check Action validity
         if action not in ("BUY", "SELL"):
             return False, f"Rejected: Unknown action '{action}'. Only BUY, SELL, or HOLD are permitted.", adjusted_decision
+
+        # 2b. Resolve instrument (stock vs option) via the conviction-threshold rule.
+        # The agent expresses a directional view + conviction. A deterministic rule
+        # decides whether this decision is expressed via options (leverage) or shares.
+        # This prevents stock<->option whipsaw on the same underlying.
+        # NOTE: This guardrail only routes NEW option BUYs. Existing option positions
+        # (SELL) are detected separately below by their OCC symbol.
+        instrument = None
+        if is_occ_symbol(symbol):
+            instrument = "option"  # closing an existing option position
+        elif action == "BUY":
+            conviction = float(decision.get("conviction", 0.0) or 0.0)
+            options_on = getattr(config, "OPTIONS_ENABLED", False)
+            in_universe = symbol.upper() in set(getattr(config, "OPTIONS_UNIVERSE", []))
+            threshold = float(getattr(config, "OPTIONS_CONVICTION_THRESHOLD", 0.7))
+            # Direction must support a leveraged long (bullish -> call). For a buy,
+            # options leverage only applies to bullish calls (we only do long calls/puts).
+            direction = str(decision.get("direction", "neutral")).lower()
+            if options_on and in_universe and conviction >= threshold and direction in ("bullish", "bearish"):
+                instrument = "option"
+                adjusted_decision["instrument"] = "option"
+            else:
+                adjusted_decision["instrument"] = "stock"
+        else:
+            adjusted_decision["instrument"] = "stock"
+
+        # 2c. Options-specific validation (BUY-to-open of a new option position,
+        # or SELL-to-close of an existing OCC option position).
+        if instrument == "option":
+            ok, msg, adjusted = self._validate_option_decision(
+                decision, adjusted_decision, account_state, current_positions
+            )
+            if not ok:
+                return False, msg, adjusted
+            return True, msg, adjusted
 
         # 3. Check Universe Restrictions
         # Allow trading if symbol is in config.TRADING_UNIVERSE, in the latest
@@ -275,4 +321,129 @@ class RiskGuardrails:
             return True, f"Approved: Buy order of {proposed_qty} shares of {symbol} validated.", adjusted_decision
 
         return False, "Rejected: Fell through all guardrail options.", adjusted_decision
+
+    # ------------------------------------------------------------------
+    # OPTIONS VALIDATION
+    # ------------------------------------------------------------------
+
+    def _validate_option_decision(self, decision: dict, adjusted_decision: dict,
+                                  account_state: dict, current_positions: dict) -> tuple[bool, str, dict]:
+        """Validates an option decision (BUY-to-open or SELL-to-close).
+
+        Enforces: kill-switch, market hours, options universe, options buying
+        power, per-ticker contract limits, DTE hard bounds, and the
+        earnings/IV filter (no earnings inside the DTE window).
+        """
+        from core import database
+        action = adjusted_decision.get("action", "HOLD").upper()
+        symbol = adjusted_decision.get("symbol", "").upper()
+        proposed_qty = float(adjusted_decision.get("quantity", 0.0))
+
+        # Kill-switch
+        if not getattr(config, "OPTIONS_ENABLED", False):
+            return False, "Rejected: Options trading is disabled (OPTIONS_ENABLED=false).", adjusted_decision
+
+        cleared_o = symbol.replace(" ", "")
+        # Determine underlying root + eligibility
+        is_occ = is_occ_symbol(symbol)
+        if is_occ:
+            # SELL-to-close of an existing position: allow the underlying regardless
+            underlying = re.match(r"^[A-Z]+", cleared).group(0).strip() or symbol
+            # Verify we actually hold this contract
+            held = current_positions.get(symbol) or current_positions.get(cleared)
+            if not held or float(held.get("qty", 0)) <= 0:
+                return False, f"Rejected: Attempted to SELL-to-close {symbol} but no position is held.", adjusted_decision
+            # Cap sell qty at held qty (never go short)
+            held_qty = float(held.get("qty", 0))
+            if proposed_qty > held_qty:
+                logger.warning(f"Option SELL qty {proposed_qty} capped to held {held_qty} for {symbol}.")
+                adjusted_decision["quantity"] = held_qty
+                proposed_qty = held_qty
+        else:
+            underlying = symbol.upper()
+            # Market hours (options are equity-hours only)
+            is_open, msg = self.is_market_open_check()
+            if not is_open:
+                return False, f"Rejected: {msg} Options trading restricted outside regular market hours.", adjusted_decision
+            # Options universe membership
+            if underlying not in set(getattr(config, "OPTIONS_UNIVERSE", [])):
+                return False, f"Rejected: Symbol '{underlying}' is not in the options universe.", adjusted_decision
+            # DTE hard bounds (agent override must stay within config bounds)
+            dte_min = int(adjusted_decision.get("option_dte_min") or getattr(config, "OPTIONS_DTE_MIN", 30))
+            dte_max = int(adjusted_decision.get("option_dte_max") or getattr(config, "OPTIONS_DTE_MAX", 45))
+            hard_min = getattr(config, "OPTIONS_DTE_HARD_MIN", 14)
+            hard_max = getattr(config, "OPTIONS_DTE_HARD_MAX", 90)
+            if dte_min < hard_min:
+                dte_min = hard_min
+            if dte_max > hard_max:
+                dte_max = hard_max
+            if dte_min > dte_max:
+                dte_min, dte_max = dte_max, dte_min
+            adjusted_decision["option_dte_min"] = dte_min
+            adjusted_decision["option_dte_max"] = dte_max
+            # OTM% bounds
+            otm = adjusted_decision.get("option_strike_otm_pct")
+            if otm is not None:
+                otm = max(0.0, min(0.30, float(otm)))
+                adjusted_decision["option_strike_otm_pct"] = otm
+            # Earnings/IV filter: reject if underlying reports earnings inside DTE window
+            cleared_underlying = underlying
+            earnings_msg = self._has_earnings_before_expiry(cleared_underlying, dte_max)
+            if earnings_msg:
+                return False, f"Rejected: {earnings_msg}", adjusted_decision
+
+        # Buying power sizing (only for BUY-to-open; SELL just closes, no new capital)
+        if action == "BUY":
+            equity = float(account_state.get("equity", 0.0))
+            max_cost = equity * float(getattr(config, "OPTIONS_MAX_ALLOCATION_PCT", 0.05))
+            # Estimate premium per contract ~ 1-2% OTM; we use a placeholder until the
+            # executor resolves the actual contract. The executor will enforce the real
+            # cost. Here we cap proposed contracts by a config max and rough budget.
+            max_contracts = getattr(config, "OPTIONS_MAX_CONTRACTS_PER_TICKER", 5)
+            if proposed_qty > max_contracts:
+                logger.warning(f"Option buy qty {proposed_qty} capped to max contracts {max_contracts} per ticker.")
+                adjusted_decision["quantity"] = max_contracts
+                proposed_qty = max_contracts
+            # Options buying power check (upper bound)
+            obp = float(self._get_options_buying_power())
+            # Reserve at least ~equity*2% per contract as a sanity bound; the executor
+            # does the exact ask*100*contracts check. Skip hard rejection here.
+            if obp <= 0:
+                return False, "Rejected: No options buying power available.", adjusted_decision
+
+        adjusted_decision["instrument"] = "option"
+        return True, f"Approved: Option {'BUY-to-open' if action == 'BUY' else 'SELL-to-close'} via instrument rule.", adjusted_decision
+
+    def get_options_buying_power(self) -> float:
+        """Returns account options buying power (separate from equity buying power)."""
+        return self._get_options_buying_power()
+
+    def _get_options_buying_power(self) -> float:
+        """Reads options buying power from the active Alpaca client (via a small cache)."""
+        try:
+            from core import alpaca_client as ac
+            # get singleton client if it exists
+            inst = getattr(ac, "_client_instance", None)
+            if inst is None:
+                return 0.0
+            return inst.get_options_buying_power()
+        except Exception as e:
+            logger.error(f"Error fetching options buying power in guardrails: {e}")
+            return 0.0
+
+    def _has_earnings_before_expiry(self, underlying: str, dte_max: int) -> str:
+        """Returns an error string if the underlying reports earnings within dte_max days; '' if clear."""
+        try:
+            from core import data_provider as dp
+            earn = getattr(dp, "get_earnings_dates", None)
+            if earn is None:
+                return ""
+            df = earn([underlying.upper()], days_ahead=dte_max)
+            if df is not None and not df.empty:
+                return (f"{underlying} has an earnings date within the {dte_max}-day "
+                        f"option window; options rejected to avoid IV crush.")
+            return ""
+        except Exception as e:
+            logger.warning(f"Earnings check failed for {underlying}: {e}. Allowing (fail-open).")
+            return ""
 

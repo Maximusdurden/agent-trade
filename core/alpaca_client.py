@@ -6,10 +6,10 @@ import pandas as pd
 # Try importing alpaca-py clients. If not installed or fails, we provide a warning.
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
+    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest, LimitOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-    from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
+    from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient, OptionHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest, OptionChainRequest, OptionLatestQuoteRequest
     from alpaca.data.timeframe import TimeFrame
     try:
         from alpaca.data.enums import DataFeed
@@ -32,10 +32,24 @@ from core import config
 
 logger = logging.getLogger("AlpacaClient")
 
+# Module-level singleton so guardrails/executors can read options buying power
+# without re-instantiating the client.
+_client_instance = None
+
+
+def get_client_instance() -> "AlpacaClient":
+    """Returns the shared AlpacaClient singleton (creates it if needed)."""
+    global _client_instance
+    if _client_instance is None:
+        _client_instance = AlpacaClient()
+    return _client_instance
+
+
 class AlpacaClient:
     """Wrapper class for interfacing with the Alpaca API."""
     
     def __init__(self):
+        global _client_instance
         self.api_key = config.ALPACA_API_KEY
         self.secret_key = config.ALPACA_SECRET_KEY
         self.paper = config.ALPACA_PAPER
@@ -63,6 +77,15 @@ class AlpacaClient:
                     api_key=self.api_key,
                     secret_key=self.secret_key
                 )
+                try:
+                    self.option_data_client = OptionHistoricalDataClient(
+                        api_key=self.api_key,
+                        secret_key=self.secret_key
+                    )
+                    logger.info("Alpaca OptionHistoricalDataClient initialized.")
+                except Exception as opt_err:
+                    logger.warning(f"Failed to initialize OptionHistoricalDataClient: {opt_err}. Options data unavailable.")
+                    self.option_data_client = None
                 if NEWS_AVAILABLE:
                     self.news_client = NewsClient(
                         api_key=self.api_key,
@@ -82,6 +105,7 @@ class AlpacaClient:
             self.mock_positions = {}  # symbol -> qty
             self.mock_equity = 100000.0
             logger.info("Initializing Mock Alpaca Trading Client (cash: $100,000).")
+        _client_instance = self
 
     def get_account_state(self) -> dict:
         """Retrieves portfolio state including cash, total equity, and buying power."""
@@ -157,6 +181,18 @@ class AlpacaClient:
             for pos in positions:
                 symbol = get_str(pos, "symbol").upper()
                 if not symbol:
+                    continue
+
+                # If it's an option contract (OCC symbol), keep as-is under option handling
+                if self.is_option_symbol(symbol):
+                    positions_dict[symbol] = {
+                        "qty": get_float(pos, "qty", 0.0),
+                        "qty_available": get_float(pos, "qty_available", None) or get_float(pos, "qty", 0.0),
+                        "market_value": get_float(pos, "market_value", 0.0),
+                        "avg_entry_price": get_float(pos, "avg_entry_price", 0.0),
+                        "unrealized_pnl": get_float(pos, "unrealized_pl", 0.0),
+                        "is_option": True,
+                    }
                     continue
 
                 # Map Alpaca's slashless crypto symbol (e.g. "SOLUSD") back to standard universe representation (e.g. "SOL/USD")
@@ -565,11 +601,17 @@ class AlpacaClient:
         """Fetches the real-time latest trade price for a symbol with standard closes as fallbacks."""
         symbol = symbol.upper()
         if self.is_mock:
-            return 140.0 if "SOL" in symbol else 400.0
+            return 140.0 if "SOL" in symbol else (2.50 if self.is_option_symbol(symbol) else 400.0)
             
         is_crypto = "/" in symbol or "USD" in symbol or "SOL" in symbol
         try:
-            if is_crypto:
+            if self.is_option_symbol(symbol):
+                from alpaca.data.requests import OptionLatestQuoteRequest
+                req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+                res = self.option_data_client.get_option_latest_quote(req)
+                quote = res.get(symbol)
+                return float(getattr(quote, "midpoint", None) or getattr(quote, "last", None) or 0.0)
+            elif is_crypto:
                 from alpaca.data.requests import CryptoLatestTradeRequest
                 req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
                 res = self.crypto_data_client.get_crypto_latest_trade(req)
@@ -588,6 +630,216 @@ class AlpacaClient:
             except Exception as bar_err:
                 logger.error(f"Fallback to historical bars failed for {symbol}: {bar_err}")
             raise ValueError(f"Could not resolve real-time or historical price for {symbol}: {e}")
+
+    # ------------------------------------------------------------------
+    # OPTIONS TRADING SUPPORT
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_option_symbol(symbol: str) -> bool:
+        """Detect whether a symbol is an OCC option contract (has digits, not crypto)."""
+        clean = (symbol or "").upper().replace("/", "")
+        has_digits = any(c.isdigit() for c in clean)
+        is_crypto = "/" in symbol or clean.endswith("USD")
+        return has_digits and not is_crypto
+
+    def get_option_chain_snapshot(self, underlying_symbol: str, expiration_date_gte=None,
+                                  expiration_date_lte=None, strike_price_gte=None,
+                                  strike_price_lte=None, contract_type=None):
+        """Fetches an option chain snapshot for an underlying symbol.
+
+        Args:
+            underlying_symbol: The underlying ticker (e.g. 'NVDA').
+            expiration_date_gte/lte: YYYY-MM-DD expiry window.
+            strike_price_gte/lte: Strike price window.
+            contract_type: 'call' or 'put'.
+        Returns:
+            dict of OCC symbol -> snapshot, or {} if unavailable/mock.
+        """
+        if self.is_mock or self.option_data_client is None:
+            logger.info(f"[MOCK] Option chain snapshot requested for {underlying_symbol} (type={contract_type}).")
+            return {}
+        try:
+            request = OptionChainRequest(
+                underlying_symbol=underlying_symbol.upper(),
+                expiration_date_gte=expiration_date_gte,
+                expiration_date_lte=expiration_date_lte,
+                strike_price_gte=strike_price_gte,
+                strike_price_lte=strike_price_lte,
+                type=contract_type
+            )
+            return self.option_data_client.get_option_chain(request)
+        except Exception as e:
+            logger.error(f"Error fetching option chain for {underlying_symbol}: {e}")
+            return {}
+
+    def get_latest_option_data(self, symbols):
+        """Fetches latest option quotes for a list of OCC symbols."""
+        if self.is_mock or self.option_data_client is None:
+            logger.info(f"[MOCK] Latest option data requested for {symbols}.")
+            return {}
+        try:
+            request = OptionLatestQuoteRequest(symbol_or_symbols=symbols)
+            return self.option_data_client.get_option_latest_quote(request)
+        except Exception as e:
+            logger.error(f"Error fetching latest option data for {symbols}: {e}")
+            return {}
+
+    def place_option_order(self, symbol: str, qty: int, side: str, limit_price: float | None = None,
+                           client_order_id: str | None = None) -> dict:
+        """Places an option order (BUY-to-open or SELL-to-close).
+
+        Options require whole qty, TIF DAY/GTC, extended_hours=false. Uses a
+        limit order when limit_price is provided, otherwise a market order.
+        """
+        symbol = symbol.upper().replace(" ", "")
+        side = side.lower()
+        if self.is_mock:
+            price = limit_price if limit_price else 2.50
+            cost = price * 100 * qty
+            if side == "buy":
+                if cost > self.mock_cash:
+                    raise ValueError(f"Insufficient mock funds. Cash: {self.mock_cash}, Order Cost: {cost}")
+                self.mock_cash -= cost
+                self.mock_positions[symbol] = self.mock_positions.get(symbol, 0) + qty
+            elif side == "sell":
+                current_qty = self.mock_positions.get(symbol, 0)
+                if qty > current_qty:
+                    raise ValueError(f"Insufficient mock option positions. Available: {current_qty}, Order Qty: {qty}")
+                self.mock_cash += cost
+                self.mock_positions[symbol] = current_qty - qty
+                if self.mock_positions[symbol] <= 0:
+                    del self.mock_positions[symbol]
+            return {
+                "id": f"mock-option-{int(datetime.now().timestamp())}",
+                "symbol": symbol,
+                "qty": qty,
+                "side": side,
+                "filled_avg_price": price,
+                "status": "filled",
+                "order_type": "limit" if limit_price else "market",
+                "is_option": True,
+            }
+
+        order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+        try:
+            if limit_price is not None:
+                req = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=str(int(qty)),
+                    side=order_side,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round(float(limit_price), 2),
+                    client_order_id=client_order_id,
+                )
+            else:
+                req = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=str(int(qty)),
+                    side=order_side,
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=client_order_id,
+                )
+            order = self.trading_client.submit_order(order_data=req)
+            order_id = str(order.id)
+            logger.info(f"Option order submitted to Alpaca. Order ID: {order_id} ({side} {qty} {symbol}).")
+
+            # Poll for fill
+            filled_price = None
+            status_str = str(getattr(order.status, "value", order.status))
+            for _ in range(10):
+                try:
+                    updated = self.trading_client.get_order_by_id(order_id)
+                    status_str = str(getattr(updated.status, "value", updated.status))
+                    if updated.filled_avg_price is not None:
+                        filled_price = float(updated.filled_avg_price)
+                    if status_str in ("filled", "partially_filled"):
+                        break
+                except Exception as poll_err:
+                    logger.warning(f"Error polling option order {order_id}: {poll_err}")
+                time.sleep(0.5)
+
+            return {
+                "id": order_id,
+                "symbol": symbol,
+                "qty": qty,
+                "side": side,
+                "filled_avg_price": filled_price,
+                "status": status_str,
+                "order_type": "limit" if limit_price else "market",
+                "is_option": True,
+            }
+        except Exception as e:
+            logger.error(f"Failed to place option order for {symbol}: {e}")
+            raise
+
+    def close_option_position(self, symbol: str) -> dict:
+        """Closes an option position via market liquidation (SELL-to-close)."""
+        symbol = symbol.upper().replace(" ", "")
+        if self.is_mock:
+            current_qty = self.mock_positions.get(symbol, 0)
+            if current_qty <= 0:
+                return {"id": f"mock-close-{int(time.time())}", "symbol": symbol, "qty": 0,
+                        "side": "sell", "filled_avg_price": None, "status": "no_position"}
+            self.mock_cash += current_qty * 2.50 * 100
+            del self.mock_positions[symbol]
+            return {"id": f"mock-close-{int(time.time())}", "symbol": symbol, "qty": current_qty,
+                    "side": "sell", "filled_avg_price": 2.50, "status": "filled", "is_option": True}
+        try:
+            self.cancel_open_orders(symbol)
+            closed = self.trading_client.close_position(symbol)
+            return {
+                "id": str(getattr(closed, "id", "")),
+                "symbol": symbol,
+                "qty": float(getattr(closed, "qty", 0) or 0),
+                "side": "sell",
+                "filled_avg_price": float(getattr(closed, "filled_avg_price", 0) or 0) or None,
+                "status": str(getattr(closed, "status", "closed")),
+                "is_option": True,
+            }
+        except Exception as e:
+            logger.error(f"Failed to close option position {symbol}: {e}")
+            raise
+
+    def get_option_positions(self) -> dict:
+        """Returns open option positions keyed by OCC symbol -> details dict."""
+        if self.is_mock:
+            return {sym: {"qty": qty, "qty_available": qty, "market_value": qty * 250.0,
+                          "avg_entry_price": 2.50, "unrealized_pnl": 0.0, "is_option": True}
+                    for sym, qty in self.mock_positions.items() if self.is_option_symbol(sym)}
+        try:
+            positions = self.trading_client.get_all_positions()
+            result = {}
+            for pos in positions:
+                symbol = str(getattr(pos, "symbol", "")).upper()
+                if not self.is_option_symbol(symbol):
+                    continue
+                result[symbol] = {
+                    "qty": float(getattr(pos, "qty", 0) or 0),
+                    "qty_available": float(getattr(pos, "qty_available", 0) or 0),
+                    "market_value": float(getattr(pos, "market_value", 0) or 0),
+                    "avg_entry_price": float(getattr(pos, "avg_entry_price", 0) or 0),
+                    "unrealized_pnl": float(getattr(pos, "unrealized_pl", 0) or 0),
+                    "is_option": True,
+                }
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching option positions: {e}")
+            return {}
+
+    def get_options_buying_power(self) -> float:
+        """Returns the account's options buying power (separate from equity buying power)."""
+        if self.is_mock:
+            return self.mock_cash * 2.0
+        try:
+            account = self.trading_client.get_account()
+            obp = getattr(account, "options_buying_power", None)
+            if obp is None:
+                obp = getattr(account, "buying_power", 0.0)
+            return float(obp or 0.0)
+        except Exception as e:
+            logger.error(f"Error fetching options buying power: {e}")
+            return 0.0
 
     def execute_market_order(self, symbol: str, qty: float, side: str, take_profit_price: float | None = None, stop_loss_price: float | None = None) -> dict:
         """Executes a market order, optionally adding bracket take-profit and stop-loss legs for BUY actions on non-crypto assets."""
