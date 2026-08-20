@@ -30,6 +30,9 @@ if (-not $GcsBucket) {
     Write-Error "GCS_BUCKET_NAME is not defined in .env"
 }
 
+# Force the project for this script's gcloud invocations.
+$env:CLOUDSDK_CORE_PROJECT = $GcpProject
+
 $Region = "us-central1"
 $BuildId = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
 $ImageTag = "gcr.io/$GcpProject/agent-trade:$BuildId"
