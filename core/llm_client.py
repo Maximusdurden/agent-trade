@@ -23,8 +23,9 @@ class LLMClientError(Exception):
 class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
-    Enforces a 20s timeout, Pydantic-based JSON Schema, <think> tag purging,
-    and automatic local-rules fallback upon failure.
+    Enforces a hard per-call wall-clock budget (LLM_MAX_TOTAL_SECONDS, default
+    120s), Pydantic-based JSON Schema, think-tag purging, bounded retries with
+    thread cancellation, and automatic local-rules fallback upon failure.
     """
     def __init__(self):
         self.api_key = os.getenv("OPENROUTER_API_KEY", "")
@@ -186,11 +187,30 @@ class SharedLLMClient:
                 + schema_instruction
             )
             
-        # 2. Enforce timeout with exponential backoff retries
+        # 2. Enforce timeout with exponential backoff retries.
+        # A bounded wall-clock envelope keeps the whole call within a hard budget
+        # so a hung OpenRouter/Gemini request can never blow the Cloud Run job
+        # timeout (600s). The background thread is cancelled on each timeout so
+        # cumulative wall-time stays bounded across retries.
+        max_total_seconds = int(os.getenv("LLM_MAX_TOTAL_SECONDS", "120"))
+        start = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            response_text = None
             retry_count = 0
             try:
-                while retry_count <= self.max_retries:
+                while True:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= max_total_seconds:
+                        logger.critical(
+                            f"OpenRouter/Gemini call exceeded {max_total_seconds}s total budget "
+                            f"after {retry_count} retries. Giving up."
+                        )
+                        raise LLMClientError(
+                            f"LLM call exceeded total {max_total_seconds}s budget (retries={retry_count})."
+                        )
+                    # Remaining budget caps this attempt's timeout to the global deadline.
+                    attempt_timeout = min(20, max(1, max_total_seconds - elapsed))
+                    attempt_timeout = max(attempt_timeout, 1)
                     try:
                         future = executor.submit(
                             self._execute_completion,
@@ -199,44 +219,61 @@ class SharedLLMClient:
                             tier=tier,
                             max_output_tokens=max_output_tokens
                         )
-                        # Enforce a strict 20s timeout per request as specified in the docstring
-                        timeout = 20
-                        logger.info(f"Attempt {retry_count + 1}/{self.max_retries + 1} with timeout: {timeout}s")
-                        response_text = future.result(timeout=timeout)
+                        logger.info(f"Attempt {retry_count + 1} with timeout: {attempt_timeout}s")
+                        response_text = future.result(timeout=attempt_timeout)
                         break
-                    except concurrent.futures.TimeoutError as te:
+                    except concurrent.futures.TimeoutError:
+                        future.cancel()  # mark cancelled to free the thread
                         retry_count += 1
                         if retry_count > self.max_retries:
-                            logger.critical(f"OpenRouter request timed out after {timeout}s (attempt {retry_count})")
+                            logger.critical(
+                                f"OpenRouter request timed out after {attempt_timeout}s (attempt {retry_count})"
+                            )
                             logger.debug(f"Request payload: {prompt[:500]}...")
-                            raise LLMClientError(f"OpenRouter request timed out after {timeout}s") from te
+                            raise LLMClientError(
+                                f"OpenRouter request timed out after {attempt_timeout}s"
+                            ) from None
                         delay = min(self.retry_delay * (2 ** retry_count), self.max_backoff)
+                        # Respect the global budget while backing off.
+                        if (time.monotonic() - start) + delay >= max_total_seconds:
+                            logger.critical(
+                                f"Backoff would exceed remaining {max_total_seconds}s budget; giving up."
+                            )
+                            raise LLMClientError(
+                                f"LLM call exceeded total {max_total_seconds}s budget (backoff)."
+                            )
                         logger.warning(f"Timeout, retrying in {delay}s...")
                         time.sleep(delay)
+
+                # Handle empty responses with retry logic (also bounded by the budget).
+                while not response_text and retry_count < self.max_retries:
+                    if (time.monotonic() - start) >= max_total_seconds:
+                        logger.critical(
+                            f"Retry for empty response exceeded {max_total_seconds}s budget."
+                        )
+                        break
+                    retry_count += 1
+                    logger.warning(
+                        f"OpenRouter returned empty response, retrying ({retry_count}/{self.max_retries})..."
+                    )
+                    time.sleep(self.retry_delay)
+
+                    try:
+                        future = executor.submit(
+                            self._execute_completion,
+                            prompt=prompt,
+                            system_prompt=actual_system_prompt,
+                            tier=tier,
+                            max_output_tokens=max_output_tokens
+                        )
+                        response_text = future.result(timeout=attempt_timeout)
+                        logger.debug(f"Retry {retry_count} using timeout: {attempt_timeout}s")
+                    except Exception as e:
+                        logger.warning(f"Retry {retry_count} failed: {e}")
             except Exception as e:
                 logger.critical(f"OpenRouter client connection error: {e}")
                 raise LLMClientError(f"OpenRouter client connection error: {e}") from e
 
-        # Handle empty responses with retry logic
-        retry_count = 0
-        while not response_text and retry_count < self.max_retries:
-            retry_count += 1
-            logger.warning(f"OpenRouter returned empty response, retrying ({retry_count}/{self.max_retries})...")
-            time.sleep(self.retry_delay)
-            
-            try:
-                future = executor.submit(
-                    self._execute_completion,
-                    prompt=prompt,
-                    system_prompt=actual_system_prompt,
-                    tier=tier,
-                    max_output_tokens=max_output_tokens
-                )
-                response_text = future.result(timeout=timeout)
-                logger.debug(f"Retry {retry_count} using timeout: {timeout}s")
-            except Exception as e:
-                logger.warning(f"Retry {retry_count} failed: {e}")
-                
         if not response_text:
             logger.critical("OpenRouter returned empty response after retries.")
             raise LLMClientError("OpenRouter returned empty response after retries.")
