@@ -90,6 +90,8 @@ class DataProvider:
                     "vwap_upper_2": float(latest["vwap_upper_2"]) if not pd.isna(latest["vwap_upper_2"]) else None,
                     "vwap_lower_2": float(latest["vwap_lower_2"]) if not pd.isna(latest["vwap_lower_2"]) else None,
                     "vwap_dist_pct": float(latest["vwap_dist_pct"]) if not pd.isna(latest["vwap_dist_pct"]) else None,
+                    "atr_14": float(latest["atr_14"]) if not pd.isna(latest["atr_14"]) else None,
+                    "atr_pct": float(latest["atr_pct"]) if not pd.isna(latest["atr_pct"]) else None,
                 },
                 "advanced_pivots": pivots,
                 "news": news_data
@@ -142,6 +144,18 @@ class DataProvider:
         std_20 = df["close"].rolling(window=20).std()
         df["bollinger_upper"] = df["bollinger_mid"] + (std_20 * 2)
         df["bollinger_lower"] = df["bollinger_mid"] - (std_20 * 2)
+
+        # 4b. Average True Range (ATR-14) for volatility-based position sizing.
+        # True Range = max(high-low, |high-prev_close|, |low-prev_close|).
+        prev_close = df["close"].shift(1)
+        tr = pd.concat([
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        df["atr_14"] = tr.ewm(alpha=1.0 / 14.0, adjust=False).mean()
+        # ATR as a % of price (volatility ratio) for cross-asset comparison.
+        df["atr_pct"] = df["atr_14"] / np.where(df["close"] == 0, 0.00001, df["close"]) * 100.0
 
         # 5. Dynamic Intraday VWAP and Bands (resetting daily)
         df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3

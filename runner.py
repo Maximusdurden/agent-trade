@@ -461,11 +461,14 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         # Enrich decision with current pricing data for guardrail calculations
         target_symbol = decision.get("symbol", "").upper()
         current_price = 0.0
+        atr_pct = None
         for state in market_states:
             if state["symbol"] == target_symbol:
                 current_price = state["current_price"]
+                atr_pct = state.get("indicators", {}).get("atr_pct")
                 break
         decision["current_price"] = current_price
+        decision["atr_pct"] = atr_pct
 
         # 6. Filter proposed decision through Risk Guardrails
         is_approved, status_msg, adjusted_decision = guardrails.validate_and_adjust_decision(
@@ -582,6 +585,32 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
             if stop_loss_price > max_allowed_stop:
                 stop_loss_price = max_allowed_stop
             min_allowed_tp = round(base_price + 0.05, 2)
+            if take_profit_price < min_allowed_tp:
+                take_profit_price = min_allowed_tp
+        elif action == "BUY" and is_crypto and getattr(config, "CRYPTO_BRACKET_ENABLED", True):
+            # Crypto bracket support: attach TP/SL to crypto BUYs so 24/7
+            # positions aren't left running unhedged. Uses config defaults when
+            # the brain doesn't supply explicit levels.
+            try:
+                base_price = alpaca_client.get_latest_price(symbol)
+            except Exception:
+                base_price = float(current_price)
+            take_profit_price = adjusted_decision.get("take_profit_price")
+            stop_loss_price = adjusted_decision.get("stop_loss_price")
+            cached_base = float(current_price) if current_price > 0 else base_price
+            if take_profit_price:
+                take_profit_price = round(base_price * (float(take_profit_price)/cached_base), 2)
+            else:
+                take_profit_price = round(base_price * (1.0 + getattr(config, "CRYPTO_TAKE_PROFIT_PCT", 0.05)), 2)
+            if stop_loss_price:
+                stop_loss_price = round(base_price * (float(stop_loss_price)/cached_base), 2)
+            else:
+                stop_loss_price = round(base_price * (1.0 - getattr(config, "CRYPTO_STOP_LOSS_PCT", 0.03)), 2)
+            # Ensure TP > SL and both are valid relative to base price.
+            max_allowed_stop = round(min(base_price * 0.995, base_price - 0.01), 2)
+            if stop_loss_price > max_allowed_stop:
+                stop_loss_price = max_allowed_stop
+            min_allowed_tp = round(base_price + 0.01, 2)
             if take_profit_price < min_allowed_tp:
                 take_profit_price = min_allowed_tp
         else:

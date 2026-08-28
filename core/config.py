@@ -11,6 +11,63 @@ MAX_TICKER_ALLOCATION_PCT = 0.30  # Max % of equity per ticker (new)
 DAILY_LOSS_LIMIT_PCT = 0.05  # Max daily equity drawdown before blocking buys
 MIN_CASH_BUFFER_PCT = 0.20  # Minimum cash reserve % of equity
 MIN_SELL_VALUE = float(os.getenv("MIN_SELL_VALUE", "50.0"))  # Min $ value of a SELL position; dust below this is fully liquidated
+
+# Correlation / Concentration Guardrail
+# Groups symbols whose returns are highly correlated. The guardrail caps the
+# TOTAL dollar exposure (sum of current position values + any proposed buy) to
+# MAX_CLUSTER_ALLOCATION_PCT of equity per cluster, so the portfolio can't
+# become an oversized, undiversified bet on one correlated theme (e.g. a
+# crypto-heavy book of BTC/ETH/SOL all moving together).
+MAX_CLUSTER_ALLOCATION_PCT = float(os.getenv("MAX_CLUSTER_ALLOCATION_PCT", "0.40"))
+# Cluster membership keyed by canonical upper symbol (crypto uses slash form).
+# Symbols with no listed cluster are treated as their own singleton cluster.
+CORRELATION_CLUSTERS = {
+    "CRYPTO": ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD", "DOGE/USD"],
+    "TECH_MEGACAP": ["AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "AVGO", "INTC", "QCOM", "TXN"],
+    "FINANCIALS": ["JPM", "BAC", "GS", "MS", "WFC"],
+    "BROAD_ETFS": ["SPY", "QQQ", "DIA", "IWM"],
+}
+
+# Per-Ticker Loss / Whipsaw Circuit Breaker
+# Blocks NEW BUYs on a symbol that has repeatedly lost money, so the strategy
+# stops re-entering names it keeps bleeding on (e.g. INTC/AMD/SPY in the data).
+# - MAX_CONSECUTIVE_LOSSES: if the symbol's most recent N closed round-trips are
+#   ALL losses, block new BUYs (circuit breaker).
+# - MAX_WHIPSAW_RATIO: if the symbol's share of <4h round-trips exceeds this AND
+#   it has at least MIN_WHIPSAW_TRADES closed trades, block new BUYs (whipsaw trap).
+# - CIRCUIT_BREAKER_LOOKBACK_DAYS: window over which round-trips are considered.
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+MAX_WHIPSAW_RATIO = float(os.getenv("MAX_WHIPSAW_RATIO", "0.60"))
+MIN_WHIPSAW_TRADES = int(os.getenv("MIN_WHIPSAW_TRADES", "4"))
+CIRCUIT_BREAKER_LOOKBACK_DAYS = int(os.getenv("CIRCUIT_BREAKER_LOOKBACK_DAYS", "90"))
+
+# Crypto TP/SL Bracket Support
+# When True, crypto BUYs get a bracket (take-profit + stop-loss) order like
+# equities, so 24/7 crypto positions aren't left running unhedged. If Alpaca
+# rejects the bracket for a crypto symbol, the client falls back to a plain
+# market order (no TP/SL) so trading is never blocked.
+CRYPTO_BRACKET_ENABLED = os.getenv("CRYPTO_BRACKET_ENABLED", "true").lower() == "true"
+# Default TP/SL percentages for crypto BUYs when the brain doesn't supply them.
+CRYPTO_TAKE_PROFIT_PCT = float(os.getenv("CRYPTO_TAKE_PROFIT_PCT", "0.05"))
+CRYPTO_STOP_LOSS_PCT = float(os.getenv("CRYPTO_STOP_LOSS_PCT", "0.03"))
+
+# Volatility-Based Position Sizing
+# When True, BUY quantities are scaled down for high-volatility assets so the
+# same dollar *risk* is taken regardless of asset. Uses ATR% (from data_provider)
+# relative to a baseline: a symbol with ATR% above VOL_SIZING_BASELINE_ATR_PCT
+# gets its max allocation scaled by (baseline / atr_pct), floored at
+# VOL_SIZING_MIN_ALLOCATION_PCT of equity.
+VOL_SIZING_ENABLED = os.getenv("VOL_SIZING_ENABLED", "true").lower() == "true"
+VOL_SIZING_BASELINE_ATR_PCT = float(os.getenv("VOL_SIZING_BASELINE_ATR_PCT", "2.0"))
+VOL_SIZING_MIN_ALLOCATION_PCT = float(os.getenv("VOL_SIZING_MIN_ALLOCATION_PCT", "0.02"))
+
+# Intra-Day PnL Circuit Breaker
+# Blocks NEW BUYs when the day's realized + unrealized PnL drops below
+# INTRADAY_LOSS_LIMIT_PCT of equity (a real-time, intra-cycle version of the
+# daily loss limit). SELLs are still allowed to de-risk. Uses the day's realized
+# PnL from the DB (FIFO) plus current unrealized PnL from the account.
+INTRADAY_LOSS_LIMIT_PCT = float(os.getenv("INTRADAY_LOSS_LIMIT_PCT", "0.04"))
+INTRADAY_BREAKER_ENABLED = os.getenv("INTRADAY_BREAKER_ENABLED", "true").lower() == "true"
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 

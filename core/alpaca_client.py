@@ -963,11 +963,17 @@ class AlpacaClient:
                     "fallback": fallback
                 }
 
-            if side == "buy" and not is_crypto and take_profit_price is not None and stop_loss_price is not None:
-                # Alpaca does not support fractional quantities for bracket (OCO)
-                # orders on equities. Round to whole shares for the bracket leg;
-                # fractional quantities are preserved for crypto and plain market orders.
-                bracket_qty = int(qty)
+            if side == "buy" and take_profit_price is not None and stop_loss_price is not None:
+                # Bracket (OCO) order with take-profit + stop-loss legs.
+                # - Equities: Alpaca does NOT support fractional qty for brackets,
+                #   so round to whole shares.
+                # - Crypto: fractional qty is preserved; Alpaca may reject brackets
+                #   on some crypto pairs, in which case we fall back to a plain
+                #   market order (no TP/SL) so trading is never blocked.
+                if is_crypto:
+                    bracket_qty = qty
+                else:
+                    bracket_qty = int(qty)
                 if bracket_qty < 1:
                     logger.warning(f"Bracket order qty for {symbol} rounds to {bracket_qty} (<1). Falling back to plain market order.")
                     market_order_data = MarketOrderRequest(

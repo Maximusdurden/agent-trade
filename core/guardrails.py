@@ -1,7 +1,9 @@
 import logging
 import re
 from datetime import datetime, timedelta
+from collections import defaultdict
 from core import config
+from core.strategy_rules import normalize_symbol, build_symbol_to_cluster
 
 logger = logging.getLogger("Guardrails")
 
@@ -19,7 +21,101 @@ class RiskGuardrails:
     """Deterministic security/risk layer between LLM decisions and execution."""
     
     def __init__(self):
-        pass
+        # Build the flattened symbol -> cluster mapping once from config.
+        self.symbol_to_cluster = build_symbol_to_cluster(
+            getattr(config, "CORRELATION_CLUSTERS", {})
+        )
+
+    def _cluster_of(self, symbol: str) -> str:
+        """Return the correlation cluster name for a symbol, else its own singleton."""
+        sym = normalize_symbol(symbol)
+        return self.symbol_to_cluster.get(sym, sym)
+
+    def _cluster_exposure(self, symbol: str, proposed_value: float,
+                          current_positions: dict) -> tuple[str, float]:
+        """Return (cluster_name, current total dollar exposure incl. proposed buy).
+
+        Sums the market value of every held position in the same cluster as
+        ``symbol`` plus the proposed buy's dollar value. Positions not in the
+        cluster mapping are ignored (they belong to their own singleton cluster).
+        """
+        cluster = self._cluster_of(symbol)
+        exposure = proposed_value
+        for pos_symbol, pos in current_positions.items():
+            if self._cluster_of(pos_symbol) == cluster:
+                exposure += float(pos.get("market_value", 0.0) or 0.0)
+        return cluster, exposure
+
+    def _circuit_breaker_reason(self, symbol: str) -> str | None:
+        """Return a rejection reason if a BUY to ``symbol`` should be blocked.
+
+        Uses the symbol's closed round-trips (from core.feedback) to detect:
+        1. Consecutive losses: the most recent ``MAX_CONSECUTIVE_LOSSES`` closed
+           round-trips are all losses -> the strategy keeps re-entering a loser.
+        2. Whipsaw trap: >= ``MIN_WHIPSAW_TRADES`` closed trades AND the share of
+           <4h round-trips exceeds ``MAX_WHIPSAW_RATIO`` -> the symbol whipsaws.
+
+        Returns ``None`` when the symbol is clear to buy.
+        """
+        try:
+            from core.feedback import compute_closed_round_trips
+            lookback = getattr(config, "CIRCUIT_BREAKER_LOOKBACK_DAYS", 90)
+            trips = compute_closed_round_trips(lookback_days=lookback)
+            sym_trips = [t for t in trips if t["symbol"] == normalize_symbol(symbol)]
+            if not sym_trips:
+                return None
+
+            # 1. Consecutive-loss circuit breaker.
+            max_losses = int(getattr(config, "MAX_CONSECUTIVE_LOSSES", 3))
+            # Round-trips are appended in chronological order; take the tail.
+            recent = sym_trips[-max_losses:]
+            if len(recent) >= max_losses and all(not t["win"] for t in recent):
+                total = sum(t["pnl"] for t in recent)
+                return (f"Rejected: Per-ticker circuit breaker. {symbol} has "
+                        f"{max_losses} consecutive losing round-trips "
+                        f"(recent PnL ${total:+,.2f}). BUY blocked to stop re-entering a losing name.")
+
+            # 2. Whipsaw-trap circuit breaker.
+            max_ratio = float(getattr(config, "MAX_WHIPSAW_RATIO", 0.60))
+            min_trades = int(getattr(config, "MIN_WHIPSAW_TRADES", 4))
+            if len(sym_trips) >= min_trades:
+                whipsaw = sum(1 for t in sym_trips if t["holding_hours"] < 4.0)
+                ratio = whipsaw / len(sym_trips)
+                if ratio >= max_ratio:
+                    return (f"Rejected: Whipsaw-trap circuit breaker. {symbol} has "
+                            f"{whipsaw}/{len(sym_trips)} round-trips under 4h "
+                            f"({ratio*100:.0f}% >= {max_ratio*100:.0f}%). BUY blocked.")
+        except Exception as err:
+            logger.error(f"Error checking circuit breaker for {symbol}: {err}")
+        return None
+
+    def _intraday_pnl_breaker_reason(self, account_state: dict) -> str | None:
+        """Return a rejection reason if the day's PnL loss exceeds the intra-day limit.
+
+        Combines today's realized PnL (from the DB, FIFO) with the current
+        unrealized PnL (from the account). If the total intra-day loss exceeds
+        INTRADAY_LOSS_LIMIT_PCT of equity, block new BUYs (SELLs still allowed).
+        """
+        if not getattr(config, "INTRADAY_BREAKER_ENABLED", True):
+            return None
+        try:
+            from core.feedback import today_realized_pnl
+            equity = float(account_state.get("equity", 0.0) or 0.0)
+            if equity <= 0:
+                return None
+            realized = today_realized_pnl()
+            unrealized = float(account_state.get("unrealized_pnl", 0.0) or 0.0)
+            intraday_pnl = realized + unrealized
+            limit_pct = float(getattr(config, "INTRADAY_LOSS_LIMIT_PCT", 0.04))
+            loss_pct = -intraday_pnl / equity
+            if loss_pct >= limit_pct:
+                return (f"Rejected: Intra-day PnL circuit breaker. Day PnL "
+                        f"${intraday_pnl:+,.2f} (realized ${realized:+,.2f} + "
+                        f"unrealized ${unrealized:+,.2f}) is a {loss_pct:.2%} loss "
+                        f">= {limit_pct:.2%} limit. BUY blocked to stop the bleeding.")
+        except Exception as err:
+            logger.error(f"Error checking intra-day PnL breaker: {err}")
+        return None
 
     def is_market_open_check(self) -> tuple[bool, str]:
         """
@@ -262,6 +358,21 @@ class RiskGuardrails:
 
         # 6. Buy Rules Guardrail
         if action == "BUY":
+            # Per-ticker loss / whipsaw circuit breaker: block re-entering a
+            # symbol that has repeatedly lost money or whipsaws, so the strategy
+            # stops bleeding on the same names (e.g. INTC/AMD/SPY in the data).
+            breaker_reason = self._circuit_breaker_reason(symbol)
+            if breaker_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, breaker_reason, adjusted_decision
+
+            # Intra-day PnL circuit breaker: block new BUYs when the day's
+            # realized + unrealized loss exceeds the limit (SELLs still allowed).
+            intraday_reason = self._intraday_pnl_breaker_reason(account_state)
+            if intraday_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, intraday_reason, adjusted_decision
+
             # Max dollar allocation allowed for a single trade
             max_trade_value = equity * config.MAX_TRADE_ALLOCATION_PCT
             proposed_trade_value = proposed_qty * current_price
@@ -278,6 +389,30 @@ class RiskGuardrails:
                                f"Scaling down quantity from {proposed_qty} to {max_allowed_qty}.")
                 proposed_qty = max_allowed_qty
                 proposed_trade_value = proposed_qty * current_price
+
+            # Volatility-based position sizing: scale down the max allocation for
+            # high-volatility assets so the same dollar *risk* is taken regardless
+            # of asset. A symbol with ATR% above the baseline gets its max trade
+            # value scaled by (baseline / atr_pct), floored at a min allocation.
+            if getattr(config, "VOL_SIZING_ENABLED", True):
+                atr_pct = decision.get("atr_pct")
+                if atr_pct and atr_pct > 0:
+                    baseline = float(getattr(config, "VOL_SIZING_BASELINE_ATR_PCT", 2.0))
+                    min_alloc = float(getattr(config, "VOL_SIZING_MIN_ALLOCATION_PCT", 0.02))
+                    if atr_pct > baseline:
+                        scale = baseline / atr_pct
+                        vol_capped_value = max_trade_value * scale
+                        min_value = equity * min_alloc
+                        vol_capped_value = max(vol_capped_value, min_value)
+                        if proposed_trade_value > vol_capped_value:
+                            vol_qty = round(vol_capped_value / current_price, 4)
+                            logger.warning(
+                                f"Volatility-based sizing for {symbol}: ATR%={atr_pct:.2f}% > baseline {baseline:.2f}%. "
+                                f"Capping buy value from ${proposed_trade_value:,.2f} to ${vol_capped_value:,.2f} "
+                                f"(scale {scale:.2f}x)."
+                            )
+                            proposed_qty = vol_qty
+                            proposed_trade_value = proposed_qty * current_price
 
             # Cumulative cycle budget: cap total spend across ALL buys this cycle so
             # N per-ticker BUYs can't each pass the per-trade check while summing far
@@ -322,6 +457,32 @@ class RiskGuardrails:
                 if proposed_qty <= 0:
                     adjusted_decision["quantity"] = 0.0
                     return False, f"Rejected: Buy quantity scaled down to 0 because total position allocation for {symbol} would exceed the per-ticker limit of {config.MAX_TICKER_ALLOCATION_PCT * 100}% of equity.", adjusted_decision
+
+            # Check Correlation / Concentration cluster limit.
+            # Caps TOTAL exposure across all correlated symbols sharing a cluster
+            # (e.g. BTC+ETH+SOL crypto book, or tech mega-caps) to keep the
+            # portfolio diversified and avoid an oversized single-theme bet.
+            cluster, cluster_exposure = self._cluster_exposure(
+                symbol, proposed_trade_value, current_positions
+            )
+            max_cluster_value = equity * getattr(config, "MAX_CLUSTER_ALLOCATION_PCT", 0.40)
+            if cluster_exposure > max_cluster_value:
+                allowed_for_cluster = max(0.0, max_cluster_value -
+                                          (cluster_exposure - proposed_trade_value))
+                new_allowed_qty = round(allowed_for_cluster / current_price, 4) if current_price > 0 else 0.0
+                if new_allowed_qty <= 0:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, (f"Rejected: Cluster '{cluster}' concentration limit would be "
+                                   f"exceeded (${cluster_exposure:,.2f} > ${max_cluster_value:,.2f}). "
+                                   f"No room for new {symbol} buys in this correlated cluster."), adjusted_decision
+                logger.warning(f"Cluster '{cluster}' exposure (${cluster_exposure:,.2f}) exceeds "
+                               f"MAX_CLUSTER_ALLOCATION_PCT (${max_cluster_value:,.2f}). "
+                               f"Scaling {symbol} buy from {proposed_qty} to {new_allowed_qty}.")
+                proposed_qty = new_allowed_qty
+                proposed_trade_value = proposed_qty * current_price
+                if proposed_qty <= 0:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, f"Rejected: Cluster '{cluster}' concentration limit exhausted for {symbol}.", adjusted_decision
 
             # Ensure we maintain the cash buffer
             # Calculate dynamic cash buffer based on number of open positions

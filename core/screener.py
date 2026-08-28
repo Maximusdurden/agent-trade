@@ -10,6 +10,7 @@ from core import config
 from core.alpaca_client import AlpacaClient
 from core.data_provider import DataProvider
 from core.database import get_db_connection, log_watchlist
+from core.feedback import compute_closed_round_trips, symbol_stats, feedback_text
 
 logger = logging.getLogger("Screener")
 
@@ -36,67 +37,70 @@ def load_screener_pool() -> list[str]:
     logger.info("Falling back to default liquid tickers list.")
     return DEFAULT_TICKERS
 
+def get_symbol_feedback() -> dict[str, dict]:
+    """Decay-weighted per-symbol performance feedback for the screener.
+
+    Preferred over ``get_symbol_win_rates`` because it summarizes expectancy,
+    profit factor and whipsaw exposure (not just raw win rate), which the
+    screener scoring uses to make a more robust candidate selection.
+    """
+    trips = compute_closed_round_trips()
+    by_symbol = defaultdict(list)
+    for t in trips:
+        by_symbol[t["symbol"]].append(t)
+    return {sym: symbol_stats_from_trips(sym, ts) for sym, ts in by_symbol.items()}
+
+
+def symbol_stats_from_trips(symbol: str, trips: list[dict]) -> dict:
+    """Aggregate decay-weighted stats for one symbol given its round-trips."""
+    from core.feedback import _age_weight, holding_bucket, WHIPSAW_HOURS, DEFAULT_HALF_LIFE_DAYS
+
+    w_total = 0.0
+    w_wins = 0.0
+    w_pnl = 0.0
+    gross_win = 0.0
+    gross_loss = 0.0
+    whipsaw_weight = 0.0
+
+    for t in trips:
+        w = _age_weight(t["close_ts"], DEFAULT_HALF_LIFE_DAYS)
+        w_total += w
+        w_pnl += w * t["pnl"]
+        if t["pnl"] > 0:
+            w_wins += w
+            gross_win += w * t["pnl"]
+        else:
+            gross_loss += w * abs(t["pnl"])
+        if holding_bucket(t["holding_hours"]) == "under_4h_whipsaw":
+            whipsaw_weight += w
+
+    win_rate = (w_wins / w_total * 100.0) if w_total > 0 else 0.0
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+    whipsaw_ratio = (whipsaw_weight / w_total) if w_total > 0 else 0.0
+
+    return {
+        "symbol": symbol,
+        "n_trades": len(trips),
+        "win_rate": round(win_rate, 2),
+        "avg_pnl": round(w_pnl / w_total, 2) if w_total > 0 else 0.0,
+        "expectancy": round(w_pnl, 2),
+        "profit_factor": profit_factor,
+        "whipsaw_ratio": round(whipsaw_ratio, 2),
+    }
+
+
 def get_symbol_win_rates() -> dict[str, float]:
-    """Calculates historical win rate per symbol from closed trades in the SQLite database."""
-    win_rates = {}
+    """Calculates historical win rate per symbol from closed trades in the SQLite database.
+
+    Compatibility wrapper retained for older callers; prefer ``get_symbol_feedback``.
+    Returns win rates as FRACTIONS (0.0-1.0) matching the original contract.
+    """
+    fb = {}
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT symbol, side, qty, filled_avg_price 
-                FROM trades 
-                WHERE status IN ('filled', 'partially_filled') 
-                ORDER BY id ASC
-            """)
-            rows = cursor.fetchall()
+        fb = get_symbol_feedback()
     except Exception as e:
-        logger.warning(f"Could not fetch trade history for screener feedback: {e}")
-        return {}
-
-    buy_queues = defaultdict(list)
-    closed_pnls = defaultdict(list)
-
-    for row in rows:
-        sym = row["symbol"].upper()
-        if sym == "SOLUSD":
-            sym = "SOL/USD"
-        side = row["side"].lower()
-        qty = float(row["qty"])
-        price = float(row["filled_avg_price"]) if row["filled_avg_price"] else 0.0
-
-        if side == "buy":
-            buy_queues[sym].append({"qty": qty, "price": price})
-        elif side == "sell":
-            temp_qty = qty
-            trade_pnl = 0.0
-            matched = False
-            while temp_qty > 0 and buy_queues[sym]:
-                oldest_buy = buy_queues[sym][0]
-                buy_qty = oldest_buy["qty"]
-                buy_price = oldest_buy["price"]
-
-                if buy_qty <= temp_qty:
-                    trade_pnl += buy_qty * (price - buy_price)
-                    temp_qty -= buy_qty
-                    buy_queues[sym].pop(0)
-                    matched = True
-                else:
-                    trade_pnl += temp_qty * (price - buy_price)
-                    oldest_buy["qty"] -= temp_qty
-                    temp_qty = 0
-                    matched = True
-            
-            if matched:
-                closed_pnls[sym].append(trade_pnl)
-
-    for sym, pnls in closed_pnls.items():
-        if not pnls:
-            continue
-        wins = sum(1 for p in pnls if p > 0)
-        total = len(pnls)
-        win_rates[sym] = wins / total
-        
-    return win_rates
+        logger.warning(f"Could not compute symbol feedback for win rates: {e}")
+    return {sym: (stats.get("win_rate", 0.0) / 100.0) for sym, stats in fb.items()}
 
 def calculate_technical_score(row: pd.Series) -> float:
     """
@@ -192,9 +196,9 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
         logger.error(f"Screener indicator calculation failed: {e}")
         return config.TRADING_UNIVERSE[:watchlist_limit]
         
-    # Get win rates for SQLite Feedback Loop
-    win_rates = get_symbol_win_rates()
-    
+    # Get decay-weighted per-symbol feedback for the SQLite Feedback Loop.
+    symbol_feedback = get_symbol_feedback()
+
     scored_symbols = []
     
     # Group by level 0 (symbol)
@@ -226,18 +230,35 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
         latest_row = group_df.iloc[-1]
         tech_score = calculate_technical_score(latest_row)
         
-        # 6. Stage 3: SQLite Feedback Loop
-        multiplier = 1.0
-        win_rate = win_rates.get(symbol, None)
-        if win_rate is not None:
-            if win_rate >= 0.60:
-                multiplier = 1.2
-                logger.info(f"SQLite Booster applied to {symbol}: {multiplier}x (Win Rate: {win_rate*100:.1f}%)")
-            elif win_rate < 0.40:
-                multiplier = 0.7
-                logger.info(f"SQLite Penalty applied to {symbol}: {multiplier}x (Win Rate: {win_rate*100:.1f}%)")
+        # 6. Stage 3: Feedback Loop (decay-weighted expectancy / profit factor)
+        # Replace the coarse win-rate multiplier with a capped additive adjustment
+        # driven by expectancy and profit factor, and penalize whipsaw-heavy names
+        # even if they are net winners.
+        fb = symbol_feedback.get(symbol)
+        adjustment = 0.0
+        if fb and fb["n_trades"] > 0:
+            pf = fb.get("profit_factor")
+            exp = fb.get("expectancy", 0.0)
+            # Profit-factor contribution: strong PF -> positive, weak PF -> negative.
+            if pf == "inf" or (isinstance(pf, float) and pf >= 1.5):
+                adjustment += 10.0
+            elif isinstance(pf, float):
+                adjustment += max(-12.0, min(8.0, (pf - 1.0) * 12.0))
+            # Expectancy direction & magnitude (bounded).
+            if exp <= 0:
+                adjustment -= 8.0
+            else:
+                adjustment += min(6.0, exp / 25.0)
+            # Whipsaw penalty: if >40% of (decayed) activity is <4h round-trips.
+            if fb["whipsaw_ratio"] > 0.40:
+                adjustment -= 10.0
+                logger.info(f"Feedback whipsaw penalty applied to {symbol}: "
+                            f"whipsaw_ratio={fb['whipsaw_ratio']*100:.0f}%")
+            adjustment = max(-15.0, min(15.0, adjustment))
+            logger.info(f"Feedback adjustment for {symbol}: {adjustment:+.1f} "
+                        f"(PF={pf}, exp=${exp:+,.2f}, n={fb['n_trades']})")
                 
-        final_score = tech_score * multiplier
+        final_score = tech_score + adjustment
         scored_symbols.append((symbol, final_score, avg_dollar_vol))
         
     if not scored_symbols:
@@ -252,8 +273,11 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
     
     logger.info(f"Screener complete. Top selected candidates:")
     for sym, score, vol in scored_symbols[:watchlist_limit]:
-        wr_str = f"{win_rates[sym]*100:.1f}%" if sym in win_rates else "N/A"
-        logger.info(f" - {sym}: Score = {score:.2f} | Avg Daily Vol = ${vol:,.2f} | DB Win Rate = {wr_str}")
+        fb = symbol_feedback.get(sym)
+        fb_str = "N/A"
+        if fb and fb["n_trades"] > 0:
+            fb_str = f"WR={fb['win_rate']:.1f}% PF={fb['profit_factor'] if fb['profit_factor'] == 'inf' else round(fb['profit_factor'],2)}"
+        logger.info(f" - {sym}: Score = {score:.2f} | Avg Daily Vol = ${vol:,.2f} | Feedback = {fb_str}")
         
     # 8. Log chosen watchlist to database
     try:

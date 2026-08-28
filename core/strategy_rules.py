@@ -18,6 +18,19 @@ KNOWN_CRYPTO_BASES = {
 }
 
 
+def build_symbol_to_cluster(clusters: dict) -> dict:
+    """Flatten ``{cluster_name: [symbols]}`` into ``{SYMBOL: cluster_name}``.
+
+    Symbols not present in any cluster are not included (callers treat them as
+    singleton clusters). Symbols are normalized to canonical upper form.
+    """
+    mapping = {}
+    for cluster_name, members in (clusters or {}).items():
+        for sym in members or []:
+            mapping[normalize_symbol(sym)] = cluster_name
+    return mapping
+
+
 def normalize_symbol(symbol: str) -> str:
     """Normalize broker and configuration symbols to an uppercase slash form.
 

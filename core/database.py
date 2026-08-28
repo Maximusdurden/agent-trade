@@ -161,6 +161,10 @@ def init_db():
         add_column_if_missing("trades", "strike", "REAL")
         add_column_if_missing("trades", "contract_symbol", "TEXT")
 
+        # strategy_history: optional experiment/version tag so future round-trip
+        # attribution can score rule versions against each other.
+        add_column_if_missing("strategy_history", "strategy_version", "TEXT")
+
         conn.commit()
 
 def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process: str,
@@ -354,19 +358,22 @@ def get_recent_trades(limit: int = 10) -> list[dict]:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
-def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules: str, meta_reasoning: str) -> int:
-    """Logs a daily strategy shift for a ticker."""
+def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules: str, meta_reasoning: str,
+                         strategy_version: str | None = None) -> int:
+    """Logs a daily strategy shift for a ticker, optionally tagged with a version/experiment id."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO strategy_history (timestamp, ticker, yesterdays_rules, todays_rules, meta_reasoning)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO strategy_history
+                (timestamp, ticker, yesterdays_rules, todays_rules, meta_reasoning, strategy_version)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             ticker.upper(),
             yesterdays_rules,
             todays_rules,
-            meta_reasoning
+            meta_reasoning,
+            strategy_version
         ))
         conn.commit()
         return get_last_insert_id(cursor)
@@ -384,6 +391,25 @@ def get_active_strategy(ticker: str) -> str:
             return row["todays_rules"]
         
         return f"No active strategy rules defined for {ticker}."
+
+
+def get_strategy_before(ticker: str, timestamp: str) -> str | None:
+    """Return the latest strategy rule persisted for ``ticker`` at or before ``timestamp``.
+
+    Used to attribute a closed round-trip to the strategy that governed its entry.
+    Returns ``None`` if no rule predates ``timestamp`` (e.g. the ticker was traded
+    before any strategist rule existed).
+    """
+    ticker = ticker.upper()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT todays_rules FROM strategy_history
+            WHERE ticker = ? AND timestamp <= ?
+            ORDER BY id DESC LIMIT 1
+        """, (ticker, timestamp))
+        row = cursor.fetchone()
+        return row["todays_rules"] if row else None
 
 def get_performance_summary() -> dict:
     """

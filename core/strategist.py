@@ -9,6 +9,7 @@ from core import config
 from core import database
 from core.alpaca_client import AlpacaClient
 from core.strategy_rules import is_crypto_symbol, validate_strategy_rule
+from core.feedback import feedback_text, next_strategy_version
 
 try:
     from google import genai
@@ -142,7 +143,8 @@ class MetaStrategist:
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
-                meta_reasoning=result["meta_reasoning"]
+                meta_reasoning=result["meta_reasoning"],
+                strategy_version=next_strategy_version()
             )
             
             logger.info(f"Strategy updated for {ticker}. Database ID: {db_id}")
@@ -176,13 +178,16 @@ class MetaStrategist:
     def _optimize_strategy_for_ticker(self, ticker: str, yesterdays_rules: str, bars_summary: str,
                                       recent_trades: list, recent_decisions: list,
                                       account_state: dict, positions: dict) -> dict:
-        """Sends the contextual prompt to Gemini and parses the structured response."""
+        """Sends the contextual prompt to Gemini/OpenRouter and parses the structured response."""
         if self.is_mock:
             return self._generate_mock_refinement(ticker, yesterdays_rules)
             
-        # Fetch historical successes/failures performance summary
-        perf_summary = database.get_performance_summary()
-        perf_summary_str = perf_summary.get("text_summary", "No performance history available.")
+        # Structured per-ticker + global feedback (decayed) from core.feedback
+        perf_summary_str = feedback_text(
+            symbol=ticker,
+            lookback_days=30,
+            half_life_days=14,
+        )
 
         # Compile contextual lists
         trades_str = ""
@@ -244,11 +249,13 @@ DIRECTIONS:
 1. Review the daily price candles, 30-day volatility, and trends. Is the ticker trending, range-bound, overbought, or oversold?
 2. Audit the trade outcomes. Were our recent trades profitable? Did we experience whipsaws or losses?
 3. Decide if yesterday's rules are working, or if they need adjustment to match the current market regime. 
-4. Review the HISTORICAL PORTFOLIO PERFORMANCE section carefully. Your rules MUST adapt based on these successes and failures:
-   - If historical win rate is low (<50%) or max drawdown is high (>15%), design significantly more conservative rules with tighter, safer conditional thresholds to avoid over-allocating on speculative moves.
-   - If our historical realized profit is negative, suggest smaller starter positions and require stronger support confirmations (e.g. confluences of Fibonacci support and psychological round numbers) before triggers.
+4. Review the STRUCTURED PERFORMANCE FEEDBACK section carefully. Your rules MUST adapt based on these concrete, decay-weighted outcomes:
+   - If the "<4h (whipsaw)" bucket dominates the symbol's holding-time buckets, treat it as a strong signal that entries are being whipsawed. Your new rule MUST add a faster regime filter / require stronger intraday-breakout confirmation (e.g. price must close above a VWAP band or a swing-high before a BUY). Do NOT just restate yesterday's rule.
+   - If the symbol's profit factor is < 1.0 or expectancy is negative, design more conservative rules: smaller starter size, tighter entry thresholds, and require confluences of Fibonacci support / psychological round numbers before triggers.
+   - If max historical drawdown is high (>15%), prioritize capital preservation (defensive 1-3% sizing and a larger cash buffer).
    - Ensure the execution agent strictly avoids repeating previous errors or whipsaws.
 5. Write a single, highly refined paragraph that applies ONLY to {ticker}. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" threshold for {ticker} based on price, intraday VWAP, or vwap_dist_pct. Do not substitute another ticker in the operative instruction.
+6. The new rule MUST cite at least one CONCRETE, guardrail-adjustable knob (an intraday VWAP threshold, an RSI entry band, a max allocation %, or a holding-time exit) so the rule is testable against future round-trips. State that knob explicitly (e.g. "IF vwap_dist_pct > +1.5% THEN no new BUY").
 6. For any crypto ticker, preserve 24/7 operation and use volatility-appropriate thresholds without requiring equity-index data.
 
 OUTPUT FORMAT:
@@ -374,7 +381,8 @@ Schema:
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
-                meta_reasoning=f"[EMERGENCY INTRADAY RE-EVALUATION] {result['meta_reasoning']}"
+                meta_reasoning=f"[EMERGENCY INTRADAY RE-EVALUATION] {result['meta_reasoning']}",
+                strategy_version=next_strategy_version()
             )
             logger.info(f"Emergency rules updated for {ticker}. DB ID: {db_id}")
             logger.info(f"Emergency Rules: {todays_rules}\n")
