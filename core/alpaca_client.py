@@ -123,10 +123,14 @@ class AlpacaClient:
         
         try:
             account = self.trading_client.get_account()
-            # Fetch active positions to calculate actual total unrealized profit/loss on all open holdings
+            # Fetch active positions to calculate actual total unrealized profit/loss
+            # on all open holdings. Use get_positions() so crypto cost basis is
+            # corrected via our FIFO override (Alpaca's crypto avg_entry_price is
+            # unreliable and would inflate/deflate unrealized PnL).
             try:
-                positions = self.trading_client.get_all_positions()
-                unrealized_pnl = sum(float(pos.unrealized_pl) for pos in positions) if positions else 0.0
+                positions = self.get_positions()
+                unrealized_pnl = sum(float(p.get("unrealized_pnl", 0.0) or 0.0)
+                                     for p in positions.values())
             except Exception as pos_err:
                 logger.warning(f"Failed to fetch positions for account state unrealized PnL: {pos_err}")
                 unrealized_pnl = 0.0
@@ -218,10 +222,50 @@ class AlpacaClient:
                     "avg_entry_price": get_float(pos, "avg_entry_price", 0.0),
                     "unrealized_pnl": get_float(pos, "unrealized_pl", 0.0)
                 }
+
+            # Override crypto cost basis with our own FIFO reconstruction.
+            # Alpaca's avg_entry_price for crypto is unreliable (it can average
+            # in realized sell prices / mishandle fractional-lot FIFO, e.g. SOL
+            # showing $46 when the open lots are ~$109). Recompute from our
+            # filled trades table so unrealized PnL reflects reality.
+            self._apply_fifo_cost_basis_override(positions_dict)
             return positions_dict
         except Exception as e:
             logger.error(f"Error fetching positions: {e}")
             return {}
+
+    def _apply_fifo_cost_basis_override(self, positions_dict: dict) -> None:
+        """Overwrite crypto positions' avg_entry_price/unrealized_pnl in place.
+
+        Uses ``core.feedback.compute_open_position_cost_basis`` (canonical FIFO
+        from our filled trades) to correct Alpaca's unreliable crypto cost basis.
+        Only symbols present in both the live positions and our FIFO basis are
+        corrected; equity/option positions are left untouched.
+        """
+        try:
+            from core.feedback import compute_open_position_cost_basis
+            basis = compute_open_position_cost_basis()
+        except Exception as e:
+            logger.warning(f"FIFO cost-basis override unavailable: {e}")
+            return
+        for symbol, pos in positions_dict.items():
+            if symbol not in basis:
+                continue
+            b = basis[symbol]
+            if b["qty"] <= 1e-9:
+                continue
+            market_value = float(pos.get("market_value", 0.0) or 0.0)
+            avg_entry = b["avg_entry_price"]
+            broker_avg = float(pos.get("avg_entry_price", 0.0) or 0.0)
+            # Recompute unrealized PnL from the corrected cost basis.
+            unrealized = market_value - b["cost_basis"]
+            pos["avg_entry_price"] = avg_entry
+            pos["unrealized_pnl"] = unrealized
+            logger.info(
+                f"FIFO cost-basis override for {symbol}: avg_entry "
+                f"${avg_entry:.4f} (was ${broker_avg:.4f}), "
+                f"unrealized ${unrealized:,.2f}"
+            )
 
     def get_executed_orders(self, limit: int = 50) -> list[dict]:
         """Fetches recently filled/closed orders directly from Alpaca.

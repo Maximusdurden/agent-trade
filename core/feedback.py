@@ -199,6 +199,57 @@ def _fetch_filled_trades(database):
         return [dict(r) for r in cursor.fetchall()]
 
 
+def compute_open_position_cost_basis() -> dict[str, dict]:
+    """Return the FIFO open-position cost basis for every symbol.
+
+    Alpaca's ``avg_entry_price`` for crypto is unreliable (it can average in
+    realized sell prices / mishandle fractional-lot FIFO, producing a wildly
+    wrong cost basis — e.g. SOL showing $46 when the open lots are ~$109). This
+    recomputes the *correct* open cost basis from our own filled trades table
+    using the same canonical FIFO matching as ``compute_closed_round_trips``.
+
+    Returns ``{symbol: {"qty": float, "avg_entry_price": float, "cost_basis": float}}``
+    for symbols with a non-zero open position. ``avg_entry_price`` is the
+    volume-weighted average of the still-open (unmatched) buy lots.
+    """
+    from core import database
+    rows = _memoized(
+        ("trades",),
+        lambda: _fetch_filled_trades(database),
+    )
+
+    buy_queues = defaultdict(list)  # symbol -> list of {qty, price}
+    for r in rows:
+        symbol = _sym(r["symbol"])
+        side = (r["side"] or "").lower()
+        qty = float(r["qty"] or 0.0)
+        price = float(r["filled_avg_price"] or 0.0)
+        if side == "buy":
+            buy_queues[symbol].append({"qty": qty, "price": price})
+        elif side == "sell":
+            temp_qty = qty
+            while temp_qty > 0 and buy_queues.get(symbol):
+                b = buy_queues[symbol][0]
+                matched = min(temp_qty, b["qty"])
+                temp_qty -= matched
+                b["qty"] -= matched
+                if b["qty"] <= 1e-9:
+                    buy_queues[symbol].pop(0)
+
+    result = {}
+    for symbol, lots in buy_queues.items():
+        open_qty = sum(l["qty"] for l in lots)
+        if open_qty <= 1e-9:
+            continue
+        cost = sum(l["qty"] * l["price"] for l in lots)
+        result[symbol] = {
+            "qty": open_qty,
+            "avg_entry_price": cost / open_qty,
+            "cost_basis": cost,
+        }
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Decay weighting
 # ---------------------------------------------------------------------------
