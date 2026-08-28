@@ -88,18 +88,13 @@ def test_open_position_cost_basis_multiple_symbols():
 
 
 def test_override_recomputes_unrealized_pnl():
-    """Verify the override logic in alpaca_client corrects avg_entry + unrealized."""
+    """Verify the override corrects avg_entry + unrealized from broker-order basis."""
     from core.alpaca_client import AlpacaClient
-    init_db()
-    _clean_trades()
-    _clear_memo()
-    # Simulate the SOL scenario: open lots at ~$109, broker wrongly says $46.
-    log_trade(decision_id=1, alpaca_order_id="a1", symbol="SOL/USD",
-              side="buy", qty=12.0, filled_avg_price=109.0, status="filled")
-    log_trade(decision_id=2, alpaca_order_id="a2", symbol="SOL/USD",
-              side="buy", qty=12.0, filled_avg_price=109.0, status="filled")
-
     client = AlpacaClient.__new__(AlpacaClient)  # bypass __init__ (no network)
+    # Stub the order-based cost basis: SOL open 24 @ $109 (correct).
+    client._compute_cost_basis_from_orders = lambda: {
+        "SOL/USD": {"qty": 24.0, "avg_entry_price": 109.0, "cost_basis": 24.0 * 109.0},
+    }
     positions = {
         "SOL/USD": {
             "qty": 24.0,
@@ -114,20 +109,16 @@ def test_override_recomputes_unrealized_pnl():
     # Correct avg entry = $109, correct unrealized = (108-109)*24 = -24
     assert abs(pos["avg_entry_price"] - 109.0) < 1e-6
     assert abs(pos["unrealized_pnl"] - (-24.0)) < 1e-6
-    _clean_trades()
 
 
 def test_override_live_qty_guard():
-    """When DB FIFO qty exceeds live position, cap basis to live qty."""
+    """When order-history FIFO qty exceeds live position, cap basis to live qty."""
     from core.alpaca_client import AlpacaClient
-    init_db()
-    _clean_trades()
-    _clear_memo()
-    # DB says 100 SOL open @ $100 (cost $10,000), but broker only holds 50.
-    log_trade(decision_id=1, alpaca_order_id="a1", symbol="SOL/USD",
-              side="buy", qty=100.0, filled_avg_price=100.0, status="filled")
-
     client = AlpacaClient.__new__(AlpacaClient)
+    # Stub: order history says 100 SOL open @ $100, but broker only holds 50.
+    client._compute_cost_basis_from_orders = lambda: {
+        "SOL/USD": {"qty": 100.0, "avg_entry_price": 100.0, "cost_basis": 100.0 * 100.0},
+    }
     positions = {
         "SOL/USD": {
             "qty": 50.0,
@@ -139,11 +130,26 @@ def test_override_live_qty_guard():
     }
     client._apply_fifo_cost_basis_override(positions)
     pos = positions["SOL/USD"]
-    # avg entry stays $100 (correct per-share basis), but unrealized uses only
-    # the live 50 qty: (110-100)*50 = +500
+    # avg entry stays $100, unrealized uses live 50 qty: (110-100)*50 = +500
     assert abs(pos["avg_entry_price"] - 100.0) < 1e-6
     assert abs(pos["unrealized_pnl"] - 500.0) < 1e-6
-    _clean_trades()
+
+
+def test_cost_basis_from_orders_sorted_fifo():
+    """Order history arrives newest-first; FIFO must process oldest-first."""
+    from core.alpaca_client import AlpacaClient
+    client = AlpacaClient.__new__(AlpacaClient)
+    # get_executed_orders returns newest-first (reverse chronological).
+    client.get_executed_orders = lambda limit=5000: [
+        {"symbol": "SOL/USD", "side": "sell", "qty": 5.0, "filled_avg_price": 120.0, "timestamp": "2026-08-28T12:00"},
+        {"symbol": "SOL/USD", "side": "buy", "qty": 10.0, "filled_avg_price": 110.0, "timestamp": "2026-08-27T12:00"},
+        {"symbol": "SOL/USD", "side": "buy", "qty": 10.0, "filled_avg_price": 100.0, "timestamp": "2026-08-26T12:00"},
+    ]
+    basis = client._compute_cost_basis_from_orders()
+    b = basis["SOL/USD"]
+    # Chronological FIFO: sell 5 consumes 5 of the 10@$100 lot -> open 5@$100 + 10@$110 = 15 @ $106.67
+    assert abs(b["qty"] - 15.0) < 1e-6
+    assert abs(b["avg_entry_price"] - (5 * 100 + 10 * 110) / 15.0) < 1e-6
 
 
 def test_reconcile_backfills_broker_sells():
@@ -203,6 +209,7 @@ if __name__ == "__main__":
         test_open_position_cost_basis_multiple_symbols,
         test_override_recomputes_unrealized_pnl,
         test_override_live_qty_guard,
+        test_cost_basis_from_orders_sorted_fifo,
         test_reconcile_backfills_broker_sells,
         test_reconcile_dedupes_existing_orders,
     ]

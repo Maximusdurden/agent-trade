@@ -237,14 +237,18 @@ class AlpacaClient:
     def _apply_fifo_cost_basis_override(self, positions_dict: dict) -> None:
         """Overwrite crypto positions' avg_entry_price/unrealized_pnl in place.
 
-        Uses ``core.feedback.compute_open_position_cost_basis`` (canonical FIFO
-        from our filled trades) to correct Alpaca's unreliable crypto cost basis.
-        Only symbols present in both the live positions and our FIFO basis are
-        corrected; equity/option positions are left untouched.
+        Alpaca's ``avg_entry_price`` for crypto is unreliable (it can average in
+        realized sell prices / mishandle fractional-lot FIFO, e.g. SOL showing
+        $46 when the true basis is ~$109). We recompute the correct cost basis
+        from **Alpaca's own order history** — which has been verified to be
+        accurate (FIFO comparison matches the live position) — rather than from
+        our DB ``trades`` table, which can drift (missing/duplicated fills).
+
+        Only symbols present in both the live positions and the broker-order
+        FIFO basis are corrected; equity/option positions are left untouched.
         """
         try:
-            from core.feedback import compute_open_position_cost_basis
-            basis = compute_open_position_cost_basis()
+            basis = self._compute_cost_basis_from_orders()
         except Exception as e:
             logger.warning(f"FIFO cost-basis override unavailable: {e}")
             return
@@ -258,24 +262,20 @@ class AlpacaClient:
             live_qty = float(pos.get("qty", 0.0) or 0.0)
             broker_avg = float(pos.get("avg_entry_price", 0.0) or 0.0)
 
-            # Live-qty guard: if the DB FIFO open qty exceeds the actual broker
-            # position, the DB is missing broker-side sells (TP/SL fills, dust
-            # liquidation). Cap the cost basis to the live qty so we don't
-            # attribute PnL to shares the broker no longer holds. The avg entry
-            # price is still taken from the FIFO lots (the correct per-share
-            # basis), but only the live qty's cost is used for unrealized PnL.
+            # Live-qty guard: if the order-history FIFO open qty exceeds the
+            # actual broker position (orders not fully captured), scale the cost
+            # basis to the live qty so we don't attribute PnL to shares the
+            # broker no longer holds.
             if live_qty > 1e-9 and b["qty"] > live_qty + 1e-9:
-                # Scale cost basis proportionally to the live qty.
                 cost_basis = b["cost_basis"] * (live_qty / b["qty"])
                 logger.info(
-                    f"FIFO cost-basis guard for {symbol}: DB open {b['qty']:.4f} "
-                    f"> live {live_qty:.4f}. Capping basis to live qty."
+                    f"FIFO cost-basis guard for {symbol}: order-history open "
+                    f"{b['qty']:.4f} > live {live_qty:.4f}. Capping basis to live qty."
                 )
             else:
                 cost_basis = b["cost_basis"]
 
             avg_entry = b["avg_entry_price"]
-            # Recompute unrealized PnL from the corrected cost basis.
             unrealized = market_value - cost_basis
             pos["avg_entry_price"] = avg_entry
             pos["unrealized_pnl"] = unrealized
@@ -285,52 +285,136 @@ class AlpacaClient:
                 f"unrealized ${unrealized:,.2f}"
             )
 
-    def get_executed_orders(self, limit: int = 50) -> list[dict]:
-        """Fetches recently filled/closed orders directly from Alpaca.
+    def _compute_cost_basis_from_orders(self) -> dict:
+        """Reconstruct open-position cost basis from Alpaca's order history.
 
-        This catches TP/SL bracket fills and broker-side sells that the
-        runner never logged to the local trades table. The dashboard uses
-        this to reconcile what actually happened vs what was locally recorded.
+        FIFO-matches every filled buy/sell order across symbols and returns
+        ``{symbol: {"qty", "avg_entry_price", "cost_basis"}}`` for each symbol
+        with a non-zero open position. This is the authoritative source because
+        Alpaca's order history reproduces the live position (unlike the DB).
+        """
+        from collections import deque
+        orders = self.get_executed_orders(limit=5000)  # paginated full history
+        # Alpaca returns orders newest-first; FIFO matching REQUIRES chronological
+        # (oldest-first) processing, so sort by timestamp ascending.
+        orders = sorted(orders, key=lambda o: o.get("timestamp") or "")
+        buy_queues = {}  # symbol -> deque[(qty, price)]
+        for o in orders:
+            symbol = o.get("symbol")
+            if not symbol:
+                continue
+            side = (o.get("side") or "").lower()
+            try:
+                qty = float(o.get("qty") or 0.0)
+                price = float(o.get("filled_avg_price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            q = buy_queues.setdefault(symbol, deque())
+            if side == "buy":
+                q.append((qty, price))
+            elif side == "sell":
+                rem = qty
+                while rem > 1e-9 and q:
+                    lq, lp = q[0]
+                    if lq <= rem:
+                        rem -= lq
+                        q.popleft()
+                    else:
+                        q[0] = (lq - rem, lp)
+                        rem = 0
+        result = {}
+        for symbol, q in buy_queues.items():
+            open_qty = sum(item_qty for item_qty, _ in q)
+            if open_qty <= 1e-9:
+                continue
+            cost = sum(item_qty * item_price for item_qty, item_price in q)
+            result[symbol] = {
+                "qty": open_qty,
+                "avg_entry_price": cost / open_qty,
+                "cost_basis": cost,
+            }
+        return result
 
-        Duplicate detection happens at the call site (dashboard cache worker)
-        by comparing ``alpaca_order_id`` values.
+    def get_executed_orders(self, limit: int = 200, page_size: int = 2000) -> list[dict]:
+        """Fetches filled/closed orders directly from Alpaca, paginating for full history.
+
+        This catches TP/SL bracket fills and broker-side sells that the runner
+        never logged to the local trades table. It pages through ALL closed
+        orders (using the ``after`` cursor) so even old sells that closed prior
+        positions are captured — otherwise the FIFO cost basis would attribute
+        phantom open positions to the current holdings.
+
+        Duplicate detection happens at the call site (dashboard cache worker /
+        runner reconciliation) by comparing ``alpaca_order_id`` values.
         """
         if self.is_mock:
             return []
 
         try:
-            all_orders = self.trading_client.get_orders(
-                filter=GetOrdersRequest(
-                    status="closed",
-                    limit=limit
-                )
-            )
             executed = []
-            for order in all_orders:
-                if order.filled_at is None:
+            until = None  # ISO timestamp cursor for pagination (go older)
+            # Page backwards through time: fetch the most recent `page_size`
+            # orders, then keep requesting older pages via `until` until we have
+            # `limit` distinct filled orders or exhaust history.
+            while len(executed) < limit:
+                req_kwargs = {
+                    "status": "closed",
+                    "limit": page_size,
+                }
+                if until is not None:
+                    req_kwargs["until"] = until
+                page = self.trading_client.get_orders(
+                    filter=GetOrdersRequest(**req_kwargs)
+                )
+                if not page:
+                    break
+                for order in page:
+                    if order.filled_at is None:
+                        continue
+                    # Map Alpaca's slashless crypto symbol back
+                    sym = (order.symbol or "").upper()
+                    trading_universe = getattr(config, "TRADING_UNIVERSE", [])
+                    for u_symbol in trading_universe:
+                        if "/" in u_symbol and u_symbol.replace("/", "").upper() == sym:
+                            sym = u_symbol
+                            break
+                    else:
+                        if sym.endswith("USD") and len(sym) >= 6 and "/" not in sym:
+                            sym = f"{sym[:-3]}/USD"
+                    executed.append({
+                        "alpaca_order_id": str(order.id),
+                        "timestamp": str(order.filled_at.isoformat()) if hasattr(order.filled_at, "isoformat") else str(order.filled_at),
+                        "symbol": sym,
+                        # Use the enum's .value ("buy"/"sell") — str(OrderSide.BUY)
+                        # is "OrderSide.BUY", which mislabels every order as "sell".
+                        "side": "buy" if (order.side and (getattr(order.side, "value", None) == "buy" or str(order.side).lower() == "buy")) else "sell",
+                        "qty": float(order.filled_qty or order.qty or 0),
+                        "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
+                        "status": str(order.status.value) if hasattr(order.status, "value") else str(order.status),
+                    })
+                if len(page) < page_size:
+                    break  # got the oldest page; no more history
+                # Advance cursor to the oldest filled_at on this page so the next
+                # request returns older orders (via `until`).
+                old_filled = [o.filled_at for o in page if o.filled_at is not None]
+                if not old_filled:
+                    break
+                oldest_filled = min(old_filled)
+                until = oldest_filled.isoformat() if hasattr(oldest_filled, "isoformat") else str(oldest_filled)
+                if len(executed) >= limit:
+                    break
+            # Trim to requested limit, keeping most recent first (dedupe first).
+            seen = set()
+            unique = []
+            for o in executed:
+                if o["alpaca_order_id"] in seen:
                     continue
-                # Map Alpaca's slashless crypto symbol back
-                sym = (order.symbol or "").upper()
-                trading_universe = getattr(config, "TRADING_UNIVERSE", [])
-                for u_symbol in trading_universe:
-                    if "/" in u_symbol and u_symbol.replace("/", "").upper() == sym:
-                        sym = u_symbol
-                        break
-                else:
-                    if sym.endswith("USD") and len(sym) >= 6 and "/" not in sym:
-                        sym = f"{sym[:-3]}/USD"
-                executed.append({
-                    "alpaca_order_id": str(order.id),
-                    "timestamp": str(order.filled_at.isoformat()) if hasattr(order.filled_at, "isoformat") else str(order.filled_at),
-                    "symbol": sym,
-                    # Use the enum's .value ("buy"/"sell") — str(OrderSide.BUY) is
-                    # "OrderSide.BUY", which would mislabel every order as "sell".
-                    "side": "buy" if (order.side and (getattr(order.side, "value", None) == "buy" or str(order.side).lower() == "buy")) else "sell",
-                    "qty": float(order.filled_qty or order.qty or 0),
-                    "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
-                    "status": str(order.status.value) if hasattr(order.status, "value") else str(order.status),
-                })
-            return executed
+                seen.add(o["alpaca_order_id"])
+                unique.append(o)
+            unique.sort(key=lambda o: o["timestamp"], reverse=True)
+            return unique[:limit]
         except Exception as e:
             logger.error(f"Error fetching executed orders from Alpaca: {e}")
             return []
