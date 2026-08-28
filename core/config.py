@@ -68,6 +68,15 @@ VOL_SIZING_MIN_ALLOCATION_PCT = float(os.getenv("VOL_SIZING_MIN_ALLOCATION_PCT",
 # PnL from the DB (FIFO) plus current unrealized PnL from the account.
 INTRADAY_LOSS_LIMIT_PCT = float(os.getenv("INTRADAY_LOSS_LIMIT_PCT", "0.04"))
 INTRADAY_BREAKER_ENABLED = os.getenv("INTRADAY_BREAKER_ENABLED", "true").lower() == "true"
+
+# Intraday VWAP gating
+# VWAP is cumulative within the current trading day. Early in the session there
+# are too few intraday bars for VWAP (and its bands / dist_pct) to be meaningful:
+# with a single bar, vwap == typical_price and vwap_dist_pct collapses to ~0%,
+# which the brain can mistake for "price hugging VWAP" confluence. To avoid this
+# false signal, VWAP-derived fields are exposed as None until the current day has
+# at least MIN_VWAP_BARS intraday bars.
+MIN_VWAP_BARS = int(os.getenv("MIN_VWAP_BARS", "4"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 

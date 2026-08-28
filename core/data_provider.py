@@ -62,6 +62,20 @@ class DataProvider:
             # Calculate Fibonacci, Psychological, and Support/Resistance Pivot levels
             pivots = self._calculate_advanced_pivots(daily_df, float(latest["close"]), symbol)
 
+            # Gate VWAP-derived fields on intraday bar count. VWAP is cumulative
+            # within the current day; with too few bars it is meaningless (a single
+            # bar makes vwap == typical_price and vwap_dist_pct ~0%). Expose None
+            # until the current day has at least MIN_VWAP_BARS bars so the brain
+            # cannot cite VWAP as confluence early in the session.
+            from core import config
+            today_bars = self._count_today_bars(df)
+            vwap_valid = today_bars >= config.MIN_VWAP_BARS
+            if not vwap_valid:
+                logger.info(
+                    f"VWAP gated for {symbol}: only {today_bars} intraday bar(s) today "
+                    f"(need >= {config.MIN_VWAP_BARS}). Exposing VWAP fields as None."
+                )
+
             # Fetch recent news/events
             news_data = []
             try:
@@ -84,12 +98,12 @@ class DataProvider:
                     "macd_hist": float(latest["macd_hist"]) if not pd.isna(latest["macd_hist"]) else None,
                     "bollinger_upper": float(latest["bollinger_upper"]) if not pd.isna(latest["bollinger_upper"]) else None,
                     "bollinger_lower": float(latest["bollinger_lower"]) if not pd.isna(latest["bollinger_lower"]) else None,
-                    "vwap": float(latest["vwap"]) if not pd.isna(latest["vwap"]) else None,
-                    "vwap_upper_1": float(latest["vwap_upper_1"]) if not pd.isna(latest["vwap_upper_1"]) else None,
-                    "vwap_lower_1": float(latest["vwap_lower_1"]) if not pd.isna(latest["vwap_lower_1"]) else None,
-                    "vwap_upper_2": float(latest["vwap_upper_2"]) if not pd.isna(latest["vwap_upper_2"]) else None,
-                    "vwap_lower_2": float(latest["vwap_lower_2"]) if not pd.isna(latest["vwap_lower_2"]) else None,
-                    "vwap_dist_pct": float(latest["vwap_dist_pct"]) if not pd.isna(latest["vwap_dist_pct"]) else None,
+                    "vwap": float(latest["vwap"]) if (vwap_valid and not pd.isna(latest["vwap"])) else None,
+                    "vwap_upper_1": float(latest["vwap_upper_1"]) if (vwap_valid and not pd.isna(latest["vwap_upper_1"])) else None,
+                    "vwap_lower_1": float(latest["vwap_lower_1"]) if (vwap_valid and not pd.isna(latest["vwap_lower_1"])) else None,
+                    "vwap_upper_2": float(latest["vwap_upper_2"]) if (vwap_valid and not pd.isna(latest["vwap_upper_2"])) else None,
+                    "vwap_lower_2": float(latest["vwap_lower_2"]) if (vwap_valid and not pd.isna(latest["vwap_lower_2"])) else None,
+                    "vwap_dist_pct": float(latest["vwap_dist_pct"]) if (vwap_valid and not pd.isna(latest["vwap_dist_pct"])) else None,
                     "atr_14": float(latest["atr_14"]) if not pd.isna(latest["atr_14"]) else None,
                     "atr_pct": float(latest["atr_pct"]) if not pd.isna(latest["atr_pct"]) else None,
                 },
@@ -179,6 +193,29 @@ class DataProvider:
         df["vwap_dist_pct"] = ((df["close"] - df["vwap"]) / np.where(df["vwap"] == 0, 0.00001, df["vwap"])) * 100
         
         return df
+
+    def _count_today_bars(self, df: pd.DataFrame) -> int:
+        """Count how many intraday bars fall on the latest trading day in df.
+
+        VWAP is cumulative within a single day, so its value (and bands /
+        dist_pct) is only meaningful once enough bars have accumulated. With a
+        single bar, vwap == typical_price and vwap_dist_pct collapses to ~0%,
+        which the brain can mistake for "price hugging VWAP" confluence. This
+        helper returns the number of bars on the most recent day so callers can
+        gate VWAP-derived fields.
+        """
+        if df is None or df.empty:
+            return 0
+        if isinstance(df.index, pd.MultiIndex):
+            # Multi-symbol frame: use the last symbol's level-1 timestamps.
+            last_sym = df.index.get_level_values(0)[-1]
+            idx = df.index.get_level_values(1)[df.index.get_level_values(0) == last_sym]
+        else:
+            idx = df.index
+        if not hasattr(idx, "date"):
+            return 0
+        latest_date = idx[-1].date()
+        return int((idx.date == latest_date).sum())
 
     def _calculate_advanced_pivots(self, daily_df: pd.DataFrame, current_price: float, symbol: str) -> dict:
         """
