@@ -6,7 +6,7 @@ os.environ["DATABASE_FILENAME"] = "test_cost_basis.db"
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from core.database import init_db, log_trade
+from core.database import init_db, log_trade, reconcile_broker_orders
 from core.feedback import compute_open_position_cost_basis, _memo
 
 
@@ -117,6 +117,84 @@ def test_override_recomputes_unrealized_pnl():
     _clean_trades()
 
 
+def test_override_live_qty_guard():
+    """When DB FIFO qty exceeds live position, cap basis to live qty."""
+    from core.alpaca_client import AlpacaClient
+    init_db()
+    _clean_trades()
+    _clear_memo()
+    # DB says 100 SOL open @ $100 (cost $10,000), but broker only holds 50.
+    log_trade(decision_id=1, alpaca_order_id="a1", symbol="SOL/USD",
+              side="buy", qty=100.0, filled_avg_price=100.0, status="filled")
+
+    client = AlpacaClient.__new__(AlpacaClient)
+    positions = {
+        "SOL/USD": {
+            "qty": 50.0,
+            "qty_available": 50.0,
+            "market_value": 50.0 * 110.0,  # current price $110
+            "avg_entry_price": 46.0,
+            "unrealized_pnl": (110.0 - 46.0) * 50.0,
+        }
+    }
+    client._apply_fifo_cost_basis_override(positions)
+    pos = positions["SOL/USD"]
+    # avg entry stays $100 (correct per-share basis), but unrealized uses only
+    # the live 50 qty: (110-100)*50 = +500
+    assert abs(pos["avg_entry_price"] - 100.0) < 1e-6
+    assert abs(pos["unrealized_pnl"] - 500.0) < 1e-6
+    _clean_trades()
+
+
+def test_reconcile_backfills_broker_sells():
+    init_db()
+    _clean_trades()
+    _clear_memo()
+    # DB has a buy, but broker also executed a sell (TP/SL fill) not in DB.
+    log_trade(decision_id=1, alpaca_order_id="a1", symbol="SOL/USD",
+              side="buy", qty=100.0, filled_avg_price=100.0, status="filled")
+    broker_orders = [
+        {
+            "alpaca_order_id": "broker-sell-1",
+            "timestamp": "2026-08-28T12:00:00+00:00",
+            "symbol": "SOL/USD",
+            "side": "sell",
+            "qty": 50.0,
+            "filled_avg_price": 120.0,
+            "status": "filled",
+        }
+    ]
+    inserted = reconcile_broker_orders(broker_orders)
+    assert inserted == 1
+    # Now FIFO open should be 50 @ $100 (100 bought - 50 sold)
+    _clear_memo()
+    basis = compute_open_position_cost_basis()
+    b = basis["SOL/USD"]
+    assert abs(b["qty"] - 50.0) < 1e-6
+    assert abs(b["avg_entry_price"] - 100.0) < 1e-6
+    _clean_trades()
+
+
+def test_reconcile_dedupes_existing_orders():
+    init_db()
+    _clean_trades()
+    _clear_memo()
+    log_trade(decision_id=1, alpaca_order_id="a1", symbol="SOL/USD",
+              side="buy", qty=100.0, filled_avg_price=100.0, status="filled")
+    broker_orders = [
+        {"alpaca_order_id": "a1", "timestamp": "2026-08-28T12:00:00+00:00",
+         "symbol": "SOL/USD", "side": "buy", "qty": 100.0,
+         "filled_avg_price": 100.0, "status": "filled"},
+        {"alpaca_order_id": "broker-sell-1", "timestamp": "2026-08-28T12:00:00+00:00",
+         "symbol": "SOL/USD", "side": "sell", "qty": 50.0,
+         "filled_avg_price": 120.0, "status": "filled"},
+    ]
+    inserted = reconcile_broker_orders(broker_orders)
+    # a1 already exists (deduped), only broker-sell-1 is new
+    assert inserted == 1
+    _clean_trades()
+
+
 if __name__ == "__main__":
     tests = [
         test_open_position_cost_basis_simple,
@@ -124,6 +202,9 @@ if __name__ == "__main__":
         test_open_position_cost_basis_full_close_absent,
         test_open_position_cost_basis_multiple_symbols,
         test_override_recomputes_unrealized_pnl,
+        test_override_live_qty_guard,
+        test_reconcile_backfills_broker_sells,
+        test_reconcile_dedupes_existing_orders,
     ]
     failed = 0
     for fn in tests:

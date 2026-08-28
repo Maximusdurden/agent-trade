@@ -271,6 +271,56 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
         conn.commit()
         return get_last_insert_id(cursor)
 
+
+def reconcile_broker_orders(broker_orders: list[dict]) -> int:
+    """Backfill broker-side fills into the trades table.
+
+    The runner only logs trades it executes itself. Broker-side sells — TP/SL
+    bracket fills, dust liquidation, manual closes — never reach the DB, so the
+    FIFO cost basis (core.feedback) diverges from the real broker position. This
+    inserts any broker order not already present (deduped by alpaca_order_id),
+    preserving the broker's actual fill timestamp.
+
+    Args:
+        broker_orders: list of dicts from AlpacaClient.get_executed_orders()
+            (each with alpaca_order_id, timestamp, symbol, side, qty,
+             filled_avg_price, status).
+
+    Returns:
+        Number of new trades inserted.
+    """
+    if not broker_orders:
+        return 0
+    inserted = 0
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT alpaca_order_id FROM trades WHERE alpaca_order_id IS NOT NULL")
+        existing = {r["alpaca_order_id"] for r in cursor.fetchall()}
+        for order in broker_orders:
+            oid = order.get("alpaca_order_id")
+            if not oid or oid in existing:
+                continue
+            ts = order.get("timestamp") or datetime.utcnow().isoformat()
+            cursor.execute("""
+                INSERT INTO trades (
+                    decision_id, alpaca_order_id, timestamp, symbol, side, qty,
+                    filled_avg_price, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                None,
+                oid,
+                ts,
+                str(order.get("symbol", "")).upper(),
+                str(order.get("side", "")).lower(),
+                float(order.get("qty", 0.0) or 0.0),
+                float(order.get("filled_avg_price")) if order.get("filled_avg_price") is not None else None,
+                str(order.get("status", "filled")).lower(),
+            ))
+            existing.add(oid)
+            inserted += 1
+        conn.commit()
+    return inserted
+
 def log_execution(decision_id: int | None, attempt: int, symbol: str, side: str,
                   qty: float, order_type: str | None, status: str,
                   error: str | None = None, alpaca_order_id: str | None = None,
@@ -728,6 +778,9 @@ class Database:
 
     def log_execution(self, **kwargs) -> int:
         return log_execution(**kwargs)
+
+    def reconcile_broker_orders(self, broker_orders: list[dict]) -> int:
+        return reconcile_broker_orders(broker_orders)
 
     def get_executions(self, limit: int = 50) -> list[dict]:
         return get_executions(limit)

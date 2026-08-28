@@ -255,10 +255,28 @@ class AlpacaClient:
             if b["qty"] <= 1e-9:
                 continue
             market_value = float(pos.get("market_value", 0.0) or 0.0)
-            avg_entry = b["avg_entry_price"]
+            live_qty = float(pos.get("qty", 0.0) or 0.0)
             broker_avg = float(pos.get("avg_entry_price", 0.0) or 0.0)
+
+            # Live-qty guard: if the DB FIFO open qty exceeds the actual broker
+            # position, the DB is missing broker-side sells (TP/SL fills, dust
+            # liquidation). Cap the cost basis to the live qty so we don't
+            # attribute PnL to shares the broker no longer holds. The avg entry
+            # price is still taken from the FIFO lots (the correct per-share
+            # basis), but only the live qty's cost is used for unrealized PnL.
+            if live_qty > 1e-9 and b["qty"] > live_qty + 1e-9:
+                # Scale cost basis proportionally to the live qty.
+                cost_basis = b["cost_basis"] * (live_qty / b["qty"])
+                logger.info(
+                    f"FIFO cost-basis guard for {symbol}: DB open {b['qty']:.4f} "
+                    f"> live {live_qty:.4f}. Capping basis to live qty."
+                )
+            else:
+                cost_basis = b["cost_basis"]
+
+            avg_entry = b["avg_entry_price"]
             # Recompute unrealized PnL from the corrected cost basis.
-            unrealized = market_value - b["cost_basis"]
+            unrealized = market_value - cost_basis
             pos["avg_entry_price"] = avg_entry
             pos["unrealized_pnl"] = unrealized
             logger.info(

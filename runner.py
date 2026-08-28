@@ -311,6 +311,20 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         logger.error(f"Error fetching positions: {e}. Proceeding with assumptions.")
         positions = {}
 
+    # 2a. Reconcile broker-side fills into the DB. The runner only logs trades it
+    #     executes itself; TP/SL bracket fills, dust liquidation, and manual
+    #     closes never reach the trades table, so the FIFO cost basis diverges
+    #     from the real broker position. Backfill any broker order not already
+    #     present (deduped by alpaca_order_id) so cost basis matches reality.
+    if not alpaca_client.is_mock:
+        try:
+            broker_orders = alpaca_client.get_executed_orders(limit=200)
+            inserted = database.reconcile_broker_orders(broker_orders)
+            if inserted:
+                logger.info(f"Reconciled {inserted} broker-side fill(s) into trades table.")
+        except Exception as rec_err:
+            logger.warning(f"Broker-order reconciliation failed (non-fatal): {rec_err}")
+
     # Define weekend check parameters
     weekday = now_et.weekday()
     is_weekend_hours = False
