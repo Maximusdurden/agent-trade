@@ -190,7 +190,19 @@ class RiskGuardrails:
         # 1b. Per-cycle trade cap
         max_trades = int(getattr(config, "MAX_TRADES_PER_CYCLE", 1))
         trades_so_far = int(cycle_context.get("trades", 0))
-        if action in ("BUY", "SELL") and proposed_qty > 0 and trades_so_far >= max_trades:
+        # A SELL that reduces an existing held position is an EXIT (risk
+        # reduction), not new risk-taking. Exempt it from the per-cycle cap so a
+        # single executed trade earlier in the cycle can never block a needed
+        # de-risk/exit. BUYs (and SELLs that open a position we don't hold, e.g.
+        # a short) still count against the cap.
+        held_qty = 0.0
+        if action == "SELL":
+            held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+            if isinstance(held, dict):
+                held_qty = float(held.get("qty", 0.0) or 0.0)
+        is_exit_sell = action == "SELL" and held_qty > 0 and proposed_qty > 0
+        if (action in ("BUY", "SELL") and proposed_qty > 0 and not is_exit_sell
+                and trades_so_far >= max_trades):
             adjusted_decision["quantity"] = 0.0
             return False, (f"Rejected: Per-cycle trade cap reached ({trades_so_far} >= "
                            f"MAX_TRADES_PER_CYCLE {max_trades}). No more executable trades this cycle."), adjusted_decision

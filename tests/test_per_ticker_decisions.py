@@ -104,6 +104,65 @@ class TestCycleBudget(unittest.TestCase):
             config.MAX_TRADES_PER_CYCLE = old
             config.OPTIONS_ENABLED = old_opts
 
+    def test_exit_sell_bypasses_per_cycle_cap(self):
+        """A SELL that reduces an existing held position must NOT be blocked by
+        MAX_TRADES_PER_CYCLE, even after another trade already executed."""
+        g = self._make_guardrails()
+        self._mock_open(g)
+        old = config.MAX_TRADES_PER_CYCLE
+        old_opts = config.OPTIONS_ENABLED
+        config.MAX_TRADES_PER_CYCLE = 1
+        config.OPTIONS_ENABLED = False
+        try:
+            # Cap already reached by a prior trade this cycle.
+            cycle_context = {"spent": 0.0, "trades": 1}
+            # We hold SOL/USD -> SELL is an exit and must be approved.
+            positions = {"SOL/USD": {"qty": 14.0, "qty_available": 14.0}}
+            decision = {
+                "action": "SELL", "symbol": "SOL/USD", "quantity": 14.0,
+                "current_price": 103.0, "conviction": 0.6, "direction": "bearish",
+            }
+            ok, msg, adj = g.validate_and_adjust_decision(
+                decision, {"equity": 100000.0, "cash": 50000.0}, positions,
+                cycle_context=cycle_context)
+            self.assertTrue(ok, msg)
+            self.assertNotEqual(adj["quantity"], 0.0)
+
+            # A BUY at the cap must still be rejected.
+            ok2, msg2, adj2 = self._buy(g, "NVDA", 5.0, 100.0, cycle_context)
+            self.assertFalse(ok2)
+            self.assertIn("MAX_TRADES_PER_CYCLE", msg2)
+            self.assertEqual(adj2["quantity"], 0.0)
+        finally:
+            config.MAX_TRADES_PER_CYCLE = old
+            config.OPTIONS_ENABLED = old_opts
+
+    def test_sell_without_holding_still_capped(self):
+        """A SELL on a symbol we do NOT hold (e.g. opening a short) is NOT an
+        exit and must still count against the per-cycle cap."""
+        g = self._make_guardrails()
+        self._mock_open(g)
+        old = config.MAX_TRADES_PER_CYCLE
+        old_opts = config.OPTIONS_ENABLED
+        config.MAX_TRADES_PER_CYCLE = 1
+        config.OPTIONS_ENABLED = False
+        try:
+            cycle_context = {"spent": 0.0, "trades": 1}
+            # No position held for BTC/USD -> SELL is not an exit.
+            decision = {
+                "action": "SELL", "symbol": "BTC/USD", "quantity": 1.0,
+                "current_price": 77000.0, "conviction": 0.6, "direction": "bearish",
+            }
+            ok, msg, adj = g.validate_and_adjust_decision(
+                decision, {"equity": 100000.0, "cash": 50000.0}, {},
+                cycle_context=cycle_context)
+            self.assertFalse(ok)
+            self.assertIn("MAX_TRADES_PER_CYCLE", msg)
+            self.assertEqual(adj["quantity"], 0.0)
+        finally:
+            config.MAX_TRADES_PER_CYCLE = old
+            config.OPTIONS_ENABLED = old_opts
+
     def test_cumulative_cycle_budget(self):
         g = self._make_guardrails()
         self._mock_open(g)
