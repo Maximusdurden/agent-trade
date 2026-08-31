@@ -436,7 +436,10 @@ Generate your trade decision JSON:
                     "action": "BUY", "symbol": symbol, "quantity": float(qty),
                     "take_profit_price": float(round(current_price * 1.05, 2)),
                     "stop_loss_price": float(round(current_price * 0.97, 2)),
-                    "direction": "bullish", "conviction": 0.7,
+                    # The rule-based fallback is a SHARES-ONLY safety net. Keep
+                    # conviction below OPTIONS_CONVICTION_THRESHOLD (0.7) so the
+                    # guardrail never routes a fallback BUY to options leverage.
+                    "direction": "bullish", "conviction": 0.6,
                 })
             elif rsi > 62 and symbol in positions:
                 owned_qty = positions[symbol]["qty"]

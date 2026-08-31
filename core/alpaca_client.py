@@ -255,6 +255,13 @@ class AlpacaClient:
         for symbol, pos in positions_dict.items():
             if symbol not in basis:
                 continue
+            # NEVER override option positions: the FIFO cost-basis reconstruction
+            # treats qty as shares (cost_basis = qty * price), but option cost
+            # basis must include the 100x contract multiplier. Applying it here
+            # corrupts option unrealized PnL (e.g. market_value - qty*price).
+            # Alpaca's own unrealized_pl for options is authoritative.
+            if self.is_option_symbol(symbol):
+                continue
             b = basis[symbol]
             if b["qty"] <= 1e-9:
                 continue
