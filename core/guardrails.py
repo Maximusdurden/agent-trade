@@ -211,12 +211,16 @@ class RiskGuardrails:
         if action not in ("BUY", "SELL"):
             return False, f"Rejected: Unknown action '{action}'. Only BUY, SELL, or HOLD are permitted.", adjusted_decision
 
-        # 2b. Resolve instrument (stock vs option) via the conviction-threshold rule.
-        # The agent expresses a directional view + conviction. A deterministic rule
-        # decides whether this decision is expressed via options (leverage) or shares.
-        # This prevents stock<->option whipsaw on the same underlying.
-        # NOTE: This guardrail only routes NEW option BUYs. Existing option positions
-        # (SELL) are detected separately below by their OCC symbol.
+        # 2b. Resolve instrument (stock vs option).
+        # The agent now outputs an EXPLICIT instrument intent ("stock"/"option")
+        # alongside its directional view + conviction. This guardrail RESPECTS
+        # the model's stated intent, using conviction as a GATE (not a forced
+        # route): options are only used when the model explicitly said "option"
+        # AND conviction >= threshold. This prevents stock<->option whipsaw AND
+        # prevents a "moderate, I'll buy shares" decision from being silently
+        # converted into an option contract.
+        # NOTE: This guardrail only routes NEW option BUYs. Existing option
+        # positions (SELL) are detected separately below by their OCC symbol.
         instrument = None
         if is_occ_symbol(symbol):
             instrument = "option"  # closing an existing option position
@@ -225,13 +229,19 @@ class RiskGuardrails:
             options_on = getattr(config, "OPTIONS_ENABLED", False)
             in_universe = symbol.upper() in set(getattr(config, "OPTIONS_UNIVERSE", []))
             threshold = float(getattr(config, "OPTIONS_CONVICTION_THRESHOLD", 0.7))
-            # Direction must support a leveraged long (bullish -> call). For a buy,
-            # options leverage only applies to bullish calls (we only do long calls/puts).
+            # Model's explicit instrument intent (empty/none -> default stock).
+            requested = str(decision.get("instrument", "") or "").lower().strip()
+            # Direction must support a leveraged long (bullish -> call, bearish -> put).
             direction = str(decision.get("direction", "neutral")).lower()
-            if options_on and in_universe and conviction >= threshold and direction in ("bullish", "bearish"):
+            opts_requested = (requested == "option")
+            opts_eligible = (options_on and in_universe
+                             and conviction >= threshold
+                             and direction in ("bullish", "bearish"))
+            if opts_eligible and opts_requested:
                 instrument = "option"
                 adjusted_decision["instrument"] = "option"
             else:
+                instrument = "stock"
                 adjusted_decision["instrument"] = "stock"
         else:
             adjusted_decision["instrument"] = "stock"

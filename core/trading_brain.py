@@ -19,11 +19,16 @@ if GENAI_AVAILABLE:
         take_profit_price: float | None = Field(default=None, description="Propose a dynamic take-profit target price for BUY actions on equities/non-crypto assets based on Fibonacci or psychological levels; null otherwise.")
         stop_loss_price: float | None = Field(default=None, description="Propose a dynamic stop-loss price for BUY actions on equities/non-crypto assets based on Fibonacci or psychological levels; null otherwise.")
         # --- Conviction-threshold model (options-aware) ---
-        # The agent expresses a directional view + conviction score. It does NOT
-        # choose the instrument (stock vs option) directly — a deterministic rule
-        # maps conviction -> instrument. This prevents stock<->option whipsaw.
+        # The agent expresses a directional view + conviction score AND an
+        # explicit instrument intent ("stock" vs "option"). The guardrail
+        # respects the model's instrument choice, using conviction as a GATE:
+        # options are only allowed when `instrument == "option"` AND conviction
+        # >= threshold. This prevents stock<->option whipsaw while honoring the
+        # model's stated intent (e.g. a "moderate, buy shares" stance cannot be
+        # silently converted into an option contract).
         direction: str = Field(default="neutral", description="Directional view for the symbol: 'bullish', 'bearish', or 'neutral'. This expresses market view, not an instrument choice.")
-        conviction: float = Field(default=0.0, description="Conviction score 0.0-1.0 indicating how strongly you believe in the direction. High conviction (>= config threshold) may be expressed via options for leverage; lower conviction via shares.")
+        conviction: float = Field(default=0.0, description="Conviction score 0.0-1.0 indicating how strongly you believe in the direction. High conviction (>= config threshold) is REQUIRED to route to options for leverage; lower conviction routes to shares.")
+        instrument: str | None = Field(default=None, description="The instrument you intend to trade. 'option' to use options leverage (long call if bullish, long put if bearish), 'stock' to trade shares/spot, 'neutral' or null when holding or instrument is irrelevant. Default 'stock'.")
         option_dte_min: int | None = Field(default=None, description="Optional requested minimum days-to-expiry for an option (overrides the default window within hard safety bounds). Null to use the configured default.")
         option_dte_max: int | None = Field(default=None, description="Optional requested maximum days-to-expiry for an option (overrides the default window within hard safety bounds). Null to use the configured default.")
         option_strike_otm_pct: float | None = Field(default=None, description="Optional requested OTM% for strike selection (e.g. 0.05 = 5% out-of-the-money). Null to use the configured default.")
@@ -116,6 +121,13 @@ class TradingBrain:
         except (TypeError, ValueError):
             decision["conviction"] = 0.0
         decision["conviction"] = max(0.0, min(1.0, decision["conviction"]))
+
+        # Normalize explicit instrument intent: "option"/"stock"/"neutral" (default stock).
+        instrument = str(decision.get("instrument", "") or "").lower().strip()
+        if instrument not in ("option", "stock", "neutral"):
+            instrument = ""
+        decision["instrument"] = instrument
+
         for f in ("option_dte_min", "option_dte_max", "option_strike_otm_pct"):
             v = decision.get(f)
             decision[f] = float(v) if v is not None else None
@@ -304,13 +316,13 @@ Ticker: {symbol}
             universe_str = " | ".join(f'"{s}"' for s in getattr(config, "OPTIONS_UNIVERSE", []))
             options_instructions = f"""
         OPTIONS-ENABLED RULES (LONG CALLS & PUTS ONLY):
-        1. You express a DIRECTIONAL VIEW + CONVICTION score. You do NOT choose the instrument.
-        2. Output "direction": "bullish"/"bearish"/"neutral" and "conviction": 0.0-1.0.
-        3. High conviction (>= {config.OPTIONS_CONVICTION_THRESHOLD}) on a symbol in the options universe may be expressed via options (leverage). Lower conviction uses shares.
-        4. If conviction is high and the symbol is in the options universe, you may optionally request a specific DTE range via "option_dte_min" / "option_dte_max" (default {config.OPTIONS_DTE_MIN}-{config.OPTIONS_DTE_MAX} days) and OTM% via "option_strike_otm_pct".
+        1. You express a DIRECTIONAL VIEW + CONVICTION score AND an explicit "instrument" choice ("stock" or "option").
+        2. Output "direction": "bullish"/"bearish"/"neutral", "conviction": 0.0-1.0, and "instrument": "stock"/"option"/"neutral".
+        3. ROUTING: Options leverage may ONLY be used when BOTH (a) your "instrument" is "option" AND (b) your conviction is >= {config.OPTIONS_CONVICTION_THRESHOLD}. If you intend shares, set "instrument": "stock" regardless of conviction. If you do NOT intend options, do NOT set instrument to "option".
+        4. If "instrument" is "option" and the symbol is in the options universe, you may optionally request a specific DTE range via "option_dte_min" / "option_dte_max" (default {config.OPTIONS_DTE_MIN}-{config.OPTIONS_DTE_MAX} days) and OTM% via "option_strike_otm_pct".
         5. OPTIONS UNIVERSE: {universe_str}. Only symbols in this set are eligible for options.
         6. For a SELL of an existing option position, set direction opposite your view and keep conviction high; the executor sells the held contracts (never go short).
-        7. NARRATION: In "thought_process", always explicitly explain WHY you chose your conviction level and, for an options-universe symbol, whether you are leaning toward shares vs options (leverage) and why (e.g. trend strength, DTE compatibility, risk appetite). Be specific — mention the actual conviction number you are assigning and the stock-vs-option intent.
+        7. NARRATION: In "thought_process", always explicitly explain WHY you chose your instrument ("stock" vs "option") and conviction. State the exact "instrument" value you are outputting and the conviction number. If you set "instrument": "stock", STATE THAT CLEARLY — the system WILL respect your stock intent and buy shares.
         """
         
         # Add crypto-specific instructions to the system prompt
@@ -363,6 +375,7 @@ JSON Schema:
       "stop_loss_price": float or null,
       "direction": "bullish" or "bearish" or "neutral",
       "conviction": float 0.0-1.0,
+      "instrument": "stock" or "option" or "neutral" (your explicit intent; default stock),
       "option_dte_min": integer or null,
       "option_dte_max": integer or null,
       "option_strike_otm_pct": float or null

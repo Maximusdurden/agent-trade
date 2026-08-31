@@ -58,7 +58,8 @@ class TestGuardrailOptionsKillSwitch(unittest.TestCase):
     def _option_buy_decision(self):
         return {
             "action": "BUY", "symbol": "AAPL", "quantity": 2.0,
-            "conviction": 0.8, "direction": "bullish", "current_price": 100.0,
+            "conviction": 0.8, "direction": "bullish", "instrument": "option",
+            "current_price": 100.0,
         }
 
     def _option_sell_decision(self):
