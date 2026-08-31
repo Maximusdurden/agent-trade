@@ -138,7 +138,8 @@ class TradingBrain:
                 result = self.llm_client.generate_structured(
                     prompt=prompt,
                     response_model=TradingDecisionSet,
-                    tier=config.BRAIN_MODEL_TIER
+                    tier=config.BRAIN_MODEL_TIER,
+                    max_output_tokens=config.BRAIN_MAX_OUTPUT_TOKENS
                 )
                 raw_decisions = result.get("decisions", []) if isinstance(result, dict) else []
                 decisions = [self._normalize_decision(d) for d in raw_decisions if isinstance(d, dict)]

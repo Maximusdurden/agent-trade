@@ -79,6 +79,11 @@ INTRADAY_BREAKER_ENABLED = os.getenv("INTRADAY_BREAKER_ENABLED", "true").lower()
 MIN_VWAP_BARS = int(os.getenv("MIN_VWAP_BARS", "4"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
+# Max output tokens for the brain's per-ticker decision JSON. The brain emits one
+# verbose decision (with a long thought_process) per appraised ticker, so the
+# default 2048-token cap truncates the JSON mid-response and forces a rule-based
+# fallback. Bump this well above the expected response size.
+BRAIN_MAX_OUTPUT_TOKENS = int(os.getenv("BRAIN_MAX_OUTPUT_TOKENS", "8192"))
 
 # Options Trading Configuration
 # Kill-switch: when False, the brain never outputs option decisions and guardrails reject them.

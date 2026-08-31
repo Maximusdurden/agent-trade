@@ -304,16 +304,32 @@ class SharedLLMClient:
         # Sanitize control characters (except \t, \n, \r)
         cleaned_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned_text)
         
-        # Validate JSON structure with more robust extraction
+        # Validate JSON structure with more robust extraction.
+        # The brace-matching below is STRING-AWARE: braces inside quoted string
+        # values (e.g. a thought_process containing "{" or "}") must not be
+        # counted as structural delimiters, otherwise a perfectly valid response
+        # is misdetected as unbalanced and we fall back to rule-based trading.
         json_str = cleaned_text
-        
+
         # Try to find the outermost JSON object
         stack = []
         start_idx = -1
         end_idx = -1
-        
+        in_string = False
+        escaped = False
+
         for i, char in enumerate(json_str):
-            if char == '{':
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == '{':
                 if not stack:
                     start_idx = i
                 stack.append(char)
