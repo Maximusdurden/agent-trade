@@ -49,6 +49,31 @@ class TestBrainEmitsList(unittest.TestCase):
             self.assertIn("conviction", d)
             self.assertIn("action", d)
 
+    def test_mock_brain_never_buys(self):
+        """The rule-based fallback is a SELL/HOLD-only safety net. It must never
+        emit a BUY (which could be routed to an option contract when the LLM is
+        unavailable). Oversold symbols HOLD; overbought held symbols SELL."""
+        brain = self._make_brain()
+        market_states = [
+            # Oversold (would have bought before) -> must HOLD
+            {"symbol": "NVDA", "current_price": 100.0,
+             "indicators": {"rsi_14": 30.0}, "daily_return_pct": 0.01},
+            # Overbought + held -> SELL (de-risk)
+            {"symbol": "TSLA", "current_price": 200.0,
+             "indicators": {"rsi_14": 80.0}, "daily_return_pct": 0.02},
+            # Overbought but NOT held -> HOLD (can't sell what we don't own)
+            {"symbol": "AAPL", "current_price": 150.0,
+             "indicators": {"rsi_14": 75.0}, "daily_return_pct": 0.0},
+        ]
+        positions = {"TSLA": {"qty": 10.0}}
+        decisions = brain._make_mock_decision(market_states, {"equity": 100000.0, "cash": 50000.0}, positions)
+        actions = {d["symbol"].upper(): d["action"] for d in decisions}
+        self.assertEqual(actions["NVDA"], "HOLD")   # oversold, never buys
+        self.assertEqual(actions["TSLA"], "SELL")   # overbought + held
+        self.assertEqual(actions["AAPL"], "HOLD")   # overbought but not held
+        for d in decisions:
+            self.assertNotEqual(d["action"], "BUY")  # fallback can NEVER buy
+
     def test_make_decision_coerces_to_list(self):
         brain = self._make_brain()
         # Mock returns a list; make_decision should pass it through as a list.

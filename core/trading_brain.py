@@ -394,18 +394,20 @@ Generate your trade decision JSON:
         return prompt
 
     def _make_mock_decision(self, market_data_list: list[dict], account_state: dict, positions: dict) -> dict:
-        """Fallback rule-based trading agent (useful for testing or if LLM config is missing)."""
+        """Fallback rule-based trading agent (useful for testing or if LLM config is missing).
+
+        The fallback is a CONSERVATIVE safety net: it NEVER opens new positions
+        (no BUYs, no options). It only SELLs to de-risk an existing overbought
+        holding, or HOLDs. This guarantees the fallback can never take on new
+        risk (e.g. buying an option contract) when the LLM is unavailable.
+        """
         logger.info("Running rule-based strategy fallback.")
-        
+
         # Simple rule-based strategy:
-        # - RSI < 42 -> BUY a small position (oversold)
-        # - RSI > 62 and owned -> SELL half (overbought)
-        # - otherwise -> HOLD
+        # - RSI > 62 and owned -> SELL half (overbought, de-risk)
+        # - otherwise -> HOLD (never BUY)
         # Emits a LIST of per-ticker decisions (Option B).
         decisions = []
-        equity = account_state.get("equity", 100000.0)
-        cash_balance = account_state.get("cash", 0.0)
-        min_cash_buffer = equity * config.MIN_CASH_BUFFER_PCT
 
         for data in market_data_list:
             if not data:
@@ -420,28 +422,7 @@ Generate your trade decision JSON:
             direction = "neutral"
             conviction = 0.5
 
-            if rsi < 42:
-                # Buy signal
-                qty = max(1.0, int((equity * 0.05) // current_price))
-                if cash_balance < min_cash_buffer:
-                    decisions.append({
-                        "thought_process": f"[Rule Fallback] Skipped BUY {symbol}: cash (${cash_balance:,.2f}) below buffer.",
-                        "action": "HOLD", "symbol": symbol, "quantity": 0.0,
-                        "take_profit_price": None, "stop_loss_price": None,
-                        "direction": "neutral", "conviction": 0.4,
-                    })
-                    continue
-                decisions.append({
-                    "thought_process": f"[Rule Fallback] {symbol} RSI is oversold ({rsi:.1f}). Buying {qty} shares.",
-                    "action": "BUY", "symbol": symbol, "quantity": float(qty),
-                    "take_profit_price": float(round(current_price * 1.05, 2)),
-                    "stop_loss_price": float(round(current_price * 0.97, 2)),
-                    # The rule-based fallback is a SHARES-ONLY safety net. Keep
-                    # conviction below OPTIONS_CONVICTION_THRESHOLD (0.7) so the
-                    # guardrail never routes a fallback BUY to options leverage.
-                    "direction": "bullish", "conviction": 0.6,
-                })
-            elif rsi > 62 and symbol in positions:
+            if rsi > 62 and symbol in positions:
                 owned_qty = positions[symbol]["qty"]
                 qty = max(1.0, int(owned_qty * 0.5))  # sell half
                 decisions.append({
@@ -451,6 +432,8 @@ Generate your trade decision JSON:
                     "direction": "bearish", "conviction": 0.6,
                 })
             else:
+                # The fallback NEVER buys. Oversold is a HOLD, not a BUY, so the
+                # fallback can never open a new position (or an option contract).
                 decisions.append({
                     "thought_process": f"[Rule Fallback] {symbol} has no clear signal (RSI {rsi:.1f}). Holding.",
                     "action": "HOLD", "symbol": symbol, "quantity": 0.0,
