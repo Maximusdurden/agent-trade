@@ -293,3 +293,101 @@ def set_kill_switch_state(status: str, updated_by: str = "system") -> bool:
         logger.error(f"Failed to upload kill_switch.json to GCS: {e}")
         return False
 
+
+# ---------------------------------------------------------------------------
+# OPTIONS KILL SWITCH
+# A dedicated, independently-toggleable kill switch for OPTIONS trading only.
+# Stored in its own ``options_kill_switch.json`` blob so operators can halt
+# option buying (e.g. after a mis-routing incident, an IV crush, a margin
+# scare, or to stop bleeding on a bad options desk) WITHOUT halting the whole
+# trading loop. Stock/crypto trades continue normally unless the primary
+# ``kill_switch.json`` is also HALTED.
+# ---------------------------------------------------------------------------
+_OPTIONS_KS_BLOB = "options_kill_switch.json"
+_OPTIONS_KS_LOCAL = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "options_kill_switch.json",
+)
+
+
+def check_options_kill_switch() -> dict:
+    """Reads options_kill_switch.json from GCS (with local cache fallback).
+
+    Returns a dict with at least ``{"status": "ACTIVE"|"HALTED", ...}``.
+    Defaults to ACTIVE (options allowed) when no file is present or GCS is
+    unreachable.
+    """
+    import json
+    gcs_bucket = os.getenv("GCS_BUCKET_NAME")
+
+    def _local():
+        if os.path.exists(_OPTIONS_KS_LOCAL):
+            try:
+                with open(_OPTIONS_KS_LOCAL, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"status": "ACTIVE", "updated_at": "", "updated_by": "default"}
+
+    if not gcs_bucket:
+        return _local()
+
+    try:
+        client = get_gcs_client()
+        if client is None:
+            logger.warning("GCS client unavailable. Falling back to local options kill switch.")
+            return _local()
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(_OPTIONS_KS_BLOB)
+        if blob.exists():
+            data = json.loads(blob.download_as_text())
+            # Sync to local cache
+            try:
+                with open(_OPTIONS_KS_LOCAL, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+            return data
+    except Exception as e:
+        logger.warning(f"Error checking options kill switch: {e}. Falling back to local cache.")
+        return _local()
+
+    return {"status": "ACTIVE", "updated_at": "", "updated_by": "default"}
+
+
+def set_options_kill_switch_state(status: str, updated_by: str = "system") -> bool:
+    """Sets the options kill switch on GCS (and writes local cache)."""
+    import json
+    from datetime import datetime
+    data = {
+        "status": status.upper(),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_by": updated_by,
+    }
+
+    # Local cache
+    try:
+        with open(_OPTIONS_KS_LOCAL, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write local options kill switch cache: {e}")
+
+    gcs_bucket = os.getenv("GCS_BUCKET_NAME")
+    if not gcs_bucket:
+        logger.warning("GCS_BUCKET_NAME not set. Saved options kill switch locally only.")
+        return True
+
+    try:
+        client = get_gcs_client()
+        if client is None:
+            logger.warning("GCS client unavailable. Options kill switch saved locally only.")
+            return True
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(_OPTIONS_KS_BLOB)
+        blob.upload_from_string(json.dumps(data, indent=2), content_type="application/json")
+        logger.info(f"Successfully uploaded options_kill_switch.json with status {status} to GCS.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upload options_kill_switch.json to GCS: {e}")
+        return False
+

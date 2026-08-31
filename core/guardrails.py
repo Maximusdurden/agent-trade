@@ -557,14 +557,33 @@ class RiskGuardrails:
         if not getattr(config, "OPTIONS_ENABLED", False):
             return False, "Rejected: Options trading is disabled (OPTIONS_ENABLED=false).", adjusted_decision
 
+        # Dedicated OPTIONS KILL SWITCH (independent of the global kill switch).
+        # When HALTED, block opening NEW option positions (BUY-to-open). Existing
+        # option positions may still be SELL-to-closed (de-risked) — the kill
+        # switch stops new risk, never locks you into an existing position.
+        action = adjusted_decision.get("action", "HOLD").upper()
+        if action == "BUY":
+            try:
+                from core.gcs_sync import check_options_kill_switch
+                opts_ks = check_options_kill_switch()
+                status = str(opts_ks.get("status", "ACTIVE")).upper()
+                if status == "HALTED":
+                    return False, ("Rejected: Options KILL SWITCH is HALTED. "
+                                   "New option positions are blocked. "
+                                   "Stock/crypto trading is unaffected."), adjusted_decision
+            except Exception as ks_err:
+                logger.error(f"Error checking options kill switch: {ks_err}. Allowing option BUY.")
+                # Fail-open on GCS errors so a transient GCS outage never
+                # freezes legitimate option buying unexpectedly.
+
         cleared_o = symbol.replace(" ", "")
         # Determine underlying root + eligibility
         is_occ = is_occ_symbol(symbol)
         if is_occ:
             # SELL-to-close of an existing position: allow the underlying regardless
-            underlying = re.match(r"^[A-Z]+", cleared).group(0).strip() or symbol
+            underlying = re.match(r"^[A-Z]+", cleared_o).group(0).strip() or symbol
             # Verify we actually hold this contract
-            held = current_positions.get(symbol) or current_positions.get(cleared)
+            held = current_positions.get(symbol) or current_positions.get(cleared_o)
             if not held or float(held.get("qty", 0)) <= 0:
                 return False, f"Rejected: Attempted to SELL-to-close {symbol} but no position is held.", adjusted_decision
             # Cap sell qty at held qty (never go short)

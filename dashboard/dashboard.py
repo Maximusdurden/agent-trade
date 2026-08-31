@@ -393,6 +393,16 @@ def status_cache_worker():
             except Exception as ks_err:
                 print(f"[Dashboard Server] Failed to read kill switch: {ks_err}", file=sys.stderr)
 
+            # Dedicated OPTIONS kill switch (independent of the main kill switch)
+            options_kill_switch_state = "ACTIVE"
+            try:
+                from core.gcs_sync import check_options_kill_switch
+                opts_ks_data = check_options_kill_switch()
+                if opts_ks_data:
+                    options_kill_switch_state = opts_ks_data.get("status", "ACTIVE")
+            except Exception as opts_ks_err:
+                print(f"[Dashboard Server] Failed to read options kill switch: {opts_ks_err}", file=sys.stderr)
+
             # Assemble payload
             payload = {
                 "account": account,
@@ -413,6 +423,7 @@ def status_cache_worker():
                 "is_mock": is_mock,
                 "is_paper": config.ALPACA_PAPER,
                 "kill_switch": kill_switch_state,
+                "options_kill_switch": options_kill_switch_state,
                 "heartbeat": heartbeat,
                 "freshness": freshness,
                 "latest_decision_at": latest_decision_at,
@@ -1815,6 +1826,10 @@ HTML_CONTENT = """<!DOCTYPE html>
                         <div class="status-dot" style="background-color: rgba(255, 8, 68, 0.8);"></div>
                         <span>KILL SWITCH: ACTIVE</span>
                     </div>
+                    <div class="status-badge" id="options-kill-switch-badge" style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.3); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
+                        <div class="status-dot" style="background-color: rgba(139, 92, 246, 0.8);"></div>
+                        <span>OPTIONS: ENABLED</span>
+                    </div>
                     <div class="status-badge" id="weekend-skip-badge" style="background: rgba(230, 161, 0, 0.1); border: 1px solid rgba(230, 161, 0, 0.3); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
                         <div class="status-dot" style="background-color: rgba(230, 161, 0, 0.8);"></div>
                         <span>WEEKEND SKIP: OFF</span>
@@ -2660,6 +2675,24 @@ HTML_CONTENT = """<!DOCTYPE html>
                         statusDot.style.backgroundColor = "var(--color-crimson)";
                         statusDot.style.boxShadow = "0 0 8px var(--color-crimson)";
                     }
+                }
+
+                // Update KILL SWITCH badge text/color (main + options).
+                const ksBadge = document.getElementById('kill-switch-badge');
+                if (ksBadge) {
+                    const halted = (data.kill_switch === "HALTED");
+                    const span = ksBadge.querySelector('span');
+                    if (span) span.innerText = halted ? 'KILL SWITCH: HALTED' : 'KILL SWITCH: ACTIVE';
+                    ksBadge.style.borderColor = halted ? 'rgba(255, 8, 68, 1)' : 'rgba(255, 8, 68, 0.3)';
+                    ksBadge.style.background = halted ? 'rgba(255, 8, 68, 0.3)' : 'rgba(255, 8, 68, 0.1)';
+                }
+                const optsBadge = document.getElementById('options-kill-switch-badge');
+                if (optsBadge) {
+                    const halted = (data.options_kill_switch === "HALTED");
+                    const span = optsBadge.querySelector('span');
+                    if (span) span.innerText = halted ? 'OPTIONS: HALTED' : 'OPTIONS: ENABLED';
+                    optsBadge.style.borderColor = halted ? 'rgba(255, 8, 68, 1)' : 'rgba(139, 92, 246, 0.3)';
+                    optsBadge.style.background = halted ? 'rgba(255, 8, 68, 0.3)' : 'rgba(139, 92, 246, 0.1)';
                 }
 
                 // 1. Update Metrics Cards
