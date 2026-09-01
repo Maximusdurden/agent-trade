@@ -145,6 +145,34 @@ class SharedLLMClient:
                 
         raise LLMClientError("OpenRouter failed and Gemini fallback is not configured.")
         
+    def _generate_via_gemini(self, prompt, system_prompt, model_id):
+        """Execute a completion using the native google-genai Gemini client only.
+
+        Used as a true cross-provider fallback when OpenRouter HANGS (times out
+        at the executor level, which never reaches ``_execute_completion``'s own
+        inner Gemini fallback). This keeps the trading cycle alive during a
+        transient OpenRouter outage instead of silently degrading to rule-based.
+        """
+        if not self.gemini_client:
+            raise LLMClientError("OpenRouter failed and Gemini fallback is not configured.")
+        gemini_model_name = self.gemini_model
+        if "gemini-2.5-flash" in model_id:
+            gemini_model_name = "gemini-2.5-flash"
+        elif "gemini-2.5-pro" in model_id:
+            gemini_model_name = "gemini-2.5-pro"
+        elif "gemini-3.5-flash" in model_id:
+            gemini_model_name = "gemini-2.5-flash"  # fallback if 3.5-flash unsupported
+        logger.info(f"Executing cross-provider fallback completion using Gemini model: {gemini_model_name}")
+        response = self.gemini_client.models.generate_content(
+            model=gemini_model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.2,
+            )
+        )
+        return response.text or ""
+        
     def generate_structured(
         self,
         prompt: str,
@@ -194,6 +222,24 @@ class SharedLLMClient:
         # cumulative wall-time stays bounded across retries.
         max_total_seconds = int(os.getenv("LLM_MAX_TOTAL_SECONDS", "120"))
         start = time.monotonic()
+        resolved_tier = tier.lower() if tier else "daily_driver"
+        model_id = self.tier_mapping.get(resolved_tier, self.tier_mapping["daily_driver"])
+
+        def _try_gemini_direct() -> str:
+            """Last-resort cross-provider fallback to Gemini when OpenRouter hangs.
+            Runs the native Gemini call inside the same bounded executor so a hung
+            Gemini request still can't blow the Cloud Run job timeout."""
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as gem_exec:
+                fut = gem_exec.submit(
+                    self._generate_via_gemini,
+                    prompt, actual_system_prompt, model_id,
+                )
+                try:
+                    return fut.result(timeout=max_total_seconds)
+                except concurrent.futures.TimeoutError:
+                    fut.cancel()
+                    raise LLMClientError("Gemini cross-provider fallback timed out.")
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             response_text = None
             retry_count = 0
@@ -201,10 +247,15 @@ class SharedLLMClient:
                 while True:
                     elapsed = time.monotonic() - start
                     if elapsed >= max_total_seconds:
-                        logger.critical(
-                            f"OpenRouter/Gemini call exceeded {max_total_seconds}s total budget "
-                            f"after {retry_count} retries. Giving up."
-                        )
+                        # Try Gemini directly before giving up (transient OpenRouter hang).
+                        try:
+                            response_text = _try_gemini_direct()
+                            break
+                        except Exception as gem_ex:
+                            logger.critical(
+                                f"OpenRouter exhausted {max_total_seconds}s budget and "
+                                f"Gemini cross-provider fallback also failed: {gem_ex}"
+                            )
                         raise LLMClientError(
                             f"LLM call exceeded total {max_total_seconds}s budget (retries={retry_count})."
                         )
@@ -226,6 +277,15 @@ class SharedLLMClient:
                         future.cancel()  # mark cancelled to free the thread
                         retry_count += 1
                         if retry_count > self.max_retries:
+                            # Try Gemini directly before giving up on timeouts.
+                            try:
+                                response_text = _try_gemini_direct()
+                                break
+                            except Exception as gem_ex:
+                                logger.critical(
+                                    f"OpenRouter timed out after {max_retries} and Gemini "
+                                    f"cross-provider fallback failed: {gem_ex}"
+                                )
                             logger.critical(
                                 f"OpenRouter request timed out after {attempt_timeout}s (attempt {retry_count})"
                             )
@@ -236,6 +296,15 @@ class SharedLLMClient:
                         delay = min(self.retry_delay * (2 ** retry_count), self.max_backoff)
                         # Respect the global budget while backing off.
                         if (time.monotonic() - start) + delay >= max_total_seconds:
+                            # Try Gemini directly before giving up on backoff.
+                            try:
+                                response_text = _try_gemini_direct()
+                                break
+                            except Exception as gem_ex:
+                                logger.critical(
+                                    f"OpenRouter backoff would exceed {max_total_seconds}s "
+                                    f"and Gemini cross-provider fallback failed: {gem_ex}"
+                                )
                             logger.critical(
                                 f"Backoff would exceed remaining {max_total_seconds}s budget; giving up."
                             )
