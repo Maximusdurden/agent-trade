@@ -24,7 +24,7 @@ class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
     Enforces a hard per-call wall-clock budget (LLM_MAX_TOTAL_SECONDS, default
-    120s), Pydantic-based JSON Schema, think-tag purging, bounded retries with
+    180s), Pydantic-based JSON Schema, think-tag purging, bounded retries with
     thread cancellation, and automatic local-rules fallback upon failure.
     """
     def __init__(self):
