@@ -17,6 +17,11 @@ def is_occ_symbol(symbol: str) -> bool:
     return bool(OCC_SYMBOL_RE.match(clean)) and not clean.endswith("USD")
 
 
+def is_crypto_member(symbol: str) -> bool:
+    """Return True if a normalized symbol is a crypto quote (contains '/')."""
+    return "/" in normalize_symbol(symbol)
+
+
 class RiskGuardrails:
     """Deterministic security/risk layer between LLM decisions and execution."""
     
@@ -45,6 +50,88 @@ class RiskGuardrails:
             if self._cluster_of(pos_symbol) == cluster:
                 exposure += float(pos.get("market_value", 0.0) or 0.0)
         return cluster, exposure
+
+    def _in_latest_watchlist(self, symbol: str) -> bool:
+        """Return True if ``symbol`` is in the latest screener watchlist.
+
+        Uses the same normalization the universe check uses (raw and slash-stripped
+        forms). A symbol in the latest watchlist is actively endorsed by the
+        screener and is always eligible for a BUY.
+        """
+        try:
+            from core import database
+            latest = database.get_latest_watchlist_raw()
+        except Exception:
+            latest = []
+        sym = symbol.upper().replace("/", "")
+        for ws in latest:
+            ws_upper = (ws or "").upper()
+            if ws_upper == symbol.upper() or ws_upper.replace("/", "") == sym:
+                return True
+        return False
+
+    def _universe_guardrail_reason(self, symbol: str, current_positions: dict) -> str | None:
+        """Return a rejection reason if a NEW BUY to ``symbol`` should be blocked by
+        the strict-universe guardrail.
+
+        When STRICT_UNIVERSE_ENABLED, a BUY to a symbol that is NOT in the latest
+        screener watchlist AND NOT currently held is blocked. This prevents the
+        fallback path and the static TRADING_UNIVERSE from opening NEW positions in
+        names the screener never endorsed (e.g. SPY/QQQ/TSLA/MS in the data), which
+        dominated equity losses (-$540).
+
+        Held positions are exempt so the agent can always manage (SELL) or top-up an
+        existing position. Averaging-down on a held position is separately guarded by
+        the anti-scale-in guardrail. Crypto is exempt (it is the profitable book).
+        """
+        if not getattr(config, "STRICT_UNIVERSE_ENABLED", True):
+            return None
+        sym = normalize_symbol(symbol)
+        if is_crypto_member(sym) or "/" in sym:
+            return None  # crypto is 24/7 and evidence shows it's the profitable book
+        if self._in_latest_watchlist(symbol):
+            return None  # screener-endorsed this cycle -> always eligible
+        held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+        if isinstance(held, dict) and float(held.get("qty", 0.0) or 0.0) > 0:
+            return None  # held position -> must be manageable (SELL or top-up)
+        try:
+            from core import database
+            wl = database.get_latest_watchlist_raw()
+        except Exception:
+            wl = []
+        return (f"Rejected: Strict-universe guardrail. {symbol} is not in the latest "
+                f"watchlist {wl}) and is not currently held. New BUYs are only "
+                f"allowed on screener-endorsed symbols. Use SELL/HOLD to manage any "
+                f"existing position in this name.")
+
+    def _anti_scale_in_reason(self, symbol: str, proposed_qty: float,
+                              current_price: float, current_positions: dict) -> str | None:
+        """Return a rejection reason if a BUY would average DOWN into a held position.
+
+        The MS loss pattern (-$226) was "buy-the-dip scale-in": the agent bought the
+        same name repeatedly as it sagged, accumulating a falling knife and then
+        capitulating at the low. This guard blocks ADDING to a held position when the
+        current price is BELOW the position's average entry price. SELLs are never
+        blocked. Crypto is exempt (it is the profitable book and scales differently).
+        """
+        if proposed_qty <= 0 or current_price <= 0:
+            return None
+        if is_crypto_member(symbol) or "/" in symbol:
+            return None
+        pos = current_positions.get(symbol)
+        if not isinstance(pos, dict):
+            return None
+        avg_entry = float(pos.get("avg_entry_price", 0.0) or 0.0)
+        if avg_entry <= 0:
+            return None
+        # Only guard "averaging DOWN" (current price below avg entry).
+        if current_price >= avg_entry:
+            return None
+        drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0
+        return (f"Rejected: Anti-scale-in guardrail. {symbol} is held at ${avg_entry:.2f} "
+                f"but currently ${current_price:.2f} ({drawdown_pct:.1f}% below entry). "
+                f"Adding to a losing position is the MS dip-add failure mode. "
+                f"Use SELL/HOLD to de-risk instead of averaging down.")
 
     def _circuit_breaker_reason(self, symbol: str) -> str | None:
         """Return a rejection reason if a BUY to ``symbol`` should be blocked.
@@ -85,6 +172,21 @@ class RiskGuardrails:
                     return (f"Rejected: Whipsaw-trap circuit breaker. {symbol} has "
                             f"{whipsaw}/{len(sym_trips)} round-trips under 4h "
                             f"({ratio*100:.0f}% >= {max_ratio*100:.0f}%). BUY blocked.")
+
+            # 3. Low win-rate circuit breaker: catch chronic losers (e.g. KO at
+            # 0%, MS at 17%) that bleed on net even without 3 *consecutive* losses.
+            min_low_win_trades = int(getattr(config, "MIN_LOW_WIN_RATE_TRADES", 5))
+            max_low_win_rate = float(getattr(config, "MAX_LOW_WIN_RATE", 0.25))
+            if len(sym_trips) >= min_low_win_trades:
+                wins = sum(1 for t in sym_trips if t["win"])
+                win_rate = wins / len(sym_trips)
+                if win_rate < max_low_win_rate:
+                    total = sum(t["pnl"] for t in sym_trips)
+                    return (f"Rejected: Low win-rate circuit breaker. {symbol} has "
+                            f"{wins}/{len(sym_trips)} winning round-trips "
+                            f"({win_rate*100:.0f}% < {max_low_win_rate*100:.0f}%) "
+                            f"with net PnL ${total:+,.2f}. BUY blocked to stop "
+                            f"re-entering a chronic loser.")
         except Exception as err:
             logger.error(f"Error checking circuit breaker for {symbol}: {err}")
         return None
@@ -380,6 +482,25 @@ class RiskGuardrails:
 
         # 6. Buy Rules Guardrail
         if action == "BUY":
+            # 6a. Strict-universe guardrail: a NEW buy must be screener-endorsed
+            # (in the latest watchlist) OR crypto OR already held. Untracked names
+            # in the static TRADING_UNIVERSE that the screener never picks are
+            # blocked from being newly bought, closing the fallback-universe loss hole.
+            strict_reason = self._universe_guardrail_reason(symbol, current_positions)
+            if strict_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, strict_reason, adjusted_decision
+
+            # 6a2. Anti-scale-in guardrail: block averaging DOWN into a held
+            # position that is not currently screener-endorsed. Prevents the MS
+            # "buy-the-dip-adding" failure mode that bled -$226.
+            scale_in_reason = self._anti_scale_in_reason(
+                symbol, proposed_qty, current_price, current_positions
+            )
+            if scale_in_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, scale_in_reason, adjusted_decision
+
             # Per-ticker loss / whipsaw circuit breaker: block re-entering a
             # symbol that has repeatedly lost money or whipsaws, so the strategy
             # stops bleeding on the same names (e.g. INTC/AMD/SPY in the data).

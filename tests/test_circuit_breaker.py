@@ -26,14 +26,17 @@ def _clean_trades():
 _order_counter = [0]
 
 
-def _add_round_trip(symbol, buy_price, sell_price, qty=1.0):
-    """Insert a buy then a sell producing one closed round-trip, 5h in the past.
+def _add_round_trip(symbol, buy_price, sell_price, qty=1.0, hold_hours=0.0):
+    """Insert a buy then a sell producing one closed round-trip.
 
-    Timestamps are set 5 hours ago so the anti-whipsaw (4h hold) guardrail does
-    not interfere with the circuit-breaker tests. Order IDs are unique per call.
+    ``hold_hours`` sets the gap between buy and sell timestamps. The SELL is
+    always placed 5h in the past so the anti-whipsaw 4h guardrail never fires on
+    a re-buy test (it needs the most recent trade <4h old). Default hold 0 keeps
+    existing tests isolating the circuit breaker.
     """
     from datetime import datetime, timedelta
-    old = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    sell_ts = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    buy_ts = (datetime.utcnow() - timedelta(hours=5 + hold_hours)).isoformat()
     _order_counter[0] += 1
     n = _order_counter[0]
     with get_db_connection() as conn:
@@ -41,12 +44,12 @@ def _add_round_trip(symbol, buy_price, sell_price, qty=1.0):
         cur.execute(
             "INSERT INTO trades (decision_id, alpaca_order_id, timestamp, symbol, side, qty, filled_avg_price, status) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (1, f"{symbol}-b-{n}", old, symbol.upper(), "buy", qty, buy_price, "filled"),
+            (1, f"{symbol}-b-{n}", buy_ts, symbol.upper(), "buy", qty, buy_price, "filled"),
         )
         cur.execute(
             "INSERT INTO trades (decision_id, alpaca_order_id, timestamp, symbol, side, qty, filled_avg_price, status) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (2, f"{symbol}-s-{n}", old, symbol.upper(), "sell", qty, sell_price, "filled"),
+            (2, f"{symbol}-s-{n}", sell_ts, symbol.upper(), "sell", qty, sell_price, "filled"),
         )
         conn.commit()
 
@@ -118,6 +121,33 @@ class TestCircuitBreaker(unittest.TestCase):
         )
         self.assertFalse(approved)
         self.assertIn("whipsaw", msg.lower())
+
+    def test_low_win_rate_blocks_buy(self):
+        # 8 round-trips, only 1 win (12.5% < MAX_LOW_WIN_RATE 25%) -> blocked by
+        # low win-rate breaker even though there is NO string of 3 consecutive
+        # losses (win is last, so trailing streak is broken). Mirrors KO (0%) / MS (17%).
+        for i in range(8):
+            if i == 7:
+                _add_round_trip("SOL/USD", buy_price=90.0, sell_price=95.0, hold_hours=5.0)  # win (last)
+            else:
+                _add_round_trip("SOL/USD", buy_price=100.0, sell_price=95.0, hold_hours=5.0)  # loss
+        approved, msg, adj = self.guardrails.validate_and_adjust_decision(
+            self._decision("SOL/USD"), self._account(), {}
+        )
+        self.assertFalse(approved, f"Low win rate should block BUY: {msg}")
+        self.assertIn("low win-rate", msg.lower())
+
+    def test_decent_win_rate_allowed(self):
+        # 6 trade, 4 wins (67%) -> not a chronic loser, allowed.
+        for i in range(6):
+            if i < 4:
+                _add_round_trip("SOL/USD", buy_price=90.0, sell_price=100.0, hold_hours=5.0)  # win
+            else:
+                _add_round_trip("SOL/USD", buy_price=100.0, sell_price=99.0, hold_hours=5.0)  # loss
+        approved, msg, adj = self.guardrails.validate_and_adjust_decision(
+            self._decision("SOL/USD"), self._account(), {}
+        )
+        self.assertTrue(approved, f"67% win rate should be allowed: {msg}")
 
 
 if __name__ == "__main__":

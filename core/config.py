@@ -40,6 +40,13 @@ MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 MAX_WHIPSAW_RATIO = float(os.getenv("MAX_WHIPSAW_RATIO", "0.60"))
 MIN_WHIPSAW_TRADES = int(os.getenv("MIN_WHIPSAW_TRADES", "4"))
 CIRCUIT_BREAKER_LOOKBACK_DAYS = int(os.getenv("CIRCUIT_BREAKER_LOOKBACK_DAYS", "90"))
+# Low win-rate circuit breaker: if a symbol has MIN_LOW_WIN_RATE_TRADES closed RTs
+# in the lookback AND its realized win rate stays below MAX_LOW_WIN_RATE, block new
+# BUYs. This catches chronic losers (e.g. KO at 0% and MS at 17% win rate) that
+# never string 3 *consecutive* losses together but still bleed on net. SELLs to
+# de-risk remain allowed.
+MIN_LOW_WIN_RATE_TRADES = int(os.getenv("MIN_LOW_WIN_RATE_TRADES", "5"))
+MAX_LOW_WIN_RATE = float(os.getenv("MAX_LOW_WIN_RATE", "0.25"))
 
 # Crypto TP/SL Bracket Support
 # When True, crypto BUYs get a bracket (take-profit + stop-loss) order like
@@ -68,6 +75,17 @@ VOL_SIZING_MIN_ALLOCATION_PCT = float(os.getenv("VOL_SIZING_MIN_ALLOCATION_PCT",
 # PnL from the DB (FIFO) plus current unrealized PnL from the account.
 INTRADAY_LOSS_LIMIT_PCT = float(os.getenv("INTRADAY_LOSS_LIMIT_PCT", "0.04"))
 INTRADAY_BREAKER_ENABLED = os.getenv("INTRADAY_BREAKER_ENABLED", "true").lower() == "true"
+
+# Universe Guardrail
+# When STRICT_UNIVERSE_ENABLED is True, a BUY to a symbol that is NOT in the
+# latest screened watchlist is blocked UNLESS the symbol is currently held (so
+# we can always manage/SELL it) or is crypto. This closes the "fallback-universe"
+# hole that let untracked names like SPY/QQQ/TSLA/MS (static TRADING_UNIVERSE
+# members never picked by the screener) keep getting bought and bleeding
+# (-$540 across the equity desk from untracked symbols).
+# Held positions remain tradable (SELL to exit, and a small BUY to top-up is
+# still allowed because we must be able to manage an existing position).
+STRICT_UNIVERSE_ENABLED = os.getenv("STRICT_UNIVERSE_ENABLED", "true").lower() == "true"
 
 # Intraday VWAP gating
 # VWAP is cumulative within the current trading day. Early in the session there

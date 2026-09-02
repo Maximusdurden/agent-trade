@@ -10,6 +10,10 @@ import os
 import sys
 import unittest
 
+# Use a SEPARATE test database so the strict-universe / circuit-breaker guardrails
+# never see round-trips leaked from other test modules (which run on the shared
+# default DB), and so cluster tests stay isolated.
+os.environ["DATABASE_FILENAME"] = "test_cluster_guardrail.db"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import config
@@ -50,7 +54,30 @@ class TestClusterMapping(unittest.TestCase):
 
 class TestClusterGuardrail(unittest.TestCase):
     def setUp(self):
+        # Isolate from the shared default DB: the strict-universe + circuit-breaker
+        # guardrails read `database.get_latest_watchlist_raw()` / closed round-trips.
+        # Point DATABASE_PATH at a throwaway file, clear it, AND clear the feedback
+        # FIFO memo cache (a 60s process-wide cache) so the circuit breaker never
+        # sees SOL/USD whipsaw round-trips computed by a prior test module.
+        from core import config as _c, database as _db
+        import core.feedback as _fb
+        _fb._memo.clear()  # drop the 60s process-wide FIFO cache from prior modules
+        import tempfile
+        self._tmpdb = tempfile.mktemp(suffix=".db")
+        _c.DATABASE_PATH = self._tmpdb
+        _db.init_db()
+        with _db.get_db_connection() as conn:
+            conn.execute("DELETE FROM trades")
+            conn.execute("DELETE FROM watchlist_history")
+            conn.commit()
         self.guardrails = RiskGuardrails()
+
+    def tearDown(self):
+        try:
+            import os as _os
+            _os.remove(self._tmpdb)
+        except Exception:
+            pass
 
     def _account(self, equity=100000.0):
         return {"equity": equity, "cash": 60000.0, "unrealized_pnl": 0.0, "last_equity": equity}

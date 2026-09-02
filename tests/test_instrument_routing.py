@@ -18,8 +18,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from core.guardrails import RiskGuardrails
 
 
+def _seed_watchlist(symbols):
+    """Seed the current watchlist so strict-universe guardrail passes."""
+    import json
+    from core import database
+    with database.get_db_connection() as conn:
+        conn.execute("DELETE FROM watchlist_history")
+        conn.execute("INSERT INTO watchlist_history (timestamp, watchlist) VALUES (?, ?)",
+                     ("2026-08-15 12:00:00", json.dumps(symbols)))
+        conn.commit()
+
+
 def _run(decision, positions=None):
     g = RiskGuardrails()
+    # These tests exercise option-vs-stock routing, not universe gating; endorse NVDA.
+    _seed_watchlist(["NVDA"])
     with patch("core.gcs_sync.check_options_kill_switch", return_value={"status": "ACTIVE"}), \
          patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0):
         return g.validate_and_adjust_decision(

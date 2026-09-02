@@ -86,8 +86,19 @@ class TestCycleBudget(unittest.TestCase):
         from core.guardrails import RiskGuardrails
         return RiskGuardrails()
 
+    def _seed_watchlist(self, symbols):
+        """Seed the current watchlist so strict-universe guardrail passes."""
+        import json
+        with database.get_db_connection() as conn:
+            conn.execute("DELETE FROM watchlist_history")
+            conn.execute("INSERT INTO watchlist_history (timestamp, watchlist) VALUES (?, ?)",
+                         ("2026-08-15 12:00:00", json.dumps(symbols)))
+            conn.commit()
+
     def _mock_open(self, g):
         g.is_market_open_check = lambda: (True, "open")
+        # Endorse the equity symbols these tests buy.
+        self._seed_watchlist(["NVDA", "AAPL", "TSLA", "MSFT", "AMZN", "GOOG", "MS"])
 
     def _buy(self, g, symbol, qty, price, cycle_context, **overrides):
         """Run a single stock BUY through validate_and_adjust_decision."""
