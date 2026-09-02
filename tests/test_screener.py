@@ -14,6 +14,7 @@ from core.database import get_db_connection, log_trade, log_watchlist
 from core.screener import get_symbol_win_rates, run_screener
 from core.alpaca_client import AlpacaClient
 from core.data_provider import DataProvider
+import core.feedback as _fb  # noqa: E402
 
 def test_screener_and_feedback():
     print("Initializing Screener & Feedback integration test...")
@@ -25,6 +26,9 @@ def test_screener_and_feedback():
         # Ensure tables exist
         from core.database import init_db
         init_db()
+        # Drop the process-wide 60s FIFO cache so a prior module's memoized
+        # round-trips from a DIFFERENT database file don't leak into this test.
+        _fb._memo.clear()
         
         # Ticker 1: BOOSTED (1 buy at 10, 1 sell at 12 -> +2 Profit = 100% Win Rate)
         log_trade(

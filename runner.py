@@ -351,6 +351,20 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                 )
                 send_discord_message(msg)
                 database.set_system_state("last_evening_sent", today_str)
+
+                # Strategy-model A/B self-prompt: fire the Discord tally right after
+                # the evening status, so results land in front of the user on their
+                # own cadence (new-data OR weekly heartbeat) — never more than ~1/day,
+                # and harmless if it fails (wrapped in its own try/except).
+                try:
+                    from tools.strategist_ab_notify import main as ab_notify_main
+                    # Analyze the authoritative DB this runner syncs from GCS each
+                    # cycle (download_from_gcs -> DATABASE_PATH, done above at cycle
+                    # start). --no-pull avoids a redundant 2nd GCS fetch mid-cycle.
+                    from core.database import DATABASE_PATH as _AB_DB_PATH  # noqa: E402
+                    ab_notify_main(["--no-pull", "--db", str(_AB_DB_PATH)])
+                except Exception as ab_err:
+                    logger.warning(f"Strategist A/B notify skipped/failed: {ab_err}")
                     
     except Exception as cadence_err:
         logger.error(f"Error handling daily status cadence or smart Friday triggers: {cadence_err}")

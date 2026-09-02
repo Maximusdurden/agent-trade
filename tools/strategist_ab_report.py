@@ -52,9 +52,11 @@ def parse_dt(ts):
         return None
 
 
-def load_strategy_models():
+def load_strategy_models(db_path=None):
     """Return {ticker: [(ts, model, rules)]} sorted by ts ASC."""
-    conn = sqlite3.connect(CLOUD_DB)
+    if db_path is None:
+        db_path = CLOUD_DB
+    conn = sqlite3.connect(db_path)
     rows = conn.execute(
         "SELECT timestamp, ticker, todays_rules, strategy_version FROM strategy_history ORDER BY timestamp ASC"
     ).fetchall()
@@ -78,8 +80,10 @@ def model_at_entry(hist, ts):
     return prior
 
 
-def build_round_trips():
-    conn = sqlite3.connect(CLOUD_DB)
+def build_round_trips(db_path=None):
+    if db_path is None:
+        db_path = CLOUD_DB
+    conn = sqlite3.connect(db_path)
     rows = conn.execute(
         "SELECT timestamp, symbol, side, qty, filled_avg_price, status FROM trades "
         "WHERE status IN ('filled','partially_filled') ORDER BY id ASC"
@@ -114,9 +118,22 @@ def build_round_trips():
     return trips
 
 
-def main():
-    hist = load_strategy_models()
-    trips = build_round_trips()
+def analyze(db_path=None):
+    """Load cloud DB and attribute round-trips to authoring A/B model.
+
+    Returns a dict:
+      trips          -> list of all equity round-trips (with open_ts)
+      attributed     -> list of round-trips attributed to an A/B-tagged model (with model)
+      not_attributed -> count of pre-experiment / untagged round-trips
+      grouped        -> pandas DataFrame grouped by model (rt, pnl, win%, avg hold,
+                        largest win/loss), or None if no attributed trades
+      per_ticker     -> pandas DataFrame grouped by (symbol, model), or None
+    Pure read-only; reusable by both the file writer and the Discord notifier.
+    """
+    if db_path is None:
+        db_path = CLOUD_DB
+    hist = load_strategy_models(db_path)
+    trips = build_round_trips(db_path)
     # Restrict to rules that carry an A/B model tag (skip pre-experiment 'unknown' history).
     attributed = []
     not_attributed = 0
@@ -128,6 +145,35 @@ def main():
             continue
         t["model"] = model
         attributed.append(t)
+
+    grouped = None
+    per_ticker = None
+    if attributed:
+        df = pd.DataFrame(attributed)
+        grouped = df.groupby("model").agg(
+            rt=("pnl", "size"), pnl=("pnl", "sum"), win=("win", "mean"),
+            avg_hold_h=("holding_hours", "mean"),
+            largest_win=("pnl", "max"), largest_loss=("pnl", "min")
+        ).sort_values("pnl", ascending=False)
+        per_ticker = df.groupby(["symbol", "model"]).agg(
+            rt=("pnl", "size"), pnl=("pnl", "sum"), win=("win", "mean")
+        ).sort_values(["symbol", "model"])
+
+    return {
+        "trips": trips,
+        "attributed": attributed,
+        "not_attributed": not_attributed,
+        "grouped": grouped,
+        "per_ticker": per_ticker,
+    }
+
+
+def main():
+    res = analyze()
+    trips = res["trips"]
+    attributed = res["attributed"]
+    not_attributed = res["not_attributed"]
+    grouped = res["grouped"]
 
     print(f"Total equity round-trips: {len(trips)}")
     print(f"Attributed to an A/B strategist model: {len(attributed)}")
@@ -141,25 +187,18 @@ def main():
              f"- Attributed to an A/B-tagged strategist rule: **{len(attributed)}**",
              f"- Not attributed (pre-experiment/untagged): **{not_attributed}**\n"]
 
-    if attributed:
-        df = pd.DataFrame(attributed)
-        grp = df.groupby("model").agg(
-            rt=("pnl", "size"), pnl=("pnl", "sum"), win=("win", "mean"),
-            avg_hold_h=("holding_hours", "mean"),
-            largest_win=("pnl", "max"), largest_loss=("pnl", "min")
-        ).sort_values("pnl", ascending=False)
+    if grouped is not None:
+        # `grouped` is already sorted by pnl desc internally already
         lines.append("## Results by authoring model\n")
-        lines.append(df.to_markdown())
+        lines.append(grouped.to_markdown())
         lines.append("")
         lines.append("> Win% is win rate; expectancy = avg net PnL/trade.")
-        print(grp.to_string())
+        print(grouped.to_string())
         print()
 
         # Per-ticker split too
+        per_ticker = res["per_ticker"]
         lines.append("## Per-ticker by model\n")
-        per_ticker = df.groupby(["symbol", "model"]).agg(
-            rt=("pnl", "size"), pnl=("pnl", "sum"), win=("win", "mean")
-        ).sort_values(["symbol", "model"])
         lines.append(per_ticker.to_markdown())
         lines.append("")
         print(per_ticker.to_string())

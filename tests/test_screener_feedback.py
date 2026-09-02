@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from core.database import init_db, get_db_connection, log_trade
 from core.screener import get_symbol_feedback, get_symbol_win_rates
+import core.feedback as _fb  # noqa: E402
 
 
 def _clean():
@@ -15,6 +16,9 @@ def _clean():
         conn.execute("DELETE FROM trades")
         conn.execute("DELETE FROM strategy_history")
         conn.commit()
+    # Drop the process-wide 60s FIFO cache so a prior module's memoized round-trips
+    # from a DIFFERENT database file don't leak into this test's assertions.
+    _fb._memo.clear()
 
 
 def test_get_symbol_feedback_profit_factor_and_expectancy():

@@ -18,9 +18,9 @@ class TestStrategistAB(unittest.TestCase):
             self.assertIsNone(MetaStrategist._pick_ab_model())
 
     def test_pick_ab_model_alternates_between_two(self):
-        with patch.object(config, "STRATEGIST_AB_MODELS", "deepseek/deepseek-r1,anthropic/claude-sonnet-4"):
+        with patch.object(config, "STRATEGIST_AB_MODELS", "deepseek/deepseek-r1,anthropic/claude-sonnet-5"):
             m = MetaStrategist._pick_ab_model()
-            self.assertIn(m, ("deepseek/deepseek-r1", "anthropic/claude-sonnet-4"))
+            self.assertIn(m, ("deepseek/deepseek-r1", "anthropic/claude-sonnet-5"))
 
     def test_pick_ab_model_strips_whitespace_and_empty_entries(self):
         with patch.object(config, "STRATEGIST_AB_MODELS", "  a/b ,,  c/d  "):
@@ -29,11 +29,11 @@ class TestStrategistAB(unittest.TestCase):
 
     def test_strategy_version_embeds_model_tag(self):
         from core.feedback import next_strategy_version
-        model = "anthropic/claude-sonnet-4"
+        model = "anthropic/claude-sonnet-5"
         model_tag = model.replace("/", "-").replace("_", "-")
         ver = f"{next_strategy_version()}|model={model_tag}"
         self.assertTrue(ver.startswith("v"))
-        self.assertIn("|model=anthropic-claude-sonnet-4", ver)
+        self.assertIn("|model=anthropic-claude-sonnet-5", ver)
 
 
 if __name__ == "__main__":

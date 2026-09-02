@@ -15,7 +15,7 @@ actually perform — instead of swapping blind.
 
 1. `core/config.py` defines the experiment:
    ```python
-   STRATEGIST_AB_MODELS = "deepseek/deepseek-r1,anthropic/claude-sonnet-4"  # default
+   STRATEGIST_AB_MODELS = "deepseek/deepseek-r1,anthropic/claude-sonnet-5"  # default
    STRATEGIST_AB_LABEL  = "r1-vs-sonnet"
    ```
    A comma-separated list of **two** OpenRouter model ids.
@@ -25,7 +25,7 @@ actually perform — instead of swapping blind.
    `generate_structured(..., explicit_model=...)`, bypassing the tier→model map.
 
 3. Every logged rule carries the authoring model in `strategy_history.strategy_version`:
-   `v<timestamp>|model=anthropic-claude-sonnet-4` (or `deepseek-deepseek-r1`).
+   `v<timestamp>|model=anthropic-claude-sonnet-5` (or `deepseek-deepseek-r1`).
 
 4. `tools/strategist_ab_report.py` re-attributes each closed round-trip to the model
    that authored the **active rule at entry time**, and reports win rate / PnL /
@@ -33,10 +33,10 @@ actually perform — instead of swapping blind.
 
 ## Toggling
 - **Default:** the two-model experiment is ON if `STRATEGIST_AB_MODELS` is unset
-  (falls back to the hardcoded `deepseek/deepseek-r1,anthropic/claude-sonnet-4`).
+  (falls back to the hardcoded `deepseek/deepseek-r1,anthropic/claude-sonnet-5`).
 - **Disable / single model:** set `STRATEGIST_AB_MODELS` to a single id, or the
   existing `STRATEGIST_MODEL_TIER` flow resumes (no `explicit_model`).
-- **Swap the variant:** edit the env var (e.g. `anthropic/claude-sonnet-4` → another id)
+- **Swap the variant:** edit the env var (e.g. `anthropic/claude-sonnet-5` → another id)
   and re-deploy. Toggling is config-only — no code change.
 
 Env vars are whitelisted in `deploy/deploy_cloud.ps1` so they persist on Cloud Run.

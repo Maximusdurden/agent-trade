@@ -106,7 +106,8 @@ STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 # higher-conviction / better-performing rules over a few weeks, without a code
 # redeploy. If unset, the strategist uses STRATEGIST_MODEL_TIER (current behavior).
 # Default here is the intended experiment: [deepseek-r1 (control), Claude Sonnet (variant)].
-_ab_default = "deepseek/deepseek-r1,anthropic/claude-sonnet-4"
+# claude-sonnet-5 verified live on OpenRouter (2026-06 GA), stronger & cheaper than sonnet-4.
+_ab_default = "deepseek/deepseek-r1,anthropic/claude-sonnet-5"
 STRATEGIST_AB_MODELS = os.getenv("STRATEGIST_AB_MODELS", _ab_default)
 # Optional experiment label so harness reports can name the trial.
 STRATEGIST_AB_LABEL = os.getenv("STRATEGIST_AB_LABEL", "r1-vs-sonnet")
