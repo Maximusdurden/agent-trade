@@ -179,11 +179,16 @@ class SharedLLMClient:
         response_model,
         system_prompt: str | None = None,
         tier: str | None = None,
-        max_output_tokens: int | None = None
+        max_output_tokens: int | None = None,
+        explicit_model: str | None = None
     ) -> dict:
         """
         Executes completion with JSON schema enforcement, a strict 20s timeout,
-        cleaning of <think> tags, and critical error logging.
+        cleaning of  thinking tags, and critical error logging.
+
+        ``explicit_model`` (optional): an exact OpenRouter model id to use,
+        bypassing the tier->model mapping. Used by the strategist A/B experiment
+        to alternate between two heavyweight models without a redeploy.
         """
         # 1. Enforce JSON schema using Pydantic models
         try:
@@ -223,7 +228,10 @@ class SharedLLMClient:
         max_total_seconds = int(os.getenv("LLM_MAX_TOTAL_SECONDS", "120"))
         start = time.monotonic()
         resolved_tier = tier.lower() if tier else "daily_driver"
-        model_id = self.tier_mapping.get(resolved_tier, self.tier_mapping["daily_driver"])
+        if explicit_model:
+            model_id = explicit_model  # A/B experiment override
+        else:
+            model_id = self.tier_mapping.get(resolved_tier, self.tier_mapping["daily_driver"])
 
         def _try_gemini_direct() -> str:
             """Last-resort cross-provider fallback to Gemini when OpenRouter hangs.

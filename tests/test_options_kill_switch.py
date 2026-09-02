@@ -53,7 +53,9 @@ class TestOptionsKillSwitchHelpers(unittest.TestCase):
 class TestGuardrailOptionsKillSwitch(unittest.TestCase):
     def _make_guardrails(self):
         from core.guardrails import RiskGuardrails
-        return RiskGuardrails()
+        g = RiskGuardrails()
+        g.is_market_open_check = lambda: (True, "open")  # time-independent
+        return g
 
     def _option_buy_decision(self):
         return {

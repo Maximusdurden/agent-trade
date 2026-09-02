@@ -42,6 +42,7 @@ class TestAntiScaleIn(unittest.TestCase):
         decision = {"action": "BUY", "symbol": symbol, "quantity": qty,
                     "current_price": price, "conviction": 0.8,
                     "direction": "bullish", "instrument": "stock"}
+        self.g.is_market_open_check = lambda: (True, "open")  # tests not time-dependent
         return self.g.validate_and_adjust_decision(
             decision, {"equity": 100000.0, "cash": 50000.0, "unrealized_pnl": 0.0},
             positions,

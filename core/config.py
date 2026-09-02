@@ -97,6 +97,20 @@ STRICT_UNIVERSE_ENABLED = os.getenv("STRICT_UNIVERSE_ENABLED", "true").lower() =
 MIN_VWAP_BARS = int(os.getenv("MIN_VWAP_BARS", "4"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
+
+# Strategist model A/B experiment.
+# When STRATEGIST_AB_MODELS is a non-empty, comma-separated list of TWO OpenRouter
+# model ids, the MetaStrategist alternates between them on each daily run
+# (round-robin), tagging each logged rule with the model that authored it (in
+# strategy_history.strategy_version). This lets us measure which model writes
+# higher-conviction / better-performing rules over a few weeks, without a code
+# redeploy. If unset, the strategist uses STRATEGIST_MODEL_TIER (current behavior).
+# Default here is the intended experiment: [deepseek-r1 (control), Claude Sonnet (variant)].
+_ab_default = "deepseek/deepseek-r1,anthropic/claude-sonnet-4"
+STRATEGIST_AB_MODELS = os.getenv("STRATEGIST_AB_MODELS", _ab_default)
+# Optional experiment label so harness reports can name the trial.
+STRATEGIST_AB_LABEL = os.getenv("STRATEGIST_AB_LABEL", "r1-vs-sonnet")
+STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 # Max output tokens for the brain's per-ticker decision JSON. The brain emits one
 # verbose decision (with a long thought_process) per appraised ticker, so the
 # default 2048-token cap truncates the JSON mid-response and forces a rule-based

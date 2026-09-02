@@ -45,11 +45,16 @@ class MetaStrategist:
     def __init__(self):
         self.provider = getattr(config, "LLM_PROVIDER", "gemini").lower()
         self.is_mock = False
+        # Selected OpenRouter model id for THIS run (None => tier_mapping default).
+        self.ab_model = None
+        self.ab_label = getattr(config, "STRATEGIST_AB_LABEL", "experiment")
         
         if self.provider == "openrouter":
             try:
                 from core.llm_client import SharedLLMClient
                 self.llm_client = SharedLLMClient()
+                # Pick this run's model from the A/B list, if configured.
+                self.ab_model = self._pick_ab_model()
                 logger.info("Initialized OpenRouter SharedLLMClient for Meta-Strategist (Heavyweight Tier).")
             except Exception as e:
                 logger.error(f"Failed to initialize OpenRouter SharedLLMClient: {e}. Falling back to rule-based strategist.")
@@ -70,6 +75,22 @@ class MetaStrategist:
                 except Exception as e:
                     logger.error(f"Failed to initialize Gemini Client: {e}. Falling back to rule-based strategist.")
                     self.is_mock = True
+
+    @staticmethod
+    def _pick_ab_model() -> str | None:
+        """Round-robin select an OpenRouter model for this strategist run.
+
+        If STRATEGIST_AB_MODELS is a comma-separated list of models, alternate
+        between them day-to-day (based on UTC date) and return the chosen model id.
+        Returns None to use the configured tier default (no experiment).
+        """
+        raw = getattr(config, "STRATEGIST_AB_MODELS", "") or ""
+        models = [m.strip() for m in raw.split(",") if m.strip()]
+        if len(models) < 2:
+            return None
+        # Deterministic day-alternation: even/odd UTC date -> first/second model.
+        day_index = datetime.utcnow().date().toordinal() % len(models)
+        return models[day_index]
 
     def run_daily_strategy_refinement(self, alpaca_client: AlpacaClient):
         """Runs the strategist routine for all relevant tickers (universe, holdings, and watchlist)."""
@@ -138,13 +159,16 @@ class MetaStrategist:
                 )
                 continue
             
-            # D. Log the new strategy into history
+            # D. Log the new strategy into history. Embed the authoring model in
+            # the version tag so the A/B harness can split outcomes by model.
+            authored_by = result.get("ab_model") or (getattr(config, "STRATEGIST_MODEL_TIER", "heavyweight"))
+            model_tag = authored_by.replace("/", "-").replace("_", "-") if authored_by else "unknown"
             db_id = database.log_strategy_history(
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
                 meta_reasoning=result["meta_reasoning"],
-                strategy_version=next_strategy_version()
+                strategy_version=f"{next_strategy_version()}|model={model_tag}"
             )
             
             logger.info(f"Strategy updated for {ticker}. Database ID: {db_id}")
@@ -278,11 +302,13 @@ Schema:
                 result = self.llm_client.generate_structured(
                     prompt=prompt,
                     response_model=StrategistResponse,
-                    tier=config.STRATEGIST_MODEL_TIER
+                    tier=config.STRATEGIST_MODEL_TIER,
+                    explicit_model=self.ab_model
                 )
                 return {
                     "meta_reasoning": result.get("meta_reasoning", "Maintained previous rule set due to matching market trend."),
-                    "todays_rules": result.get("todays_rules", yesterdays_rules)
+                    "todays_rules": result.get("todays_rules", yesterdays_rules),
+                    "ab_model": self.ab_model,
                 }
             except Exception as e:
                 logger.error(f"Error calling OpenRouter AI strategist for {ticker}: {e}. Falling back to yesterday's rules.")
@@ -382,7 +408,7 @@ Schema:
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
                 meta_reasoning=f"[EMERGENCY INTRADAY RE-EVALUATION] {result['meta_reasoning']}",
-                strategy_version=next_strategy_version()
+                strategy_version=f"{next_strategy_version()}|model={result.get('ab_model') or 'default'}"
             )
             logger.info(f"Emergency rules updated for {ticker}. DB ID: {db_id}")
             logger.info(f"Emergency Rules: {todays_rules}\n")

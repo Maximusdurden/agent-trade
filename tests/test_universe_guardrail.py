@@ -40,6 +40,7 @@ class TestStrictUniverseGuardrail(unittest.TestCase):
                     "current_price": price, "conviction": 0.8,
                     "direction": "bullish", "instrument": "stock"}
         guardrails = RiskGuardrails()
+        guardrails.is_market_open_check = lambda: (True, "open")  # tests not time-dependent
         return guardrails.validate_and_adjust_decision(
             decision,
             {"equity": 100000.0, "cash": 50000.0, "unrealized_pnl": 0.0},

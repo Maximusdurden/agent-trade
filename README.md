@@ -46,7 +46,8 @@ agent-trade/
 │   └── create_task.ps1   # PowerShell Windows Scheduled Task registrar
 │
 ├── docs/                 # Technical documentation & incident notes
-│   ├── equity_desk_guardrails.md       # the 2026-09-02 loss-guardrail design
+    ├── strategist_model_ab.md        # strategist model A/B experiment (r1 vs Sonnet)
+│   ├── equity_desk_guardrails.md      # the 2026-09-02 loss-guardrail design
 │   ├── held_positions_universe_guardrail_fix.md
 │   └── fractional_shares_and_jira_logging_fix.md
 │

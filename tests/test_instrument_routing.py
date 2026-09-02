@@ -34,7 +34,8 @@ def _run(decision, positions=None):
     # These tests exercise option-vs-stock routing, not universe gating; endorse NVDA.
     _seed_watchlist(["NVDA"])
     with patch("core.gcs_sync.check_options_kill_switch", return_value={"status": "ACTIVE"}), \
-         patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0):
+         patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0), \
+         patch.object(RiskGuardrails, "is_market_open_check", return_value=(True, "open")):
         return g.validate_and_adjust_decision(
             decision, {"equity": 100000.0, "cash": 50000.0}, positions or {},
             cycle_context={"spent": 0.0, "trades": 0},
