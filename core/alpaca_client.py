@@ -393,6 +393,12 @@ class AlpacaClient:
                     executed.append({
                         "alpaca_order_id": str(order.id),
                         "timestamp": str(order.filled_at.isoformat()) if hasattr(order.filled_at, "isoformat") else str(order.filled_at),
+                        # Order CREATION time (when the order was submitted). For
+                        # GTC limit orders this can be days before the fill, which
+                        # is why the dashboard's fill-time and Alpaca's UI
+                        # (created-time) can look mismatched. Expose both so the
+                        # difference is visible.
+                        "created_at": str(order.created_at.isoformat()) if hasattr(order.created_at, "isoformat") else str(order.created_at),
                         "symbol": sym,
                         # Use the enum's .value ("buy"/"sell") — str(OrderSide.BUY)
                         # is "OrderSide.BUY", which mislabels every order as "sell".

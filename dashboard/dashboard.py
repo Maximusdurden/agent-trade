@@ -2044,7 +2044,8 @@ HTML_CONTENT = """<!DOCTYPE html>
                     <table class="trades-table">
                         <thead>
                             <tr>
-                                <th>Timestamp (UTC)</th>
+                                <th>Filled (UTC)</th>
+                                <th>Created (UTC)</th>
                                 <th>Symbol</th>
                                 <th>Action</th>
                                 <th>Qty</th>
@@ -2989,21 +2990,32 @@ HTML_CONTENT = """<!DOCTYPE html>
                     });
 
                     if (allOrders.length === 0) {
-                        tradesTbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No orders registered in database.</td></tr>';
+                        tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No orders registered in database.</td></tr>';
                     } else {
                         allOrders.forEach(t => {
                             const side = t.side || 'buy';
                             const sideClass = side.toLowerCase() === 'buy' ? 'text-green' : 'text-crimson';
                             const dateStr = t.timestamp ? formatToEastern(t.timestamp) : 'N/A';
+                            // Created time (when the order was submitted). For GTC
+                            // limit orders this can be days before the fill — that's
+                            // why Alpaca's UI (created-time) and this table
+                            // (fill-time) can look mismatched.
+                            const createdStr = t.created_at ? formatToEastern(t.created_at) : '—';
                             const fillPriceStr = t.filled_avg_price ? '$' + t.filled_avg_price.toFixed(2) : '<span style="color: var(--text-muted)">Unfilled</span>';
                             const symbol = t.symbol || 'N/A';
                             const qty = t.qty !== undefined ? t.qty : 0;
                             const status = t.status || 'filled';
                             const orderId = t.alpaca_order_id || 'N/A';
+                            // Show a hint when created != filled (GTC limit order that
+                            // rested before filling) so the date gap is obvious.
+                            const dateGapHint = (t.created_at && t.timestamp && t.created_at.slice(0,10) !== t.timestamp.slice(0,10))
+                                ? ' <span style="color: var(--color-gold); font-size: 0.7rem;" title="Order was created on a different day than it filled (GTC limit order).">↔</span>'
+                                : '';
                             
                             tradesTbody.innerHTML += `
                                 <tr>
-                                    <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;">${dateStr}</td>
+                                    <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;">${dateStr}${dateGapHint}</td>
+                                    <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-muted);">${createdStr}</td>
                                     <td style="font-weight: 600;">${symbol}</td>
                                     <td class="${sideClass}" style="text-transform: uppercase; font-weight: bold;">${side}</td>
                                     <td>${qty}</td>
@@ -3525,10 +3537,10 @@ HTML_CONTENT = """<!DOCTYPE html>
                 // If it's the "No orders registered" placeholder row, skip
                 if (row.cells.length < 3) return;
                 
-                const symbol = row.cells[1].textContent.trim();
-                const action = row.cells[2].textContent.trim().toUpperCase();
-                const qty = parseFloat(row.cells[3].textContent.trim()) || 0;
-                const priceText = row.cells[4].textContent.trim();
+                const symbol = row.cells[2].textContent.trim();
+                const action = row.cells[3].textContent.trim().toUpperCase();
+                const qty = parseFloat(row.cells[4].textContent.trim()) || 0;
+                const priceText = row.cells[5].textContent.trim();
                 const price = priceText.includes('Unfilled') ? 0 : parseFloat(priceText.replace('$', '').replace(/,/g, '')) || 0;
                 
                 const isMatch = (ticker === 'ALL' || symbol === ticker);
@@ -3571,18 +3583,18 @@ HTML_CONTENT = """<!DOCTYPE html>
                 return;
             }
             
-            let csvContent = "Timestamp,Symbol,Action,Qty,Avg Fill Price,Status,Alpaca Order ID\\r\\n";
+            let csvContent = "Filled,Symbol,Action,Qty,Avg Fill Price,Status,Alpaca Order ID\\r\\n";
             let count = 0;
             
             rows.forEach(row => {
-                if (row.style.display !== 'none' && row.cells.length >= 7) {
+                if (row.style.display !== 'none' && row.cells.length >= 8) {
                     const timestamp = row.cells[0].textContent.trim().replace(/,/g, '');
-                    const symbol = row.cells[1].textContent.trim();
-                    const action = row.cells[2].textContent.trim();
-                    const qty = row.cells[3].textContent.trim();
-                    const price = row.cells[4].textContent.trim().replace('$', '').replace(/,/g, '');
-                    const status = row.cells[5].textContent.trim();
-                    const orderId = row.cells[6].textContent.trim();
+                    const symbol = row.cells[2].textContent.trim();
+                    const action = row.cells[3].textContent.trim();
+                    const qty = row.cells[4].textContent.trim();
+                    const price = row.cells[5].textContent.trim().replace('$', '').replace(/,/g, '');
+                    const status = row.cells[6].textContent.trim();
+                    const orderId = row.cells[7].textContent.trim();
                     
                     csvContent += `"${timestamp}","${symbol}","${action}",${qty},${price},"${status}","${orderId}"\\r\\n`;
                     count++;
