@@ -42,12 +42,25 @@ agent-trade/
 │   └── dashboard.py      # Streamlit-based monitoring dashboard
 │
 ├── deploy/               # Deployment Automation
+│   └── deploy_cloud.ps1  # Cloud Run job + Cloud Scheduler deploy
 │   └── create_task.ps1   # PowerShell Windows Scheduled Task registrar
 │
+├── docs/                 # Technical documentation & incident notes
+│   ├── equity_desk_guardrails.md       # the 2026-09-02 loss-guardrail design
+│   ├── held_positions_universe_guardrail_fix.md
+│   └── fractional_shares_and_jira_logging_fix.md
+│
+├── feedback/             # Agent-facing "do-not-do-X" learning briefs
+│   └── equity_lessons.md # equity-desk loss playbook for Screener/MetaStrategist
+│
 ├── tools/                # Administrative Utilities
-│   └── get_correct_balances.py  # Alpaca cash ledger & balance backfill tool
+│   ├── equity_trade_forensics.py  # read-only loss forensics (equity desk)
+│   ├── pull_cloud_db.py           # pull authoritative cloud DB from GCS
+│   └── get_correct_balances.py    # Alpaca cash ledger & balance backfill tool
 │
 └── tests/                # Code Quality and Sanity Verification Tests
+    ├── test_universe_guardrail.py # strict-universe guardrail tests
+    ├── test_anti_scale_in.py      # anti-averaging-down guardrail tests
     ├── test_alpaca.py    # Alpaca connectivity test script
     ├── test_db.py        # Database query verification script
     ├── test_fetch.py     # Dashboard HTTP status check script
@@ -136,7 +149,30 @@ To prevent the LLM from making erratic or high-risk trading decisions, the deter
 * **Max Allocation Size**: No single trade value can exceed **10% of total portfolio equity**. If the LLM requests more, the guardrails automatically **scale down** the share quantity to the maximum allowed safe value instead of failing.
 * **Daily Drawdown Limit**: If portfolio value drops **2%** from the starting equity, all buying activities are blocked. Only sell orders (to liquidate/risk-reduce) are allowed.
 * **Cash Buffer**: The agent is blocked from buying if cash falls below a **5% cash reserve cushion** of total equity.
-* **Strict Universe**: The agent is blocked from trading any ticker outside of `config.TRADING_UNIVERSE` (`["SPY", "QQQ"]` by default).
+* **Strict Universe**: The agent is blocked from trading any ticker outside of `config.TRADING_UNIVERSE` (`["SPY", "QQQ"]` by default), the latest screener watchlist, or a currently-held position.
+
+### Equity-Desk Loss Guardrails (added 2026-09-02)
+
+Forensics on realized round-trips (7/7 → 8/31) showed the equity desk lost money in three
+distinct patterns: (1) the fallback/static-universe path kept **buying untracked names** the
+screener never endorsed (-$540, 8.6% win rate on names like SPY/QQQ/AMD/INTC/TSLA that never
+appeared in the watchlist), (2) the agent **averaged down** into a held losing position
+(MS dip-add, -$226), and (3) it kept **re-entering chronic losers** with very low win rates
+(KO 0%, MS 17%). Three deterministic guardrails now close these holes:
+
+* **Strict-Universe Guardrail** (`STRICT_UNIVERSE_ENABLED`, default `true`): a NEW buy is
+  blocked unless the symbol is in the latest screener watchlist, is crypto, or is currently
+  held. The fallback path can no longer open positions in names the screener never picked.
+* **Anti-Scale-In Guardrail**: blocks **adding** to a held position when the current price is
+  below its average entry price (averaging down = falling-knife accumulation). Crypto is exempt.
+* **Low Win-Rate Circuit Breaker** (`MIN_LOW_WIN_RATE_TRADES=5`, `MAX_LOW_WIN_RATE=0.25`):
+  if a symbol has ≥5 closed round-trips in the lookback window with a realized win rate below
+  25%, new BUYs are blocked even without a string of consecutive losses.
+
+These work alongside the existing per-ticker (consecutive-loss + whipsaw-trap) and intra-day
+PnL circuit breakers. The MetaStrategist is also told, via structured feedback, to **rewrite**
+(not restate) rules for any "chronic loser" symbol. See
+[docs/equity_desk_guardrails.md](docs/equity_desk_guardrails.md) for details and tuning.
 
 ---
 
