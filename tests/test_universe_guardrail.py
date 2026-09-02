@@ -29,6 +29,11 @@ class TestStrictUniverseGuardrail(unittest.TestCase):
     def setUp(self):
         init_db()
         _clean()
+        # Clear the process-global feedback FIFO memo cache so round-trips computed
+        # on a DIFFERENT test DB by an earlier test module don't leak in and trip
+        # the circuit breaker for symbols we test here (e.g. SOL/USD).
+        import core.feedback as fb
+        fb._memo.clear()
 
     def _buy(self, symbol, qty=1.0, price=100.0):
         decision = {"action": "BUY", "symbol": symbol, "quantity": qty,

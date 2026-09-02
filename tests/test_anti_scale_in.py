@@ -32,6 +32,10 @@ class TestAntiScaleIn(unittest.TestCase):
     def setUp(self):
         init_db()
         _clean()
+        # Clear the process-global feedback FIFO memo cache so round-trips computed
+        # on a DIFFERENT test DB by an earlier module don't trip the circuit breaker.
+        import core.feedback as fb
+        fb._memo.clear()
         self.g = RiskGuardrails()
 
     def _buy(self, symbol, positions, price=100.0, qty=1.0):

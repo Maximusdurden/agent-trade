@@ -13,6 +13,7 @@ from this module so the analytics stay consistent.
 """
 
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -429,6 +430,22 @@ def feedback_text(symbol: str | None = None,
     if symbol:
         lines.append(f"--- {st['symbol']} (decayed over past {lookback_days}d) ---")
         lines.append(format_symbol_feedback(st))
+        # Chronic-loser hard flag: if this symbol has enough round-trips and a
+        # persistently low decayed win rate, the rule MUST be rewritten rather than
+        # restated. Mirrors the guardrail circuit breaker (KO 0% / MS 17%).
+        min_rt = int(os.getenv("MIN_LOW_WIN_RATE_TRADES", "5"))
+        min_wr = float(os.getenv("MAX_LOW_WIN_RATE", "0.25"))
+        if st["n_trades"] >= min_rt and st["win_rate"] < min_wr:
+            lines.append(
+                "CHRONIC LOSER FLAG: this symbol is a chronic loser "
+                f"({st['n_trades']} round-trips, decayed win rate {st['win_rate']}% "
+                f"< {min_wr*100:.0f}%). The existing rule is demonstrably failing. "
+                "You MUST NOT restate or tweak the current rule. Instead REWRITE it "
+                "with a materially different, more conservative entry (stronger VWAP "
+                "threshold, RSI requirement, tighter allocation, or a holding-time "
+                "exit), OR explicitly recommend removing this symbol from the active "
+                "universe until conditions change."
+            )
     lines.append("--- PORTFOLIO-GLOBAL CONTEXT ---")
 
     lines.append(
