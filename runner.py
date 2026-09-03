@@ -54,6 +54,48 @@ def build_appraisal_universe(screened_symbols: list[str], positions: dict,
     return list(dict.fromkeys(candidates))
 
 
+def maybe_run_intraday_options_watch(alpaca_client, positions: dict) -> bool:
+    """While we HOLD an option position, re-tune the options strategy every cooldown.
+
+    Options are "time bombs" (theta/IV/DTE decay risk), so the strategist should
+    stay locked onto any open leveraged position intraday — not just once after
+    market close. This runs the options track on a short DB-backed cooldown
+    (default 30m). Returns True when a tune was attempted+persisted, False
+    otherwise (off cooldown, or nothing to do).
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from core import database, config as _cfg
+    from core.feedback import is_option_contract_symbol, option_underlying
+
+    held_occs = [s for s in positions if is_option_contract_symbol(s)]
+    if not held_occs:
+        return False
+
+    cooldown_min = float(getattr(_cfg, "OPTIONS_WATCH_COOLDOWN_MINUTES", 30))
+    status_ts = database.get_system_state("last_options_intraday_watch")
+    due = True
+    if status_ts:
+        try:
+            last_intraday = _dt.fromisoformat(str(status_ts))
+            if last_intraday.tzinfo is not None:
+                last_intraday = last_intraday.astimezone(_tz.utc).replace(tzinfo=None)
+            elapsed = (_dt.utcnow() - last_intraday).total_seconds() / 60.0
+            due = elapsed >= cooldown_min
+        except Exception:
+            due = True
+
+    held_underlyings = list(dict.fromkeys(option_underlying(s) for s in held_occs))
+    if not due:
+        logger.info(f"Options held ({held_underlyings}); within {cooldown_min}m cooldown, skipping.")
+        return False
+
+    from core.strategist import MetaStrategist
+    refined = MetaStrategist().run_option_strategy_refinement(alpaca_client)
+    database.set_system_state("last_options_intraday_watch", _dt.utcnow().isoformat())
+    logger.info(f"INTRADAY options watch refined for {held_underlyings}: {refined}")
+    return True
+
+
 SHOCK_COOLDOWN_MINUTES = 60
 # Cooldown between on-demand strategy-refinement attempts for a missing rule.
 STRATEGY_REFRESH_COOLDOWN_MINUTES = 60
@@ -378,6 +420,17 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                         logger.info(f"Daily OPTIONS strategy track refined: {refined_opts}")
                 except Exception as opt_strat_err:
                     logger.warning(f"Daily OPTIONS strategy track failed: {opt_strat_err}")
+
+                # D. INTRADAY OPTIONS WATCH (runs every cycle while we HOLD an option).
+                # Options are "time bombs" — theta/IV decay means risk changes intraday,
+                # not just daily. While any option position is open, re-run the options
+                # strategy track on a short cooldown (default 30m) so the strategist
+                # stays locked onto the leveraged position and tunes its knobs as the
+                # market / PnL / DTE evolves. Harmless if it fails.
+                try:
+                    maybe_run_intraday_options_watch(alpaca_client, positions)
+                except Exception as opt_watch_err:
+                    logger.warning(f"Intraday options watch failed: {opt_watch_err}")
                     
     except Exception as cadence_err:
         logger.error(f"Error handling daily status cadence or smart Friday triggers: {cadence_err}")

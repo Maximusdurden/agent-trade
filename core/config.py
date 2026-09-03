@@ -138,6 +138,10 @@ OPTIONS_DTE_HARD_MAX = int(os.getenv("OPTIONS_DTE_HARD_MAX", "90"))
 # Fallback upper bound the executor uses when no contract is found in the primary
 # DTE window, so a weekly-expiration gap can't cancel a valid option BUY.
 OPTIONS_DTE_FALLBACK_MAX = int(os.getenv("OPTIONS_DTE_FALLBACK_MAX", "90"))
+# Intraday options-watch cooldown (minutes): while we HOLD an option position, the
+# runner re-runs the options strategy track this often so the strategist stays
+# locked onto the leveraged position as theta/IV/PnL/DTE evolve intraday.
+OPTIONS_WATCH_COOLDOWN_MINUTES = float(os.getenv("OPTIONS_WATCH_COOLDOWN_MINUTES", "30"))
 # Max % of equity allocated to a single option position (cost = ask * 100 * contracts).
 OPTIONS_MAX_ALLOCATION_PCT = float(os.getenv("OPTIONS_MAX_ALLOCATION_PCT", "0.05"))
 # Max number of option contracts per ticker.

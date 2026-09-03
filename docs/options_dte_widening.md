@@ -57,3 +57,42 @@ under the `OPTIONS/<UNDERLYING>` rule key. Together they both (a) reduce false
 - `test_fallback_retries_with_wider_window` — confirms a primary miss triggers a
   widened fallback up to the hard max.
 - `test_no_fallback_when_primary_succeeds` — confirms no unnecessary retry.
+
+---
+
+# Intraday Options Watch (stays locked onto open option positions)
+
+**Added:** 2026-09-03.
+
+## Why
+Options are **"time bombs"** — theta/IV/DTE decay means risk changes *intraday*,
+not just day-to-day. The original design only ran the options strategy track **once
+after market close** (16:30 ET), so even a large unrealized PnL on a held option
+wouldn't re-tune the strategy until the next day. That meant the strategist wasn't
+"locked onto" the leveraged position when it mattered.
+
+## What changed (`core/runner.py`)
+Added `maybe_run_intraday_options_watch(alpaca_client, positions)`, called every
+trading cycle. Behavior:
+- **If no option position is held** → no-op (returns `False`).
+- **While any option is held** → re-runs `MetaStrategist().run_option_strategy_refinement()`
+  for the held underlyings every `OPTIONS_WATCH_COOLDOWN_MINUTES` (default **30**).
+- Cooldown is enforced via the DB `system_state` key `last_options_intraday_watch`
+  (UTC), so a re-tune fires at most once per 30 minutes while options are open —
+  never more often, and it's idempotent/harmless if it fails.
+
+## New env var
+- `OPTIONS_WATCH_COOLDOWN_MINUTES` (default `30`) — intraday options-watch cooldown
+  while holding options. Added to the deploy whitelist.
+
+## Behavior summary
+- **Every loop:** brain watches PnL/positions (execution).
+- **While holding an option (every ~30m):** strategist re-tunes option strategy —
+  so it reacts to a sizable PnL / decaying DTE *as it happens*, not the next day.
+- **Once per day after close:** full options strategy refresh (unchanged).
+
+## Tests
+`tests/test_runner_heartbeat.py::TestIntradayOptionsWatch`:
+- no tune when no option held;
+- tunes when an option is held and cooldown elapsed;
+- skips when within the cooldown window.

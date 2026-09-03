@@ -42,5 +42,42 @@ class TestRunnerHeartbeat(unittest.TestCase):
         upload.assert_called_once()
 
 
+class TestIntradayOptionsWatch(unittest.TestCase):
+    @patch("core.database.set_system_state")
+    @patch("core.database.get_system_state", return_value=None)
+    @patch("core.strategist.MetaStrategist")
+    def test_no_tune_when_no_options_held(self, strategist_cls, get_state, set_state):
+        positions = {"NVDA": {"qty": 30}}
+        ran = runner.maybe_run_intraday_options_watch(MagicMock(), positions)
+        self.assertFalse(ran)
+        strategist_cls.assert_not_called()
+
+    @patch("core.database.set_system_state")
+    @patch("core.database.get_system_state", return_value=None)
+    @patch("core.strategist.MetaStrategist")
+    def test_tunes_when_option_held_and_no_prior_watch(self, strategist_cls, get_state, set_state):
+        positions = {"NVDA": {"qty": 30}, "NVDA261016C00230000": {"qty": 4}}
+        strategist_cls.return_value.run_option_strategy_refinement.return_value = ["NVDA"]
+        ran = runner.maybe_run_intraday_options_watch(MagicMock(), positions)
+        self.assertTrue(ran)
+        strategist_cls.return_value.run_option_strategy_refinement.assert_called_once()
+        set_state.assert_called_once()
+        # Stored state key + a value
+        self.assertEqual(set_state.call_args.args[0], "last_options_intraday_watch")
+
+    @patch("core.database.set_system_state")
+    @patch("core.database.get_system_state")
+    @patch("core.strategist.MetaStrategist")
+    def test_skips_when_within_cooldown(self, strategist_cls, get_state, set_state):
+        # A recent timestamp (within 30m) should suppress the tune.
+        from datetime import datetime, timedelta, timezone
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        get_state.return_value = recent
+        positions = {"NVDA261016C00230000": {"qty": 4}}
+        ran = runner.maybe_run_intraday_options_watch(MagicMock(), positions)
+        self.assertFalse(ran)
+        strategist_cls.return_value.run_option_strategy_refinement.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
