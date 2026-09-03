@@ -83,6 +83,26 @@ class OptionExecutor:
             otm_percent_max=otm_max,
             alpaca_client=self.client,
         )
+        # WIDER-WINDOW FALLBACK: if no contract matched the primary DTE window
+        # (e.g. weeklies cluster just outside the window on a rollover day), retry
+        # with a wider range up to the hard bound. This prevents a transient option
+        # chain gap from cancelling a valid, high-conviction option BUY, and mirrors
+        # dexter-trader's more robust DTE window.
+        if contract is None and dte_max < getattr(config, "OPTIONS_DTE_FALLBACK_MAX", 90):
+            fallback_max = int(getattr(config, "OPTIONS_DTE_FALLBACK_MAX", 90))
+            logger.warning(
+                f"No {option_type} for {symbol} within DTE {dte_min}-{dte_max}; "
+                f"retrying with widened window up to DTE {fallback_max}."
+            )
+            contract = find_best_option(
+                underlying_symbol=symbol,
+                option_type=option_type,
+                days_out_min=dte_min,
+                days_out_max=fallback_max,
+                otm_percent_min=otm_min,
+                otm_percent_max=otm_max,
+                alpaca_client=self.client,
+            )
         if contract is None:
             raise ValueError(f"No suitable {option_type} option found for {symbol} within DTE {dte_min}-{dte_max}.")
         return contract

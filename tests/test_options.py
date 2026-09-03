@@ -206,6 +206,77 @@ class TestsOptionLifecycle(unittest.TestCase):
         self.assertFalse(mc._called)
 
 
+class TestsOptionExecutorWideWindowFallback(unittest.TestCase):
+    """Verifies the widened DTE fallback in option_executor._resolve_contract."""
+
+    def test_fallback_retries_with_wider_window(self):
+        from core.option_executor import OptionExecutor
+        from core import option_picker
+        import core.config as _cfg
+        import unittest.mock as um
+
+        _orig_min, _orig_max = _cfg.OPTIONS_DTE_MIN, _cfg.OPTIONS_DTE_MAX
+        _cfg.OPTIONS_DTE_MIN = 30
+        _cfg.OPTIONS_DTE_MAX = 45
+        _cfg.OPTIONS_DTE_FALLBACK_MAX = 90
+
+        class OKContract:
+            symbol = "NVDA  261016C00235000"
+            ask_price = 6.5
+            premium_cost = 650.0
+
+        client = object()
+        executor = OptionExecutor(client)
+        contracts = []
+        def fake_fbo(underlying_symbol, option_type, days_out_min, days_out_max,
+                     otm_percent_min, otm_percent_max, alpaca_client):
+            contracts.append((days_out_min, days_out_max))
+            if len(contracts) == 1:
+                return None
+            return OKContract()
+
+        with um.patch.object(option_picker, "find_best_option", side_effect=fake_fbo):
+            with um.patch("core.option_executor.config.OPTIONS_DTE_FALLBACK_MAX", 90):
+                result = executor._resolve_contract("NVDA", "bullish", {})
+
+        self.assertEqual(len(contracts), 2, "Expected primary + widened fallback call")
+        primary_min, primary_max = contracts[0]
+        fallback_min, fallback_max = contracts[1]
+        self.assertEqual((primary_min, primary_max), (30, 45))
+        self.assertEqual(fallback_max, 90, "Fallback should widen DTE up to the hard max")
+        self.assertEqual(result.symbol, "NVDA  261016C00235000")
+
+        _cfg.OPTIONS_DTE_MIN, _cfg.OPTIONS_DTE_MAX = _orig_min, _orig_max
+
+    def test_no_fallback_when_primary_succeeds(self):
+        from core.option_executor import OptionExecutor
+        from core import option_picker
+        import core.config as _cfg
+        import unittest.mock as um
+
+        _orig_min, _orig_max = _cfg.OPTIONS_DTE_MIN, _cfg.OPTIONS_DTE_MAX
+        _cfg.OPTIONS_DTE_MIN = 30
+        _cfg.OPTIONS_DTE_MAX = 45
+
+        class OKContract:
+            symbol = "NVDA  261016C00235000"
+            ask_price = 6.5
+            premium_cost = 650.0
+
+        executor = OptionExecutor(object())
+        contracts = []
+        def fake_fbo(underlying_symbol, option_type, days_out_min, days_out_max,
+                     otm_percent_min, otm_percent_max, alpaca_client):
+            contracts.append((days_out_min, days_out_max))
+            return OKContract()
+
+        with um.patch.object(option_picker, "find_best_option", side_effect=fake_fbo):
+            result = executor._resolve_contract("NVDA", "bullish", {})
+
+        self.assertEqual(len(contracts), 1, "No widened retry when primary succeeds")
+        _cfg.OPTIONS_DTE_MIN, _cfg.OPTIONS_DTE_MAX = _orig_min, _orig_max
+
+
 def _snapshot_for_dte(dte: int) -> FakeSnapshot:
     """Build a valid snapshot for the given DTE with reasonable values."""
     exp = date.today() + timedelta(days=dte)

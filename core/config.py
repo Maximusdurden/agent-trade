@@ -127,11 +127,17 @@ OPTIONS_UNIVERSE = [
     "AMZN", "MSFT", "META", "GOOGL", "AMD",
 ]
 # Default DTE (days-to-expiry) window for option selection.
+# A wide window (30-60) mirrors dexter-trader's more robust picker and avoids
+# "no suitable option within DTE 30-45" gaps when weeklies/Monthlies cluster just
+# outside a narrow window. The executor additionally retries up to the hard max.
 OPTIONS_DTE_MIN = int(os.getenv("OPTIONS_DTE_MIN", "30"))
-OPTIONS_DTE_MAX = int(os.getenv("OPTIONS_DTE_MAX", "45"))
+OPTIONS_DTE_MAX = int(os.getenv("OPTIONS_DTE_MAX", "60"))
 # Hard safety bounds on DTE. The agent may override within these bounds only.
 OPTIONS_DTE_HARD_MIN = int(os.getenv("OPTIONS_DTE_HARD_MIN", "14"))
 OPTIONS_DTE_HARD_MAX = int(os.getenv("OPTIONS_DTE_HARD_MAX", "90"))
+# Fallback upper bound the executor uses when no contract is found in the primary
+# DTE window, so a weekly-expiration gap can't cancel a valid option BUY.
+OPTIONS_DTE_FALLBACK_MAX = int(os.getenv("OPTIONS_DTE_FALLBACK_MAX", "90"))
 # Max % of equity allocated to a single option position (cost = ask * 100 * contracts).
 OPTIONS_MAX_ALLOCATION_PCT = float(os.getenv("OPTIONS_MAX_ALLOCATION_PCT", "0.05"))
 # Max number of option contracts per ticker.
