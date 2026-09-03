@@ -72,6 +72,15 @@ If you want `OPTIONS_DTE_FALLBACK_MAX` (or the widened defaults) to be configura
 at runtime, add it to the `$AllowedRuntimeKeys` whitelist in the deploy script. The
 code defaults (`30`/`60`) work without it.
 
+> **⚠️ Env overrides code (TMCL-894 root cause).** The production `.env` previously
+> set `OPTIONS_DTE_MAX=45`, which **overrode** the widened 60 code default — so the
+> deployed image still opened with a 30-45 window and re-emitted the 
+> "No suitable CALL within DTE 30-45" error. When the code default is changed, you
+> **must** also update the deployed `.env` (`OPTIONS_DTE_MAX=60`,
+> `OPTIONS_DTE_FALLBACK_MAX=90`) or the running job will keep the old window. The
+> error message always shows the *original* `dte_max` even after the fallback runs,
+> so "30-45" in the message does **not** prove the fallback didn't happen.
+
 ## Related: options-aware strategy learning
 This DTE widening complements the dedicated OPTIONS strategy track (see commit
 `279a45b`), where the strategist tunes option-specific knobs (conviction threshold,

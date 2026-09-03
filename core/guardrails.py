@@ -120,6 +120,11 @@ class RiskGuardrails:
         This lets a high-conviction add to a name the screener is currently
         endorsing go through, even slightly below entry — matching the documented
         intent of blocking only *unendorsed* averaging-down (the MS failure mode).
+
+        **Noise tolerance:** trivial dips within ``ANTI_SCALE_IN_TOLERANCE_PCT``
+        (default 0.5%) are treated as flat — not "averaging down into a loser."
+        This prevents a 0.1% quote dip from wrongly blocking a legitimate add
+        (e.g. PG held at $147.54, currently $147.42 = 0.08% below entry).
         """
         if proposed_qty <= 0 or current_price <= 0:
             return None
@@ -138,6 +143,10 @@ class RiskGuardrails:
         if current_price >= avg_entry:
             return None
         drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0
+        # Noise tolerance: treat sub-tolerance dips as flat, not a losing add.
+        tolerance = float(getattr(config, "ANTI_SCALE_IN_TOLERANCE_PCT", 0.5))
+        if drawdown_pct <= tolerance:
+            return None
         return (f"Rejected: Anti-scale-in guardrail. {symbol} is held at ${avg_entry:.2f} "
                 f"but currently ${current_price:.2f} ({drawdown_pct:.1f}% below entry). "
                 f"Adding to a losing position is the MS dip-add failure mode. "

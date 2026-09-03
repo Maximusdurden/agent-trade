@@ -72,6 +72,26 @@ class TestAntiScaleIn(unittest.TestCase):
         ok, msg, _ = self._buy("MS", pos, price=213.0)  # above avg -> not averaged down
         self.assertTrue(ok, f"Add above entry (not averaging down) should be allowed: {msg}")
 
+    def test_small_dip_within_tolerance_allowed(self):
+        # Unwatched, but the dip is trivial (< tolerance 0.5%) -> treated as flat,
+        # not "averaging down into a loser". Mirrors the PG 0.1% case.
+        _set_watchlist(["MSFT"])
+        import core.config as cfg
+        cfg.ANTI_SCALE_IN_TOLERANCE_PCT = 0.5
+        pos = {"PG": {"qty": 10, "avg_entry_price": 147.54}}
+        ok, msg, _ = self._buy("PG", pos, price=147.42)  # ~0.08% below entry
+        self.assertTrue(ok, f"Sub-tolerance dip should be allowed: {msg}")
+
+    def test_meaningful_dip_beyond_tolerance_blocked(self):
+        # Unwatched and a real dip (> tolerance) -> anti-scale-in fires.
+        _set_watchlist(["MSFT"])
+        import core.config as cfg
+        cfg.ANTI_SCALE_IN_TOLERANCE_PCT = 0.5
+        pos = {"PG": {"qty": 10, "avg_entry_price": 147.54}}
+        ok, msg, _ = self._buy("PG", pos, price=145.00)  # ~1.7% below entry
+        self.assertFalse(ok, f"Meaningful avg-down should be blocked: {msg}")
+        self.assertIn("Anti-scale-in", msg)
+
     def test_crypto_ignores_scale_in(self):
         _set_watchlist(["MSFT"])
         pos = {"SOL/USD": {"qty": 10, "avg_entry_price": 150.0}}

@@ -47,6 +47,11 @@ CIRCUIT_BREAKER_LOOKBACK_DAYS = int(os.getenv("CIRCUIT_BREAKER_LOOKBACK_DAYS", "
 # de-risk remain allowed.
 MIN_LOW_WIN_RATE_TRADES = int(os.getenv("MIN_LOW_WIN_RATE_TRADES", "5"))
 MAX_LOW_WIN_RATE = float(os.getenv("MAX_LOW_WIN_RATE", "0.25"))
+# Anti-scale-in noise tolerance (%). Trivial dips at or below this are treated as
+# flat (not "averaging down into a loser"), so a 0.1% quote dip doesn't wrongly
+# block a legitimate add to a held position. Only *meaningful* averaging-down
+# (beyond this tolerance) is blocked.
+ANTI_SCALE_IN_TOLERANCE_PCT = float(os.getenv("ANTI_SCALE_IN_TOLERANCE_PCT", "0.5"))
 
 # Crypto TP/SL Bracket Support
 # When True, crypto BUYs get a bracket (take-profit + stop-loss) order like

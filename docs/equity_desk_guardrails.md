@@ -46,6 +46,11 @@ names the screener is **not** currently endorsing — the actual MS "buy-the-dip
 This lets a high-conviction (e.g. 70%+) add to a currently-watchlisted name like a held PG go
 through instead of being wrongly rejected.
 
+**Noise tolerance** (`ANTI_SCALE_IN_TOLERANCE_PCT`, default `0.5`): trivial dips at or below
+this % are treated as flat (NOT "averaging down into a loser"), so a 0.1% quote dip doesn't
+wrongly block a legitimate add. Only *meaningful* averaging-down beyond the tolerance is
+blocked. This directly addressed the PG case (held at $147.54, bid $147.42 = ~0.08% below).
+
 ### 3. Low Win-Rate Circuit Breaker
 
 `MIN_LOW_WIN_RATE_TRADES` (default `5`) · `MAX_LOW_WIN_RATE` (default `0.25`)
