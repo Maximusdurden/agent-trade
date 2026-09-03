@@ -468,3 +468,118 @@ def feedback_text(symbol: str | None = None,
         "holding-time exit) so it is testable against future round-trips."
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Options-specific feedback (learn from leveraged option PnL separately)
+# ---------------------------------------------------------------------------
+# OCC option contract: 6-char root (+ padding), 6-digit date, C/P, 8-digit strike
+_OCC_RE = __import__("re").compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def is_option_contract_symbol(symbol: str) -> bool:
+    """Return True if a symbol is an OCC option contract (e.g. NVDA261016C00230000)."""
+    clean = (symbol or "").upper().replace(" ", "")
+    return bool(_OCC_RE.match(clean)) and not clean.endswith("USD")
+
+
+def option_underlying(symbol: str) -> str:
+    """Extract the underlying root ticker from an OCC option symbol."""
+    clean = (symbol or "").upper().replace(" ", "")
+    for i, ch in enumerate(clean):
+        if ch.isdigit():
+            return clean[:i]
+    return clean
+
+
+def options_feedback(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+                     half_life_days: int = DEFAULT_HALF_LIFE_DAYS) -> dict:
+    """Aggregate option round-trip PnL, grouped by underlying, with decay weighting.
+
+    Options are LEVERAGED instruments with their own risk/instrument knobs, so
+    the strategist needs a separate feedback block than stocks. This returns
+    per-underlying option stats plus a portfolio-level option rollup.
+
+    Returns:
+        {
+          "n_closed": total option round-trips,
+          "total_pnl": decay-weighted total option PnL,
+          "by_underlying": {UNDERLYING: {n, pnl, win_rate, buckets...}},
+        }
+    """
+    trips = compute_closed_round_trips(lookback_days=lookback_days)
+    option_trips = [t for t in trips if is_option_contract_symbol(t["symbol"])]
+
+    by_underlying = defaultdict(lambda: defaultdict(float))
+    counts = defaultdict(int)
+    wins = defaultdict(int)
+    bucket_counts = defaultdict(lambda: defaultdict(int))
+    per_underlying_pnl = defaultdict(float)
+    total_pnl = 0.0
+
+    for t in option_trips:
+        underlying = option_underlying(t["symbol"])
+        w = _age_weight(t["close_ts"], half_life_days)
+        counts[underlying] += 1
+        per_underlying_pnl[underlying] += w * t["pnl"]
+        total_pnl += w * t["pnl"]
+        if t["win"]:
+            wins[underlying] += 1
+        bk = holding_bucket(t["holding_hours"])
+        bucket_counts[underlying][bk] += 1
+
+    by_underlying_out = {}
+    for underlying in counts:
+        by_underlying_out[underlying] = {
+            "n_trades": counts[underlying],
+            "pnl": round(per_underlying_pnl[underlying], 2),
+            "win_rate": round(wins[underlying] / counts[underlying] * 100.0, 2),
+            "buckets": dict(bucket_counts[underlying]),
+        }
+
+    return {
+        "n_closed": len(option_trips),
+        "total_pnl": round(total_pnl, 2),
+        "by_underlying": by_underlying_out,
+    }
+
+
+def format_options_feedback(fb: dict) -> str:
+    """Human-readable options feedback block for the strategist prompt."""
+    if fb.get("n_closed", 0) == 0:
+        return ("=== OPTIONS PERFORMANCE FEEDBACK (LEVERAGE LEARNING) ===\n"
+                "No closed option round-trips in the window yet. Options are "
+                "LEVERAGED instruments; keep option exposure small and ensure the "
+                "strategist tunes option-specific knobs (conviction/DTE/OTM/allocation) "
+                "as soon as the first option round-trip closes.")
+    lines = [
+        "=== OPTIONS PERFORMANCE FEEDBACK (LEVERAGE LEARNING) ===",
+        f"- Closed option round-trips: {fb['n_closed']} | Decay-weighted net PnL: ${fb['total_pnl']:+,.2f}",
+        "",
+        "Per-underlying option outcomes:",
+    ]
+    for underlying, st in fb["by_underlying"].items():
+        lines.append(
+            f"- {underlying}: {st['n_trades']} closed, decayed PnL ${st['pnl']:+,.2f}, "
+            f"win rate {st['win_rate']}%"
+        )
+    lines.append(
+        "OPTIONS COGNITIVE LESSONS:\n"
+        "1. Options are LEVERAGED (100x contract multiplier). A small adverse move "
+        "can produce outsized loss. If any underlying's option PnL is negative, "
+        "REDUCE conviction for that route, tighten DTE/OTM, or lower the option "
+        "allocation for it.\n"
+        "2. Tune option-specific knobs SEPARATELY from stock rules: conviction "
+        "threshold, DTE window, OTM% band, and max contracts per underlying.\n"
+        "3. If options are systematically underperforming stocks on the same "
+        "underlying, prefer the stock route (lower leverage) for that ticker."
+    )
+    return "\n".join(lines)
+
+
+def options_feedback_text(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+                          half_life_days: int = DEFAULT_HALF_LIFE_DAYS) -> str:
+    """Full options feedback block for the strategist prompt."""
+    return format_options_feedback(
+        options_feedback(lookback_days=lookback_days, half_life_days=half_life_days)
+    )

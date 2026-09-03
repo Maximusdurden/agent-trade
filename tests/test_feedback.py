@@ -108,6 +108,59 @@ def test_next_strategy_version_format():
     assert len(v) >= 8
 
 
+def test_option_contract_detection_and_underlying():
+    from core.feedback import is_option_contract_symbol, option_underlying
+    assert is_option_contract_symbol("NVDA261016C00230000")
+    assert is_option_contract_symbol("NVDA 261016C00230000")
+    assert not is_option_contract_symbol("NVDA")
+    assert not is_option_contract_symbol("SOL/USD")
+    assert not is_option_contract_symbol("BTCUSD")
+    assert option_underlying("NVDA261016C00230000") == "NVDA"
+    assert option_underlying("AAPL250117C00200000") == "AAPL"
+
+
+def test_options_feedback_aggregates_by_underlying():
+    from core.feedback import options_feedback, format_options_feedback, _memo
+    init_db()
+    _clean_trades()
+    # Open + close an NVDA call (win) and an NVDA put (loss) to test grouping.
+    log_trade(decision_id=1, alpaca_order_id="o1", symbol="NVDA261016C00230000",
+              side="buy", qty=1.0, filled_avg_price=2.0, status="filled",
+              option_type="CALL", option_dte=30, strike=230.0, contract_symbol="NVDA261016C00230000")
+    log_trade(decision_id=2, alpaca_order_id="o2", symbol="NVDA261016C00230000",
+              side="sell", qty=1.0, filled_avg_price=3.0, status="filled")
+    log_trade(decision_id=3, alpaca_order_id="o3", symbol="NVDA261016P00230000",
+              side="buy", qty=1.0, filled_avg_price=2.0, status="filled",
+              option_type="PUT", option_dte=30, strike=230.0, contract_symbol="NVDA261016P00230000")
+    log_trade(decision_id=4, alpaca_order_id="o4", symbol="NVDA261016P00230000",
+              side="sell", qty=1.0, filled_avg_price=1.0, status="filled")
+    _memo.clear()  # drop the 60s process-wide FIFO cache so we see the new trades
+
+    fb = options_feedback()
+    assert fb["n_closed"] == 2
+    assert "NVDA" in fb["by_underlying"]
+    nvda = fb["by_underlying"]["NVDA"]
+    assert nvda["n_trades"] == 2
+    # call +1, put -1 -> net ~0 (decay may make it slightly off, but sign/scale sane)
+    assert abs(nvda["pnl"]) < 1.0
+    text = format_options_feedback(fb)
+    assert "OPTIONS PERFORMANCE FEEDBACK" in text
+    assert "NVDA" in text
+    _clean_trades()
+
+
+def test_options_feedback_empty_when_no_option_trades():
+    from core.feedback import options_feedback, format_options_feedback, _memo
+    init_db()
+    _clean_trades()
+    _memo.clear()
+    fb = options_feedback()
+    assert fb["n_closed"] == 0
+    text = format_options_feedback(fb)
+    assert "No closed option round-trips" in text
+    _clean_trades()
+
+
 if __name__ == "__main__":
     tests = [
         test_fifo_round_trips_and_pnl,
@@ -115,6 +168,9 @@ if __name__ == "__main__":
         test_symbol_stats_winrate_and_buckets,
         test_get_strategy_before_returns_prior_rule,
         test_next_strategy_version_format,
+        test_option_contract_detection_and_underlying,
+        test_options_feedback_aggregates_by_underlying,
+        test_options_feedback_empty_when_no_option_trades,
     ]
     failed = 0
     for fn in tests:

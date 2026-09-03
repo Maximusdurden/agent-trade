@@ -365,6 +365,19 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                     ab_notify_main(["--no-pull", "--db", str(_AB_DB_PATH)])
                 except Exception as ab_err:
                     logger.warning(f"Strategist A/B notify skipped/failed: {ab_err}")
+
+                # C. Daily OPTIONS strategy track (once per day, after market close).
+                # Options are leveraged; tune their instrument knobs (conviction
+                # threshold, DTE, OTM%, allocation) on a SEPARATE curve from stocks.
+                try:
+                    last_opts = database.get_system_state("last_options_strategy_sent")
+                    if last_opts != today_str:
+                        from core.strategist import MetaStrategist
+                        refined_opts = MetaStrategist().run_option_strategy_refinement(alpaca_client)
+                        database.set_system_state("last_options_strategy_sent", today_str)
+                        logger.info(f"Daily OPTIONS strategy track refined: {refined_opts}")
+                except Exception as opt_strat_err:
+                    logger.warning(f"Daily OPTIONS strategy track failed: {opt_strat_err}")
                     
     except Exception as cadence_err:
         logger.error(f"Error handling daily status cadence or smart Friday triggers: {cadence_err}")
@@ -552,10 +565,28 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                 option_executor = OptionExecutor(alpaca_client)
                 option_result = option_executor.execute(adjusted_decision, account_state)
                 logger.info(f"Option order result for {symbol}: {option_result}")
+                option_symbol = option_result.get("symbol", symbol)
+                # Parse OCC metadata (root/DTE/type/strike) for the trade log so
+                # the feedback/learning engine can attribute option PnL.
+                option_meta = {}
+                try:
+                    from core.option_picker import parse_option_symbol
+                    parsed_occ = parse_option_symbol(option_symbol)
+                    if parsed_occ:
+                        option_meta = {
+                            "option_type": parsed_occ["type"],
+                            "option_dte": (
+                                parsed_occ["expiration_date"] - datetime.utcnow().date()
+                            ).days,
+                            "strike": parsed_occ["strike_price"],
+                            "contract_symbol": parsed_occ["symbol"],
+                        }
+                except Exception as occ_parse_err:
+                    logger.warning(f"Could not parse OCC metadata for {option_symbol}: {occ_parse_err}")
                 try:
                     database.log_execution(
                         decision_id=decision_id, attempt=1,
-                        symbol=option_result.get("symbol", symbol), side=action.lower(),
+                        symbol=option_symbol, side=action.lower(),
                         qty=option_result.get("contracts", qty), order_type="option",
                         status=str(option_result.get("status", "submitted")),
                         error=None if option_result.get("status") != "failed" else option_result.get("summary"),
@@ -563,6 +594,22 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                     )
                 except Exception as log_ex:
                     logger.error(f"Failed to log option execution: {log_ex}")
+                # Log the option fill to the trades table so the feedback engine
+                # (compute_closed_round_trips) can track option PnL for learning.
+                if str(option_result.get("status", "")).lower() in ("filled", "partially_filled", "closed"):
+                    try:
+                        database.log_trade(
+                            decision_id=decision_id,
+                            alpaca_order_id=option_result.get("order_info", {}).get("id"),
+                            symbol=option_symbol,
+                            side=action,
+                            qty=option_result.get("contracts", qty),
+                            filled_avg_price=option_result.get("order_info", {}).get("filled_avg_price"),
+                            status=str(option_result.get("status", "submitted")),
+                            **option_meta,
+                        )
+                    except Exception as tr_ex:
+                        logger.error(f"Failed to log option trade: {tr_ex}")
                 executed_results.append(f"OPTION {action} {option_result.get('contracts', qty)}x {symbol}")
                 option_executed = True
             except Exception as e:
@@ -675,6 +722,23 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                 )
             except Exception as exec_log_err:
                 logger.error(f"Failed to log failed execution: {exec_log_err}")
+
+    # 8b. Broker-order reconciliation (learning-engine safety net).
+    # The runner logs fills it executes itself, but broker-side fills — option
+    # SELL-to-close, the option auto-close sweep, TP/SL bracket fills, dust
+    # liquidations — never reach the local trades table. Backfill ANY closed
+    # broker order (deduped by alpaca_order_id) so the feedback engine's
+    # round-trip computation sees both stock AND option PnL. This is what lets
+    # the strategist learn from options.
+    try:
+        from core import database as _db
+        broker_orders = alpaca_client.get_executed_orders(limit=500)
+        if broker_orders:
+            inserted = _db.reconcile_broker_orders(broker_orders)
+            if inserted:
+                logger.info(f"Broker reconciliation backfilled {inserted} fill(s) into trades table.")
+    except Exception as reco_err:
+        logger.error(f"Broker-order reconciliation failed: {reco_err}")
 
     # 9. Sync database and logs to GCS if configured
     try:

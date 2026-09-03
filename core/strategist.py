@@ -426,6 +426,212 @@ Schema:
             logger.error(f"Failed to run emergency refinement for {ticker}: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # OPTIONS STRATEGY TRACK
+    # ------------------------------------------------------------------
+    def run_option_strategy_refinement(self, alpaca_client: AlpacaClient) -> list[str]:
+        """Runs a dedicated options-strategy refinement for every underlying with
+        option exposure (held option positions OR options-universe config).
+
+        Options are LEVERAGED instruments with their own instrument knobs (conviction
+        threshold, DTE window, OTM% band, max contracts/allocation). Their strategy
+        rules are stored under the special ticker key ``OPTIONS/<UNDERLYING>`` and are
+        tuned SEPARATELY from the stock track, so leverage risk is learned and managed
+        on its own curve. Returns the list of underlyings refined.
+        """
+        # Determine which underlyings to tune for options.
+        underlyings = []
+        seen = set()
+        for u in getattr(config, "OPTIONS_UNIVERSE", []) or []:
+            if u and u.upper() not in seen:
+                underlyings.append(u.upper())
+                seen.add(u.upper())
+
+        # Always include underlyings with current option holdings (even if they
+        # fell out of the static universe) so open leverage is always managed.
+        try:
+            positions = alpaca_client.get_positions()
+            from core.feedback import is_option_contract_symbol, option_underlying
+            for sym in positions:
+                if is_option_contract_symbol(sym):
+                    u = option_underlying(sym)
+                    if u and u not in seen:
+                        underlyings.append(u)
+                        seen.add(u)
+        except Exception as e:
+            logger.warning(f"Could not scan option positions for strategist: {e}")
+
+        refined = []
+        for underlying in underlyings:
+            try:
+                key = f"OPTIONS/{underlying}"
+                logger.info(f"Analyzing OPTIONS strategy for {underlying}...")
+                yesterdays_rules = database.get_active_strategy(key)
+                options_fb = self._options_feedback_text(underlying)
+                bars_summary = ""
+                try:
+                    bars_df = alpaca_client.get_historical_bars(underlying, limit=30)
+                    bars_summary = self._summarize_bars(bars_df)
+                except Exception as be:
+                    logger.warning(f"No stock bars for {underlying} options track: {be}")
+
+                result = self._optimize_option_strategy_for_underlying(
+                    underlying=underlying,
+                    yesterdays_rules=yesterdays_rules,
+                    bars_summary=bars_summary,
+                    options_feedback=options_fb,
+                    account_state=alpaca_client.get_account_state(),
+                )
+                todays_rules = result.get("todays_rules", "").strip()
+                if not todays_rules or todays_rules.startswith("No active strategy"):
+                    logger.error(f"Options strategist produced empty rule for {underlying}.")
+                    continue
+                authored_by = result.get("ab_model") or getattr(config, "STRATEGIST_MODEL_TIER", "heavyweight")
+                model_tag = authored_by.replace("/", "-").replace("_", "-") if authored_by else "unknown"
+                db_id = database.log_strategy_history(
+                    ticker=key,
+                    yesterdays_rules=yesterdays_rules,
+                    todays_rules=todays_rules,
+                    meta_reasoning=result["meta_reasoning"],
+                    strategy_version=f"{next_strategy_version()}|model={model_tag}|track=options"
+                )
+                logger.info(f"OPTIONS strategy updated for {underlying} (key={key}). DB ID: {db_id}")
+                logger.info(f"OPTIONS Rules: {todays_rules}")
+                refined.append(underlying)
+            except Exception as e:
+                logger.error(f"Options strategy refinement failed for {underlying}: {e}")
+        return refined
+
+    def _options_feedback_text(self, underlying: str) -> str:
+        """Options-specific performance feedback for one underlying."""
+        try:
+            from core.feedback import (
+                is_option_contract_symbol, option_underlying,
+                options_feedback, format_options_feedback,
+            )
+            fb = options_feedback()
+            # Narrow to the requested underlying.
+            underlying_fb = {
+                "n_closed": fb["n_closed"],
+                "total_pnl": fb["total_pnl"],
+                "by_underlying": {
+                    u: st for u, st in fb.get("by_underlying", {}).items()
+                    if u == underlying
+                },
+            }
+            return format_options_feedback(underlying_fb)
+        except Exception as e:
+            logger.warning(f"Options feedback unavailable for {underlying}: {e}")
+            return "No options feedback available."
+
+    def _optimize_option_strategy_for_underlying(self, underlying: str, yesterdays_rules: str,
+                                                 bars_summary: str, options_feedback: str,
+                                                 account_state: dict) -> dict:
+        """Sends an options-focused prompt to the LLM and parses the rule output.
+
+        Returns a dict with ``meta_reasoning`` and ``todays_rules``. The rule must
+        govern OPTION trading for the underlying (leverage), NOT stock trading.
+        """
+        if self.is_mock:
+            return {
+                "meta_reasoning": f"[Mock Strategist] Holding options exposure for {underlying} under existing config.",
+                "todays_rules": (yesterdays_rules if not yesterdays_rules.startswith("No active")
+                                 else f"Trade options on {underlying} only with conviction >= 0.7, DTE 30-45, OTM 1-10%, max contracts per allocation."),
+            }
+
+        prompt = f"""
+ROLE:
+You are the Options Risk & Strategy Specialist for an elite AI trading desk. Your job is to write a concise, high-impact **OPTIONS TRADING STRATEGY RULE** paragraph for the underlying **{underlying}**. This governs OPTIONS (long leveraged calls/puts) ONLY — NOT share trades. Options carry a 100x contract multiplier, so leverage discipline is paramount.
+
+=== SYSTEM CONTEXT ===
+- Total Portfolio Net Equity: ${account_state.get('equity', 0.0):,.2f}
+- Options universe includes: {getattr(config, 'OPTIONS_UNIVERSE', [])}
+- Options config knobs you may reference/adjust:
+  - OPTIONS_CONVICTION_THRESHOLD (default {getattr(config, 'OPTIONS_CONVICTION_THRESHOLD', 0.7)}): routing gate to the option path.
+  - OPTIONS_DTE_MIN/MAX (default {getattr(config, 'OPTIONS_DTE_MIN', 30)}-{getattr(config, 'OPTIONS_DTE_MAX', 45)}): contract days-to-expiry window.
+  - OPTIONS_OTM_PERCENT_MIN/MAX (default {getattr(config, 'OPTIONS_OTM_PERCENT_MIN', 0.01)}-{getattr(config, 'OPTIONS_OTM_PERCENT_MAX', 0.10)}): strike out-of-the-money band.
+  - OPTIONS_MAX_ALLOCATION_PCT (default {getattr(config, 'OPTIONS_MAX_ALLOCATION_PCT', 0.05)}): max equity % per option position.
+  - OPTIONS_MAX_CONTRACTS_PER_TICKER (default {getattr(config, 'OPTIONS_MAX_CONTRACTS_PER_TICKER', 5)}): per-underlying contract cap.
+
+=== OPTIONS PERFORMANCE FEEDBACK (LEVERAGE LEARNING) ===
+{options_feedback}
+
+=== UNDERLYING MARKET REGIME (Last 30 Days) ===
+{bars_summary if bars_summary else "No bars available."}
+
+=== YESTERDAY'S OPTIONS STRATEGY RULES ===
+"{yesterdays_rules}"
+
+DIRECTIONS:
+1. Review the options performance feedback. If options on {underlying} are losing money (negative decayed PnL) or underperforming, you MUST tighten option-specific knobs: raise the conviction threshold, shrink DTE/OTM windows, cut the max allocation/contracts, or de-prioritize the option route in favor of shares.
+2. If the underlying's option gamma/leverage exposure is risky (high IV, pinned near strike, large drawdowns on the contract), reduce contracts or require a higher conviction before opening leverage.
+3. Write ONE conditional "IF/THEN" paragraph governing OPTIONS on {underlying}. It MUST reference at least one concrete option knob (conviction threshold, DTE, OTM%, max allocation %, max contracts) so it is testable against future option round-trips.
+4. The rule applies ONLY to option trading for {underlying}; do NOT describe share strategies. Keep it under 3 sentences.
+
+OUTPUT FORMAT:
+Your response must be a single, valid JSON object ONLY.
+Schema:
+{{
+  "meta_reasoning": "Your analytical breakdown of the options performance feedback and the option-specific knob tuning you're recommending.",
+  "todays_rules": "The concise options trading rule paragraph for {underlying}. Must be under 3 sentences and include at least one option-specific IF/THEN knob."
+}}
+"""
+
+        if self.provider == "openrouter":
+            try:
+                from pydantic import BaseModel, Field
+
+                class OptionStrategistResponse(BaseModel):
+                    meta_reasoning: str = Field(description="Options performance analysis and knob tuning.")
+                    todays_rules: str = Field(description="Options trading rule paragraph for the underlying.")
+
+                result = self.llm_client.generate_structured(
+                    prompt=prompt,
+                    response_model=OptionStrategistResponse,
+                    tier=config.STRATEGIST_MODEL_TIER,
+                    explicit_model=self.ab_model,
+                )
+                return {
+                    "meta_reasoning": result.get("meta_reasoning", "Maintained prior options rule."),
+                    "todays_rules": result.get("todays_rules", yesterdays_rules),
+                    "ab_model": self.ab_model,
+                }
+            except Exception as e:
+                logger.error(f"Error calling OpenRouter options strategist for {underlying}: {e}. Using yesterday's rule.")
+                return {"meta_reasoning": f"Options strategist call failed: {e}. Falling back.", "todays_rules": yesterdays_rules}
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "meta_reasoning": types.Schema(type=types.Type.STRING),
+                            "todays_rules": types.Schema(type=types.Type.STRING),
+                        },
+                        required=["meta_reasoning", "todays_rules"],
+                    ),
+                ),
+            )
+            text = response.text.strip()
+            if text.startswith("```"):
+                lines = text.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            result = json.loads(text)
+            return {
+                "meta_reasoning": result.get("meta_reasoning", "Maintained prior options rule."),
+                "todays_rules": result.get("todays_rules", yesterdays_rules),
+            }
+        except Exception as e:
+            logger.error(f"Error calling options strategist for {underlying}: {e}. Using yesterday's rule.")
+            return {"meta_reasoning": f"Options strategist call failed: {e}. Falling back.", "todays_rules": yesterdays_rules}
+
     def _generate_mock_refinement(self, ticker: str, yesterdays_rules: str) -> dict:
         """Fallback mock rules generator if no Gemini API key is configured."""
         logger.info("[Mock Mode] Strategist generating simple rule iteration...")
@@ -445,6 +651,13 @@ def main():
 
     if args.run:
         strategist.run_daily_strategy_refinement(alpaca_client)
+        # Run the dedicated OPTIONS strategy track so leveraged positions are
+        # tuned on their own curve.
+        try:
+            refined_opts = strategist.run_option_strategy_refinement(alpaca_client)
+            logger.info(f"Daily OPTIONS strategist cycle complete. Refined: {refined_opts}")
+        except Exception as opt_err:
+            logger.error(f"Daily OPTIONS strategist cycle failed: {opt_err}")
         logger.info("Daily strategist cycle complete.")
 
 if __name__ == "__main__":
