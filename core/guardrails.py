@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from core import config
 from core.strategy_rules import normalize_symbol, build_symbol_to_cluster
@@ -424,6 +424,12 @@ class RiskGuardrails:
                 if trade_time_str.endswith("Z"):
                     trade_time_str = trade_time_str[:-1]
                 trade_time = datetime.fromisoformat(trade_time_str)
+                # Normalize to a NAIVE UTC datetime. Broker-reconcile/ahead-of-time
+                # timestamps can carry a '+00:00' (or 'Z') offset; datetime.utcnow()
+                # is naive, so subtracting an AWARE datetime would raise
+                # "can't subtract offset-naive and offset-aware datetimes".
+                if trade_time.tzinfo is not None:
+                    trade_time = trade_time.astimezone(timezone.utc).replace(tzinfo=None)
                 time_diff = datetime.utcnow() - trade_time
                 hours_since_last_trade = time_diff.total_seconds() / 3600.0
                 
