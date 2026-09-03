@@ -47,8 +47,16 @@ def format_positions(positions: dict) -> str:
 
 def build_appraisal_universe(screened_symbols: list[str], positions: dict,
                              actual_market_open: bool) -> list[str]:
-    """Build a deduplicated universe, excluding equities whenever their market is closed."""
+    """Build a deduplicated universe, excluding equities whenever their market is closed.
+
+    OCC option contracts (e.g. NVDA261016C00230000) are excluded: the appraisal/brain
+    loop evaluates the *underlying* for a strategy rule and fetches stock bars for it,
+    which an option contract has no data for. The underlying (NVDA) is still included
+    if held/endorsed, so open option exposure is still appraised at the underlying level.
+    """
+    from core.feedback import is_option_contract_symbol
     candidates = [*screened_symbols, *positions.keys()]
+    candidates = [s for s in candidates if not is_option_contract_symbol(s)]
     if not actual_market_open:
         candidates = [symbol for symbol in candidates if is_crypto_symbol(symbol)]
     return list(dict.fromkeys(candidates))

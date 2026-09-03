@@ -51,6 +51,17 @@ class TestWatchlistStrategyCoverage(unittest.TestCase):
 
         self.assertEqual(universe, ["AAPL", "SOL/USD", "NEE"])
 
+    def test_appraisal_universe_excludes_occ_option_contracts(self):
+        # Held option contracts must NOT be appraised as stocks (no stock bars).
+        # The underlying (NVDA) is still included for appraisal.
+        universe = build_appraisal_universe(
+            ["NVDA"],
+            {"NVDA": {"qty": 30}, "NVDA261016C00230000": {"qty": 4}},
+            actual_market_open=True,
+        )
+        self.assertIn("NVDA", universe)
+        self.assertNotIn("NVDA261016C00230000", universe)
+
     def test_crypto_detection_does_not_misclassify_equity_with_usd_letters(self):
         self.assertTrue(is_crypto_symbol("SOL/USD"))
         self.assertTrue(is_crypto_symbol("BTCUSD"))

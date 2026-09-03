@@ -17,6 +17,24 @@ dexter-trader's mature picker uses a wider default window **30-60** (see
 prone to these gaps. This change brings agent-trade's options DTE handling in line
 with that robustness.
 
+## Current open item: OPRA (option quotes/bars) agreement
+
+Option **historical bars** (the `_fetch_option_data` path) require the **OPRA**
+(Options Price Reporting Authority) agreement to be **signed on the Alpaca account**.
+If it is not signed, Alpaca rejects option-bar requests with
+`{"message":"OPRA agreement is not signed"}`. **Action required:** sign the OPRA
+agreement in the Alpaca dashboard (Account → Agreements → Options → OPRA) so the
+strategist/analysis can fetch per-OCC-contract bars. Until then, option analysis
+falls back to underlying-level stock bars and the OPRA path is skipped.
+
+## Appraisal-universe note (OCC exclusion)
+
+Held OCC option contracts (e.g. `NVDA261016C00230000`) are **excluded** from the
+runner's appraisal universe (`build_appraisal_universe` in `runner.py`) so the
+brain loop appraises the **underlying** (NVDA) rather than trying to fetch stock
+bars for a contract. This prevents both `invalid symbol` (old bug) and the OPRA
+error (new, when it fires) from spamming error tickets.
+
 ## What changed
 
 ### 1. Widened the default DTE window (`core/config.py`)
