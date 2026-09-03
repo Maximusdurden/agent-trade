@@ -206,6 +206,55 @@ class TestsOptionLifecycle(unittest.TestCase):
         self.assertFalse(mc._called)
 
 
+class TestsOptionLifecycleRiskSweep(unittest.TestCase):
+    """Verifies the event-gate / exposure-cap risk sweep closes positions."""
+
+    def test_risk_sweep_closes_near_event(self):
+        import core.config as cfg
+        import core.data_provider as dp
+        from core.option_lifecycle import OptionLifecycle
+
+        orig_options = cfg.OPTIONS_ENABLED
+        orig_gate = getattr(cfg, "OPTIONS_EVENT_GATE_ENABLED", None)
+        cfg.OPTIONS_ENABLED = True
+        cfg.OPTIONS_EVENT_GATE_ENABLED = True
+
+        # Earnings tomorrow on NVDA => gate should flatten today.
+        orig_earn = getattr(dp, "get_earnings_dates", None)
+        import pandas as pd
+        def fake_earn(tickers=None, days_ahead=365):
+            d = date.today() + timedelta(days=1)
+            return pd.DataFrame([{"ticker": t.upper(), "earnings_date": d}
+                                 for t in (tickers or [])])
+        dp.get_earnings_dates = fake_earn
+
+        class MockClient:
+            def __init__(self):
+                self.closed = []
+                self.opts = {}
+            def get_option_positions(self):
+                # one NVDA contract held, expiring far out but near earnings
+                return {f"NVDA261216C00230000": {
+                    "qty": 1.0, "qty_available": 1.0, "market_value": 100.0,
+                    "avg_entry_price": 1.0, "unrealized_pnl": 0.0, "is_option": True,
+                }}
+            def get_latest_option_data(self, symbols):
+                return {}  # no greeks -> premium fallback path
+            def close_option_position(self, symbol):
+                self.closed.append(symbol)
+                return {"id": "x", "qty": 1, "status": "closed", "symbol": symbol}
+
+        mc = MockClient()
+        try:
+            results = OptionLifecycle(mc).risk_sweep({"equity": 100000.0})
+            self.assertTrue(any(r["status"] == "closed" for r in results))
+            self.assertTrue(mc.closed)  # at least one position was flattened
+        finally:
+            cfg.OPTIONS_ENABLED = orig_options
+            cfg.OPTIONS_EVENT_GATE_ENABLED = orig_gate
+            dp.get_earnings_dates = orig_earn
+
+
 class TestsOptionExecutorWideWindowFallback(unittest.TestCase):
     """Verifies the widened DTE fallback in option_executor._resolve_contract."""
 

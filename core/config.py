@@ -159,6 +159,31 @@ OPTIONS_MAX_CONTRACTS_PER_TICKER = int(os.getenv("OPTIONS_MAX_CONTRACTS_PER_TICK
 OPTIONS_CONVICTION_THRESHOLD = float(os.getenv("OPTIONS_CONVICTION_THRESHOLD", "0.7"))
 # Auto-close: close option positions when DTE <= this value to avoid exercise/assignment.
 OPTIONS_AUTO_CLOSE_DTE = int(os.getenv("OPTIONS_AUTO_CLOSE_DTE", "3"))
+
+# Options risk-management layer (core/option_risk.py). These are deterministic,
+# LLM-independent controls that ONLY ever close (SELL-to-close) positions — they
+# never open or add risk.
+#
+# 1. EVENT GATE — flatten a held option when its underlying has a high-impact
+#    scheduled event (earnings at/before expiry, optionally FOMC/macro) during
+#    the session before the event. Captures most of the overnight-gap/IV-crush
+#    risk an unconditional end-of-day flatten would, without killing the 30-60
+#    DTE multi-week thesis on normal days.
+OPTIONS_EVENT_GATE_ENABLED = os.getenv("OPTIONS_EVENT_GATE_ENABLED", "true").lower() == "true"
+OPTIONS_EVENT_GATE_INCLUDE_FOMC = os.getenv("OPTIONS_EVENT_GATE_INCLUDE_FOMC", "true").lower() == "true"
+
+# 2. VEGA / DELTA EXPOSURE CAPS — aggregate dollar exposure across the open
+#    options book, as a % of equity. Uses real greeks when available; when greeks
+#    are unavailable (e.g. paper-skipped bars) it degrades to a premium
+#    market-value bound. 0 disables that cap.
+OPTIONS_VEGA_CAP_MV_PCT = float(os.getenv("OPTIONS_VEGA_CAP_MV_PCT", "0.02"))
+OPTIONS_DELTA_CAP_PCT = float(os.getenv("OPTIONS_DELTA_CAP_PCT", "0.15"))
+
+# 3. END-OF-DAY FLAT — hard "flatten the whole options book each session".
+#    OFF by default: it fights the 30-60 DTE swing thesis, compounds spread cost,
+#    and dilutes the strategist's options-learning signal. Prefer the event gate
+#    + caps. Only closes.
+OPTIONS_EOD_FLAT = os.getenv("OPTIONS_EOD_FLAT", "false").lower() == "true"
 # OTM% window for strike selection (1% - 10% out-of-the-money).
 OPTIONS_OTM_PERCENT_MIN = float(os.getenv("OPTIONS_OTM_PERCENT_MIN", "0.01"))
 OPTIONS_OTM_PERCENT_MAX = float(os.getenv("OPTIONS_OTM_PERCENT_MAX", "0.10"))

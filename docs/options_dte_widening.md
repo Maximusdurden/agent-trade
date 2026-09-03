@@ -94,6 +94,15 @@ under the `OPTIONS/<UNDERLYING>` rule key. Together they both (a) reduce false
   widened fallback up to the hard max.
 - `test_no_fallback_when_primary_succeeds` — confirms no unnecessary retry.
 
+## Related: options risk controls (event gate + greeks caps)
+Weighing whether to flatten at end-of-day exposed that the real overnight risk at
+30-60 DTE is **vega/delta** (IV crush + gaps), not theta. Rather than an
+unconditional EOD-flat, we implemented a **conditional** risk layer — see
+`docs/options_risk_controls.md`: the event gate flattens before earnings/FOMC, and
+vega/delta exposure caps bound the book's overnight greeks. `OPTIONS_EOD_FLAT` is
+available but off by default (it fights the 30-60 DTE thesis and dilutes the
+options-learning signal).
+
 ---
 
 # Intraday Options Watch (stays locked onto open option positions)

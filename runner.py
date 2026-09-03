@@ -353,6 +353,21 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         except Exception as ec:
             logger.warning(f"Options auto-close sweep failed: {ec}")
 
+    # 1c. Options risk sweep (event gate + vega/delta exposure caps + optional EOD-flat).
+    #     Deterministic, LLM-independent; flattens high-risk positions BEFORE the brain
+    #     appraises the book, so nothing holds through earnings/FOMC or over-concentrated
+    #     overnight greeks. Only ever closes — never opens risk.
+    if getattr(config, "OPTIONS_ENABLED", False):
+        try:
+            lifecycle = OptionLifecycle(alpaca_client)
+            risk_closed = lifecycle.risk_sweep(account_state)
+            if risk_closed:
+                logger.info(f"Options risk sweep closed {len(risk_closed)} position(s).")
+                for c in risk_closed:
+                    logger.info(f"  - Risk-close: {c.get('summary', c)}")
+        except Exception as ec:
+            logger.warning(f"Options risk sweep failed: {ec}")
+
     # 2. Fetch current active positions
     try:
         positions = alpaca_client.get_positions()
