@@ -461,8 +461,8 @@ class AlpacaClient:
         # Determine TimeFrame object from string
         tf, day_multiplier = self._get_timeframe(timeframe_str)
         
-        # Partition into stock and crypto symbols
-        stock_symbols, crypto_symbols = self._partition_symbols(symbols_list)
+        # Partition into stock, crypto, and option symbols
+        stock_symbols, crypto_symbols, option_symbols = self._partition_symbols(symbols_list)
         
         # Fetch last N days (making sure we cover weekends/holidays)
         start_time = datetime.now() - timedelta(days=limit * day_multiplier)
@@ -470,9 +470,10 @@ class AlpacaClient:
         # Try fetching data with retries
         stock_dfs = self._fetch_stock_data(stock_symbols, tf, start_time, max_retries)
         crypto_dfs = self._fetch_crypto_data(crypto_symbols, tf, start_time, max_retries)
+        option_dfs = self._fetch_option_data(option_symbols, tf, start_time, max_retries)
         
         # Combine results
-        all_dfs = stock_dfs + crypto_dfs
+        all_dfs = stock_dfs + crypto_dfs + option_dfs
         if not all_dfs:
             logger.error(f"Failed to fetch historical bars for symbols: {symbols_list}")
             return pd.DataFrame()
@@ -553,16 +554,66 @@ class AlpacaClient:
             day_multiplier = 2
         return tf, day_multiplier
         
-    def _partition_symbols(self, symbols_list: list[str]) -> tuple[list, list]:
-        """Partition symbols into stock and crypto lists."""
+    def _partition_symbols(self, symbols_list: list[str]) -> tuple[list, list, list]:
+        """Partition symbols into stock, crypto, and option lists.
+
+        OCC option contracts (e.g. ``NVDA261016C00230000``) must NOT be sent to
+        the stock or crypto bars endpoints — Alpaca rejects them with
+        ``invalid symbol``. They are routed to the option bars path instead.
+        """
         stock_symbols = []
         crypto_symbols = []
+        option_symbols = []
         for sym in symbols_list:
-            if "/" in sym or "USD" in sym:
+            if self.is_option_symbol(sym):
+                option_symbols.append(sym)
+            elif "/" in sym or "USD" in sym:
                 crypto_symbols.append(sym)
             else:
                 stock_symbols.append(sym)
-        return stock_symbols, crypto_symbols
+        return stock_symbols, crypto_symbols, option_symbols
+
+    def _fetch_option_data(self, option_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
+        """Fetch option historical bars via the OptionHistoricalDataClient.
+
+        Returns an empty list when no option symbols are requested or when the
+        option data client is unavailable (so the caller degrades gracefully
+        instead of erroring on the stock endpoint).
+        """
+        option_dfs = []
+        if not option_symbols:
+            return option_dfs
+        if self.option_data_client is None:
+            logger.warning(f"Option data client unavailable; skipping option bars for {option_symbols}.")
+            return option_dfs
+        try:
+            from alpaca.data.requests import OptionBarsRequest
+            request_params = OptionBarsRequest(
+                symbol_or_symbols=option_symbols,
+                timeframe=tf,
+                start=start_time,
+                end=datetime.now()
+            )
+            bars = self._fetch_with_retry(self.option_data_client, request_params, self.option_data_client.get_option_bars, max_retries)
+            if bars and bars.df is not None and not bars.df.empty:
+                option_dfs.append(bars.df)
+        except Exception as e:
+            logger.warning(f"Batch option fetch failed for {option_symbols}: {e}. Retrying symbols individually.")
+            for sym in option_symbols:
+                try:
+                    from alpaca.data.requests import OptionBarsRequest
+                    request_params = OptionBarsRequest(
+                        symbol_or_symbols=sym,
+                        timeframe=tf,
+                        start=start_time,
+                        end=datetime.now()
+                    )
+                    bars = self._fetch_with_retry(self.option_data_client, request_params, self.option_data_client.get_option_bars, max_retries)
+                    if bars and bars.df is not None and not bars.df.empty:
+                        option_dfs.append(bars.df)
+                except Exception as sym_err:
+                    logger.error(f"Failed to fetch option bars for {sym}: {sym_err}")
+        return option_dfs
         
     def _fetch_stock_data(self, stock_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
         """Fetch stock data with retries and fallbacks."""

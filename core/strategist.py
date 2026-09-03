@@ -33,10 +33,19 @@ logger = logging.getLogger("MetaStrategist")
 
 
 def build_strategy_universe(positions: dict, watchlist_tickers: list[str]) -> list[str]:
-    """Return every configured, held, and watched symbol once in stable order."""
+    """Return every configured, held, and watched symbol once in stable order.
+
+    OCC option contracts (e.g. ``NVDA261016C00230000``) are excluded: the
+    strategist generates *stock* strategy rules, and option positions are
+    managed by the option lifecycle/executor instead. Including a contract here
+    would try to fetch stock bars for it (Alpaca rejects with ``invalid
+    symbol``) and would generate a nonsensical stock rule for a contract.
+    """
+    from core.guardrails import is_occ_symbol
     return list(dict.fromkeys(
         ticker.upper()
         for ticker in [*config.TRADING_UNIVERSE, *positions.keys(), *watchlist_tickers]
+        if not is_occ_symbol(ticker)
     ))
 
 class MetaStrategist:

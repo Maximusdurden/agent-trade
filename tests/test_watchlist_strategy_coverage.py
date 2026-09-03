@@ -141,6 +141,17 @@ class TestWatchlistStrategyCoverage(unittest.TestCase):
         self.assertIn("VRTX", universe)
         self.assertEqual(len(universe), len(set(universe)))
 
+    def test_daily_strategy_universe_excludes_occ_option_contracts(self):
+        # A held OCC option contract must NOT be treated as a stock for
+        # strategy generation (it would hit the stock bars endpoint and fail).
+        universe = build_strategy_universe(
+            {"NVDA": {"qty": 30}, "NVDA261016C00230000": {"qty": 4}},
+            ["NVDA"],
+        )
+
+        self.assertIn("NVDA", universe)
+        self.assertNotIn("NVDA261016C00230000", universe)
+
 
 if __name__ == "__main__":
     unittest.main()
