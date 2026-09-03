@@ -60,8 +60,8 @@ def maybe_run_intraday_options_watch(alpaca_client, positions: dict) -> bool:
     Options are "time bombs" (theta/IV/DTE decay risk), so the strategist should
     stay locked onto any open leveraged position intraday — not just once after
     market close. This runs the options track on a short DB-backed cooldown
-    (default 30m). Returns True when a tune was attempted+persisted, False
-    otherwise (off cooldown, or nothing to do).
+    (default 15m, matched to the trading loop). Returns True when a tune was
+    attempted+persisted, False otherwise (off cooldown, or nothing to do).
     """
     from datetime import datetime as _dt, timezone as _tz
     from core import database, config as _cfg
@@ -71,7 +71,7 @@ def maybe_run_intraday_options_watch(alpaca_client, positions: dict) -> bool:
     if not held_occs:
         return False
 
-    cooldown_min = float(getattr(_cfg, "OPTIONS_WATCH_COOLDOWN_MINUTES", 30))
+    cooldown_min = float(getattr(_cfg, "OPTIONS_WATCH_COOLDOWN_MINUTES", 15))
     status_ts = database.get_system_state("last_options_intraday_watch")
     due = True
     if status_ts:

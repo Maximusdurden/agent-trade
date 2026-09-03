@@ -76,13 +76,14 @@ Added `maybe_run_intraday_options_watch(alpaca_client, positions)`, called every
 trading cycle. Behavior:
 - **If no option position is held** → no-op (returns `False`).
 - **While any option is held** → re-runs `MetaStrategist().run_option_strategy_refinement()`
-  for the held underlyings every `OPTIONS_WATCH_COOLDOWN_MINUTES` (default **30**).
+  for the held underlyings every `OPTIONS_WATCH_COOLDOWN_MINUTES` (default **15**,
+  matched to the 15-min trading loop).
 - Cooldown is enforced via the DB `system_state` key `last_options_intraday_watch`
-  (UTC), so a re-tune fires at most once per 30 minutes while options are open —
+  (UTC), so a re-tune fires at most once per 15 minutes while options are open —
   never more often, and it's idempotent/harmless if it fails.
 
 ## New env var
-- `OPTIONS_WATCH_COOLDOWN_MINUTES` (default `30`) — intraday options-watch cooldown
+- `OPTIONS_WATCH_COOLDOWN_MINUTES` (default `15`) — intraday options-watch cooldown
   while holding options. Added to the deploy whitelist.
 
 ## Behavior summary

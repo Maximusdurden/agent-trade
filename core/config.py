@@ -140,8 +140,11 @@ OPTIONS_DTE_HARD_MAX = int(os.getenv("OPTIONS_DTE_HARD_MAX", "90"))
 OPTIONS_DTE_FALLBACK_MAX = int(os.getenv("OPTIONS_DTE_FALLBACK_MAX", "90"))
 # Intraday options-watch cooldown (minutes): while we HOLD an option position, the
 # runner re-runs the options strategy track this often so the strategist stays
-# locked onto the leveraged position as theta/IV/PnL/DTE evolve intraday.
-OPTIONS_WATCH_COOLDOWN_MINUTES = float(os.getenv("OPTIONS_WATCH_COOLDOWN_MINUTES", "30"))
+# locked onto the leveraged position as theta/IV/PnL/DTE evolve intraday. Matched
+# to the 15-min trading loop so the strategist re-tunes once per cycle when
+# options are held. Extra API calls are acceptable because we only watch this
+# hot when an option (leverage) position is open.
+OPTIONS_WATCH_COOLDOWN_MINUTES = float(os.getenv("OPTIONS_WATCH_COOLDOWN_MINUTES", "15"))
 # Max % of equity allocated to a single option position (cost = ask * 100 * contracts).
 OPTIONS_MAX_ALLOCATION_PCT = float(os.getenv("OPTIONS_MAX_ALLOCATION_PCT", "0.05"))
 # Max number of option contracts per ticker.
