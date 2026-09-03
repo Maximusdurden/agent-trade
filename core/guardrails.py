@@ -113,10 +113,20 @@ class RiskGuardrails:
         capitulating at the low. This guard blocks ADDING to a held position when the
         current price is BELOW the position's average entry price. SELLs are never
         blocked. Crypto is exempt (it is the profitable book and scales differently).
+
+        **Screener-endorsed exemption:** a symbol that is in the *latest* screener
+        watchlist is actively endorsed and is always eligible for a BUY (see
+        ``_universe_guardrail_reason``), so it is NOT subject to this guardrail.
+        This lets a high-conviction add to a name the screener is currently
+        endorsing go through, even slightly below entry — matching the documented
+        intent of blocking only *unendorsed* averaging-down (the MS failure mode).
         """
         if proposed_qty <= 0 or current_price <= 0:
             return None
         if is_crypto_member(symbol) or "/" in symbol:
+            return None
+        # Screener-endorsed symbols are actively sanctioned -> allow the add.
+        if self._in_latest_watchlist(symbol):
             return None
         pos = current_positions.get(symbol)
         if not isinstance(pos, dict):
@@ -492,8 +502,10 @@ class RiskGuardrails:
                 return False, strict_reason, adjusted_decision
 
             # 6a2. Anti-scale-in guardrail: block averaging DOWN into a held
-            # position that is not currently screener-endorsed. Prevents the MS
-            # "buy-the-dip-adding" failure mode that bled -$226.
+            # position that is NOT screener-endorsed. Prevents the MS
+            # "buy-the-dip-adding" failure mode that bled -$226. Screener-endorsed
+            # (currently-watchlisted) names are exempt so a high-conviction add to
+            # a sanctioned symbol isn't wrongly blocked.
             scale_in_reason = self._anti_scale_in_reason(
                 symbol, proposed_qty, current_price, current_positions
             )

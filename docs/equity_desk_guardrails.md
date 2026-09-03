@@ -39,6 +39,13 @@ Blocks **adding** to a held position when the current price is **below** its ave
 price (i.e., averaging down into a falling knife). Crypto is exempt (it scales differently
 and is profitable). SELLs are never blocked.
 
+**Screener-endorsed exemption:** a symbol that is in the *latest* screener watchlist is
+actively endorsed (see Strict-Universe guardrail) and is therefore allowed to be added even
+when slightly below entry. The anti-scale-in guardrail only blocks averaging-down into held
+names the screener is **not** currently endorsing — the actual MS "buy-the-dip" failure mode.
+This lets a high-conviction (e.g. 70%+) add to a currently-watchlisted name like a held PG go
+through instead of being wrongly rejected.
+
 ### 3. Low Win-Rate Circuit Breaker
 
 `MIN_LOW_WIN_RATE_TRADES` (default `5`) · `MAX_LOW_WIN_RATE` (default `0.25`)
@@ -73,7 +80,7 @@ Defaults are the values tested against the 2026 data and are safe to keep.
 ## Tests
 
 - `tests/test_universe_guardrail.py` — strict-universe behavior (watched OK, untracked blocked, crypto allowed, empty-watchlist blocks).
-- `tests/test_anti_scale_in.py` — anti-scale-in (avg-down blocks, above-entry add allowed, crypto exempt).
+- `tests/test_anti_scale_in.py` — anti-scale-in (unwatched avg-down blocks, watched avg-down allowed, above-entry add allowed, crypto exempt).
 - `tests/test_circuit_breaker.py` — added low win-rate cases.
 
 ## Related analysis

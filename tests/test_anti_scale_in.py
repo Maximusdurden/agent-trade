@@ -56,13 +56,14 @@ class TestAntiScaleIn(unittest.TestCase):
         # Blocked by strict-universe OR anti-scale-in (either is a correct block).
         self.assertTrue("Strict-universe" in msg or "Anti-scale-in" in msg, msg)
 
-    def test_avg_down_watched_blocked(self):
-        # MS IS in watchlist but still averaging down -> anti-scale-in nets it.
+    def test_avg_down_watched_allowed(self):
+        # MS IS in the watchlist (screener-endorsed) and averaging down. Per the
+        # screener-endorsed exemption, a high-conviction add to a currently-watchlisted
+        # name is allowed even slightly below entry (matches _universe_guardrail_reason).
         _set_watchlist(["MS", "MSFT"])
         pos = {"MS": {"qty": 100, "avg_entry_price": 213.0}}
         ok, msg, _ = self._buy("MS", pos, price=207.0)
-        self.assertFalse(ok, f"Avg-down watched should still be blocked by anti-scale-in: {msg}")
-        self.assertIn("Anti-scale-in", msg)
+        self.assertTrue(ok, f"Avg-down on a screener-endorsed symbol should be allowed: {msg}")
 
     def test_add_to_watched_above_entry_allowed(self):
         # MS is watched AND above entry -> not averaging down -> allowed to add.
