@@ -576,12 +576,27 @@ class AlpacaClient:
     def _fetch_option_data(self, option_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
         """Fetch option historical bars via the OptionHistoricalDataClient.
 
-        Returns an empty list when no option symbols are requested or when the
-        option data client is unavailable (so the caller degrades gracefully
-        instead of erroring on the stock endpoint).
+        Returns an empty list when no option symbols are requested or when option
+        bars are unavailable, so the caller degrades gracefully instead of erroring.
+
+        **Paper account note:** Alpaca *paper* accounts do not provide OPRA option
+        data and the agreement cannot be signed (it is a live-account PDF agreement).
+        On paper we therefore skip option bars entirely (the underlying's stock bars
+        are still used for analysis) and log a calm, one-time notice rather than an
+        error every cycle.
         """
         option_dfs = []
         if not option_symbols:
+            return option_dfs
+        # Paper accounts cannot access OPRA option bars -> skip quietly (once).
+        if getattr(self, "paper", False):
+            if not getattr(self, "_warned_paper_option_bars", False):
+                self._warned_paper_option_bars = True
+                logger.warning(
+                    "Paper account: OPRA option bars are unavailable (agreement can't "
+                    "be signed on paper). Skipping option bars; underlying stock bars "
+                    "are used for analysis."
+                )
             return option_dfs
         if self.option_data_client is None:
             logger.warning(f"Option data client unavailable; skipping option bars for {option_symbols}.")

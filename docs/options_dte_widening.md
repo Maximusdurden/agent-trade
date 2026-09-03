@@ -22,10 +22,19 @@ with that robustness.
 Option **historical bars** (the `_fetch_option_data` path) require the **OPRA**
 (Options Price Reporting Authority) agreement to be **signed on the Alpaca account**.
 If it is not signed, Alpaca rejects option-bar requests with
-`{"message":"OPRA agreement is not signed"}`. **Action required:** sign the OPRA
-agreement in the Alpaca dashboard (Account → Agreements → Options → OPRA) so the
-strategist/analysis can fetch per-OCC-contract bars. Until then, option analysis
-falls back to underlying-level stock bars and the OPRA path is skipped.
+`{"message":"OPRA agreement is not signed"}`.
+
+**Important:** this is running on a **paper** account, where the OPRA agreement
+cannot be signed (it is a live-account PDF agreement; there is no in-app e-sign for
+it on paper). Therefore option *historical bars* are **unavailable on paper, by
+design**, and `_fetch_option_data` now **skips them gracefully** on paper accounts —
+logging a one-time info notice instead of an error every cycle. Underlying-level
+**stock** bars are still used for analysis, and option contract selection
+(`find_best_option` / chain snapshots / latest quotes) still works on paper.
+
+This means the OPRA-based error tickets should **stop** once the paper-skip is
+deployed. If the account is later upgraded to **live**, sign the OPRA agreement
+there to enable per-contract option bars.
 
 ## Appraisal-universe note (OCC exclusion)
 
