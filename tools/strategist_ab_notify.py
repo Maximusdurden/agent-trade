@@ -7,12 +7,13 @@ pulls the authoritative cloud DB, re-runs the A/B attribution, and pings the
 agent-trade Discord webhook ONLY when there is something worth looking at:
 
   * **New data** — at least one round-trip has been attributed to an A/B-tagged
-    rule since the last ping (high-watermark tracked in `reports/.ab_notified`).
+    rule since the last ping (high-watermark tracked in `system_state`).
   * **Weekly heartbeat** — if nothing new has come in for 7+ days, it sends the
     cumulative running tally anyway, so you know the harness is alive and keep
     it on your radar instead of forgetting it.
 
-Throttled via a small JSON state file (`reports/.ab_notified.json`), so it never
+Throttled state is persisted in the DB-backed `system_state` table (survives
+Cloud Run's ephemeral filesystem, which resets every execution), so it never
 spams on the 15-min scheduler. Read-only with respect to trading state.
 
 Usage:
@@ -23,7 +24,6 @@ Usage:
 """
 import os
 import sys
-import json
 import argparse
 from datetime import datetime, timedelta, timezone
 
@@ -34,28 +34,37 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=True)
 
 import tools.strategist_ab_report as ab     # noqa: E402
-from tools.strategist_ab_report import analyze, parse_dt, REPORTS_DIR  # noqa: E402
+from tools.strategist_ab_report import analyze, parse_dt  # noqa: E402
 from core.discord_notifier import send_discord_embed  # noqa: E402
+from core.database import get_system_state, set_system_state  # noqa: E402
 
-STATE_FILE = os.path.join(REPORTS_DIR, ".ab_notified.json")
+# Throttle state is persisted in the DB's system_state table (survives Cloud Run's
+# ephemeral filesystem, which resets every execution). Keys are namespaced so they
+# don't collide with the runner's cadence flags.
+STATE_KEY_LAST_SENT = "ab_notify_last_sent_at"
+STATE_KEY_HWM = "ab_notify_last_notified_open_ts"
 WEEKLY_DAYS = 7
 MARKER = "`"  # Discord inline code fence
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    """Read throttle state from the DB-backed system_state table."""
+    state = {}
+    last_sent = get_system_state(STATE_KEY_LAST_SENT)
+    hwm = get_system_state(STATE_KEY_HWM)
+    if last_sent:
+        state["last_sent_at"] = last_sent
+    if hwm:
+        state["last_notified_open_ts"] = hwm
+    return state
 
 
 def save_state(state):
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    """Persist throttle state to the DB-backed system_state table."""
+    if state.get("last_sent_at"):
+        set_system_state(STATE_KEY_LAST_SENT, state["last_sent_at"])
+    if state.get("last_notified_open_ts"):
+        set_system_state(STATE_KEY_HWM, state["last_notified_open_ts"])
 
 
 def fmt_model(model):

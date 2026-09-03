@@ -6,8 +6,9 @@ from datetime import datetime, timedelta, timezone
 os.environ["DATABASE_FILENAME"] = "test_strategist_ab_notify.db"
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from tools.strategist_ab_notify import should_notify  # noqa: E402
+from tools.strategist_ab_notify import should_notify, load_state, save_state  # noqa: E402
 from tools.strategist_ab_report import analyze, build_round_trips, load_strategy_models, MODEL_RE  # noqa: E402
+from core.database import init_db, get_system_state  # noqa: E402
 
 
 class TestABNotifyThrottle(unittest.TestCase):
@@ -30,6 +31,23 @@ class TestABNotifyThrottle(unittest.TestCase):
     def test_weekly_heartbeat_due_after_7_days(self):
         state = {"last_sent_at": (self.now - timedelta(days=8)).isoformat()}
         self.assertTrue(should_notify([], state, self.now))
+
+
+class TestABNotifyStatePersistence(unittest.TestCase):
+    """State must survive across executions (Cloud Run ephemeral FS) via system_state."""
+
+    def test_save_then_load_roundtrips(self):
+        init_db()
+        save_state({"last_sent_at": "2026-09-02T12:00:00+00:00",
+                    "last_notified_open_ts": "2026-09-01T10:00:00+00:00"})
+        state = load_state()
+        self.assertEqual(state.get("last_sent_at"), "2026-09-02T12:00:00+00:00")
+        self.assertEqual(state.get("last_notified_open_ts"), "2026-09-01T10:00:00+00:00")
+
+    def test_state_persists_in_system_state_table(self):
+        init_db()
+        save_state({"last_sent_at": "2026-09-02T12:00:00+00:00"})
+        self.assertEqual(get_system_state("ab_notify_last_sent_at"), "2026-09-02T12:00:00+00:00")
 
 
 class TestABModelTagParsing(unittest.TestCase):
