@@ -144,7 +144,56 @@ class SharedLLMClient:
                 raise LLMClientError(f"Both OpenRouter and Gemini fallback failed. Gemini error: {e}") from e
                 
         raise LLMClientError("OpenRouter failed and Gemini fallback is not configured.")
-        
+
+    @staticmethod
+    def _is_transient_error(err: Exception) -> bool:
+        """Return True if ``err`` is a transient provider error worth retrying.
+
+        OpenRouter/Gemini return 503 (high demand), 429 (rate limit), and
+        connection resets under load. These are transient and MUST be retried
+        with backoff rather than treated as fatal — otherwise a single 503
+        bubbles straight out of ``future.result()`` and the whole call gives up
+        (the TMCL-896..902 failure mode). Non-transient errors (schema, auth,
+        bad request) are re-raised immediately.
+        """
+        msg = str(err).lower()
+        transient_markers = (
+            "503", "429", "unavailable", "high demand", "rate limit",
+            "rate_limit", "connection", "reset", "timeout", "temporarily",
+            "overloaded", "try again later", "service unavailable",
+        )
+        return any(m in msg for m in transient_markers)
+
+    def _backoff_or_fallback(self, retry_count: int, start: float, max_total_seconds: int,
+                             _try_gemini_direct, kind: str):
+        """Compute backoff delay; if it would exceed the budget, try Gemini and give up.
+
+        Returns:
+          - a non-empty str if a Gemini fallback succeeded (caller should use it and break),
+          - None if the caller should sleep the backoff delay and retry,
+          - raises LLMClientError if the budget is exhausted and Gemini also failed.
+        """
+        delay = min(self.retry_delay * (2 ** retry_count), self.max_backoff)
+        if (time.monotonic() - start) + delay >= max_total_seconds:
+            try:
+                response_text = _try_gemini_direct()
+                if response_text:
+                    return response_text
+            except Exception as gem_ex:
+                logger.critical(
+                    f"OpenRouter {kind} would exceed {max_total_seconds}s budget and "
+                    f"Gemini cross-provider fallback failed: {gem_ex}"
+                )
+            logger.critical(
+                f"{kind} would exceed remaining {max_total_seconds}s budget; giving up."
+            )
+            raise LLMClientError(
+                f"LLM call exceeded total {max_total_seconds}s budget ({kind.lower()})."
+            )
+        logger.warning(f"{kind}, retrying in {delay}s...")
+        time.sleep(delay)
+        return None
+
     def _generate_via_gemini(self, prompt, system_prompt, model_id):
         """Execute a completion using the native google-genai Gemini client only.
 
@@ -301,26 +350,40 @@ class SharedLLMClient:
                             raise LLMClientError(
                                 f"OpenRouter request timed out after {attempt_timeout}s"
                             ) from None
-                        delay = min(self.retry_delay * (2 ** retry_count), self.max_backoff)
-                        # Respect the global budget while backing off.
-                        if (time.monotonic() - start) + delay >= max_total_seconds:
-                            # Try Gemini directly before giving up on backoff.
+                        fb = self._backoff_or_fallback(retry_count, start, max_total_seconds,
+                                                      _try_gemini_direct, "Timeout")
+                        if fb:
+                            response_text = fb
+                            break
+                    except Exception as attempt_err:
+                        # Transient provider errors (503 high-demand, 429 rate limit,
+                        # connection reset) must be RETRIED with backoff, not treated
+                        # as fatal. Previously only TimeoutError was retried, so a
+                        # single 503 from OpenRouter (with Gemini also 503ing) bubbled
+                        # straight to the outer except and gave up immediately —
+                        # producing the "backoff would exceed 180s" / "empty rule"
+                        # failures (TMCL-896..902).
+                        future.cancel()
+                        if not self._is_transient_error(attempt_err):
+                            raise
+                        retry_count += 1
+                        if retry_count > self.max_retries:
                             try:
                                 response_text = _try_gemini_direct()
                                 break
                             except Exception as gem_ex:
                                 logger.critical(
-                                    f"OpenRouter backoff would exceed {max_total_seconds}s "
-                                    f"and Gemini cross-provider fallback failed: {gem_ex}"
+                                    f"OpenRouter transient error after {max_retries} retries and "
+                                    f"Gemini cross-provider fallback failed: {gem_ex}"
                                 )
-                            logger.critical(
-                                f"Backoff would exceed remaining {max_total_seconds}s budget; giving up."
-                            )
                             raise LLMClientError(
-                                f"LLM call exceeded total {max_total_seconds}s budget (backoff)."
-                            )
-                        logger.warning(f"Timeout, retrying in {delay}s...")
-                        time.sleep(delay)
+                                f"OpenRouter transient error after {max_retries} retries: {attempt_err}"
+                            ) from None
+                        fb = self._backoff_or_fallback(retry_count, start, max_total_seconds,
+                                                       _try_gemini_direct, "Transient error")
+                        if fb:
+                            response_text = fb
+                            break
 
                 # Handle empty responses with retry logic (also bounded by the budget).
                 while not response_text and retry_count < self.max_retries:

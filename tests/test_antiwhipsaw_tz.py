@@ -39,6 +39,10 @@ def _decision(symbol, action="SELL", qty=10.0, price=100.0):
 class TestAntiWhipsawTimezone(unittest.TestCase):
     def setUp(self):
         self.guardrails = RiskGuardrails()
+        # These tests exercise the anti-whipsaw path, which runs AFTER the market
+        # hours check. Force market-open so the guardrail reaches the whipsaw
+        # logic regardless of when the suite runs (e.g. after-hours CI).
+        self.guardrails.is_market_open_check = lambda: (True, "open")
 
     @patch("core.database.get_recent_trades")
     def test_aware_utc_offset_timestamp_no_error(self, mock_trades):
