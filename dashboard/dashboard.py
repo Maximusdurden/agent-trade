@@ -1913,7 +1913,11 @@ HTML_CONTENT = """<!DOCTYPE html>
                     <div id="chart-timeframe-selector" style="display: flex; gap: 0.35rem; margin-left: 1.5rem;">
                         <button class="timeframe-btn" onclick="changeChartTimeframe('1D')">1D</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('5D')">5D</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('1W')">1W</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('2W')">2W</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('MTD')">MTD</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('1M')">1M</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('LM')">Last Mo</button>
                         <button class="timeframe-btn active" onclick="changeChartTimeframe('ALL')">ALL</button>
                     </div>
                     <div id="chart-ticker-selector-container" style="display: flex; align-items: center; gap: 0.35rem; margin-left: 1.5rem;">
@@ -2347,13 +2351,34 @@ HTML_CONTENT = """<!DOCTYPE html>
                     cutoffTime = now.getTime() - 24 * 60 * 60 * 1000;
                 } else if (activeChartTimeframe === '5D') {
                     cutoffTime = now.getTime() - 5 * 24 * 60 * 60 * 1000;
+                } else if (activeChartTimeframe === '1W') {
+                    cutoffTime = now.getTime() - 7 * 24 * 60 * 60 * 1000;
+                } else if (activeChartTimeframe === '2W') {
+                    cutoffTime = now.getTime() - 14 * 24 * 60 * 60 * 1000;
+                } else if (activeChartTimeframe === 'MTD') {
+                    // Month-to-date: start of the current calendar month (ET).
+                    const etNow = new Date(now.toLocaleString('en-US', {timeZone: 'America/New_York'}));
+                    const startOfMonth = new Date(etNow.getFullYear(), etNow.getMonth(), 1, 0, 0, 0);
+                    cutoffTime = startOfMonth.getTime();
                 } else if (activeChartTimeframe === '1M') {
                     cutoffTime = now.getTime() - 30 * 24 * 60 * 60 * 1000;
+                } else if (activeChartTimeframe === 'LM') {
+                    // Last month: from the 1st of the previous month to the 1st of this month.
+                    const etNow = new Date(now.toLocaleString('en-US', {timeZone: 'America/New_York'}));
+                    const startThisMonth = new Date(etNow.getFullYear(), etNow.getMonth(), 1, 0, 0, 0);
+                    const startLastMonth = new Date(etNow.getFullYear(), etNow.getMonth() - 1, 1, 0, 0, 0);
+                    chartHistory = chartHistory.filter(item => {
+                        const itemDate = parseUtcTimestamp(item.timestamp);
+                        return itemDate && itemDate.getTime() >= startLastMonth.getTime()
+                            && itemDate.getTime() < startThisMonth.getTime();
+                    });
                 }
-                chartHistory = chartHistory.filter(item => {
-                    const itemDate = parseUtcTimestamp(item.timestamp);
-                    return itemDate && itemDate.getTime() >= cutoffTime;
-                });
+                if (activeChartTimeframe !== 'LM') {
+                    chartHistory = chartHistory.filter(item => {
+                        const itemDate = parseUtcTimestamp(item.timestamp);
+                        return itemDate && itemDate.getTime() >= cutoffTime;
+                    });
+                }
             }
 
             if (chartHistory.length === 0) {
