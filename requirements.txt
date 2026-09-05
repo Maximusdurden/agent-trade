@@ -6,5 +6,8 @@ pandas>=2.0.0
 google-cloud-storage>=2.10.0
 openai>=2.52.0
 yfinance>=0.2.40
+# Blog (Treat Motivated Capital) dashboard rendering
+Pillow>=10.0.0
+requests>=2.31.0
 -e ../agent-jira-client
 

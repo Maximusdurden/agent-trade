@@ -296,29 +296,37 @@ def status_cache_worker():
                 decisions = database.get_recent_decisions(limit=15)
                 trades = database.get_recent_trades(limit=15)
                 executions = database.get_executions(limit=50)
-                history = get_portfolio_history()
+
+                # Equity curve: prefer the broker's authoritative valuation for
+                # THIS account (Alpaca portfolio history) over the local SQLite
+                # portfolio_history table, which still contains the prior demo
+                # account's equity. Fall back to the DB if broker history is
+                # unavailable.
+                try:
+                    history = client.get_alpaca_portfolio_history(timeframe="1D")
+                except Exception as ph_err:
+                    print(f"[Dashboard Server] Alpaca portfolio history failed ({ph_err}); falling back to DB.", file=sys.stderr)
+                    history = []
+                if not history:
+                    history = get_portfolio_history()
+
                 ticker_history = get_ticker_history()
+
                 try:
                     ticker_convictions = database.get_ticker_convictions(limit=200)
                 except Exception as tc_err:
                     print(f"[Dashboard Server] Ticker convictions fetch failed (non-fatal): {tc_err}", file=sys.stderr)
                     ticker_convictions = []
                 
-                # 2b. Fetch executed orders directly from Alpaca.  This catches
-                #     TP/SL bracket fills and broker-side sells that the runner
-                #     never logged to the local trades table.  Broker-supplied
-                #     orders are deduplicated by alpaca_order_id — the broker
-                #     wins and the local DB fills any gaps.
+                # 2b. Fetch executed orders directly from Alpaca as the single
+                #     authoritative source for the Broker-Side Executed Orders
+                #     panel. After the dexter cutover, use the broker's order
+                #     ledger verbatim so stale demo-DB trades are not shown
+                #     alongside the live account's orders.
                 try:
                     if not client.is_mock:
-                        alpaca_orders = client.get_executed_orders(limit=100)
-                        # Deduplicate by alpaca_order_id — broker wins, DB fills gaps
-                        db_ids = {t.get("alpaca_order_id") for t in trades if t.get("alpaca_order_id")}
-                        for ao in alpaca_orders:
-                            if ao.get("alpaca_order_id") not in db_ids:
-                                broker_orders.append(ao)
-                            # else: already in trades, skip duplicate
-                        print(f"[Dashboard Server] Fetched {len(alpaca_orders)} broker orders, {len(broker_orders)} new (not in DB).", flush=True)
+                        broker_orders = client.get_executed_orders(limit=200)
+                        print(f"[Dashboard Server] Fetched {len(broker_orders)} broker orders (authoritative).", flush=True)
                 except Exception as broker_err:
                     print(f"[Dashboard Server] Broker order fetch failed (non-fatal): {broker_err}", file=sys.stderr)
                     broker_orders = []
@@ -2228,6 +2236,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         let activeChartTicker = 'ALL';
         let latestHistoryCached = [];
         let latestTickerHistoryCached = {};
+        let LATEST_CASH = 100000.0;
 
         function filterChartByTicker() {
             const select = document.getElementById('chart-ticker-select');
@@ -2424,7 +2433,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                     borderColor = crtColor;
                     backgroundColor = crtGlow;
                 }
-                data = chartHistory.map(item => item.unrealized_pnl !== undefined ? item.unrealized_pnl : 0);
+                // Broker portfolio history exposes profit_loss (per-window); DB
+                // history exposes unrealized_pnl. Support both.
+                data = chartHistory.map(item =>
+                    item.profit_loss !== undefined ? item.profit_loss
+                    : (item.unrealized_pnl !== undefined ? item.unrealized_pnl : 0)
+                );
             } else if (activeChartMetric === 'cash') {
                 label = 'Cash Reserves ($)';
                 if (isModern) {
@@ -2434,7 +2448,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                     borderColor = crtColor;
                     backgroundColor = crtGlow;
                 }
-                data = chartHistory.map(item => item.cash !== undefined ? item.cash : 100000);
+                // Broker portfolio history has no per-window cash; default to the
+                // latest account cash so the chart isn't flat at 100k.
+                data = chartHistory.map((item, idx, arr) => {
+                    if (item.cash !== undefined && item.cash !== 100000) return item.cash;
+                    if (idx === arr.length - 1 && typeof LATEST_CASH !== 'undefined') return LATEST_CASH;
+                    return (item.cash !== undefined ? item.cash : 100000);
+                });
             }
 
             const labels = chartHistory.map(item => {
@@ -2726,6 +2746,8 @@ HTML_CONTENT = """<!DOCTYPE html>
                 const equity = account.equity !== undefined ? account.equity : 100000.0;
                 const cash = account.cash !== undefined ? account.cash : 100000.0;
                 const pnl = account.unrealized_pnl !== undefined ? account.unrealized_pnl : 0.0;
+                // Expose latest cash for the chart's cash metric fallback
+                LATEST_CASH = cash;
                 
                 const valEquityEl = document.getElementById('val-equity');
                 if (valEquityEl) {
@@ -2995,18 +3017,14 @@ HTML_CONTENT = """<!DOCTYPE html>
                     }
                 }
 
-                // 4. Trades Database List — Merge DB trades + live Alpaca broker orders
+                // 4. Broker-Side Executed Orders — single source: live Alpaca orders.
+                //    After the dexter cutover the broker ledger is authoritative;
+                //    we no longer merge the (stale pre-cutover) DB trades into it.
                 const tradesTbody = document.getElementById('trades-tbody');
                 if (tradesTbody) {
                     tradesTbody.innerHTML = '';
-                    const dbTrades = (data && data.trades) || [];
                     const brokerOrders = (data && data.broker_orders) || [];
-                    
-                    // Merge: DB trades first, then broker orders not already in DB
-                    const dbOrderIds = new Set();
-                    dbTrades.forEach(t => { if (t.alpaca_order_id) dbOrderIds.add(t.alpaca_order_id); });
-                    const freshBroker = brokerOrders.filter(o => !dbOrderIds.has(o.alpaca_order_id));
-                    const allOrders = [...dbTrades, ...freshBroker];
+                    const allOrders = [...brokerOrders];
                     // Sort descending by timestamp (newest first)
                     allOrders.sort((a, b) => {
                         const tsA = a.timestamp || '';

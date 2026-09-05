@@ -6,7 +6,7 @@ import pandas as pd
 # Try importing alpaca-py clients. If not installed or fails, we provide a warning.
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest, LimitOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest, LimitOrderRequest, GetPortfolioHistoryRequest
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
     from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient, OptionHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest, OptionChainRequest, OptionLatestQuoteRequest
@@ -145,6 +145,49 @@ class AlpacaClient:
         except Exception as e:
             logger.error(f"Error fetching account info: {e}")
             raise
+
+    def get_alpaca_portfolio_history(self, timeframe: str = "1D", period: str | None = None, extra_days: int | None = None) -> list[dict]:
+        """Fetch the account's authoritative equity curve directly from Alpaca.
+
+        This is the broker's own valuation history for THIS account (as opposed to
+        the local SQLite ``portfolio_history`` table, which tracked the previous
+        demo account). After the dexter cutover the dashboard must show the
+        broker's real equity, not the stale DB-sourced curve.
+
+        Returns a list of ``{"timestamp": iso-utc, "equity": float, "profit_loss": float, "profit_loss_pct": float}``
+        ordered oldest -> newest. On any failure returns [] (dashboard falls back to DB).
+        """
+        if self.is_mock:
+            return []
+        try:
+            kwargs = {"timeframe": timeframe}
+            if period is not None:
+                kwargs["period"] = period
+            if extra_days is not None:
+                kwargs["extra_days"] = extra_days
+            hist = self.trading_client.get_portfolio_history(
+                history_filter=GetPortfolioHistoryRequest(**kwargs)
+            )
+            if not hist or not hist.timestamp:
+                return []
+            out = []
+            for i, ts in enumerate(hist.timestamp):
+                eq = float(hist.equity[i]) if i < len(hist.equity) else 0.0
+                pl = float(hist.profit_loss[i]) if i < len(hist.profit_loss) else 0.0
+                pl_pct = hist.profit_loss_pct[i] if i < len(hist.profit_loss_pct) else None
+                # Alpaca epoch seconds -> ISO-8601 UTC
+                from datetime import datetime, timezone
+                iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                out.append({
+                    "timestamp": iso,
+                    "equity": eq,
+                    "profit_loss": pl,
+                    "profit_loss_pct": (float(pl_pct) if pl_pct is not None else None),
+                })
+            return out
+        except Exception as e:
+            logger.error(f"Failed to fetch Alpaca portfolio history: {e}")
+            return []
 
     def get_positions(self) -> dict:
         """Returns current open positions, mapped as symbol -> details dict."""

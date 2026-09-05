@@ -239,6 +239,28 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 # LLM Configurations
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 
+# ---------------------------------------------------------------------------
+# Blog (Treat Motivated Capital) configuration — Dexter's blog on agent-trade
+# The blog reader never sees these; they configure the WP feed + persona layer.
+# Secrets (WP app password, Gemini key, OpenRouter key) come from env / Secret
+# Manager at runtime — never hardcoded here.
+# ---------------------------------------------------------------------------
+BLOG_PERSONA = os.getenv("BLOG_PERSONA", "dexter")          # selects core/personas.py voice
+BLOG_MODEL = os.getenv("BLOG_MODEL", "nousresearch/hermes-3-llama-3.1-70b")
+BLOG_MAX_OUTPUT_TOKENS = int(os.getenv("BLOG_MAX_OUTPUT_TOKENS", "1024"))
+
+# WordPress API
+WP_URL = os.getenv("WP_URL", "https://treatmotivated.capital")
+WP_USER = os.getenv("WP_USER", "")
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")   # Secret Manager at runtime
+DEXTER_LOGO_URL = os.getenv("DEXTER_LOGO_URL", "")
+
+# Sidebar widget + performance page (names must match WordPress)
+WP_SIDEBAR_WIDGET_TITLE = os.getenv("WP_SIDEBAR_WIDGET_TITLE", "Dexter Sidebar Widget")
+WP_PERFORMANCE_PAGE_TITLE = os.getenv("WP_PERFORMANCE_PAGE_TITLE", "Trading Performance")
+
+# -- GCS DB sync uses core/gcs_sync.py with GCS_BUCKET_NAME (set in deploy/env) --
+
 # Jira Configurations
 JIRA_URL = os.getenv("JIRA_URL", "")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")

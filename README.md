@@ -14,6 +14,7 @@ It includes a native, zero-setup **Mock Mode** fallback so you can try out the t
 - **Indicator Engine**: Custom calculations of technical indicators like SMA 20, SMA 50, RSI 14, MACD, and Bollinger Bands using Pandas—avoiding raw coordinate calculations by the LLM.
 - **SQLite Audit DB**: Automatically records every market condition, LLM reasoning thought process, final decision, and filled order details for retro-analysis.
 - **Flexible Execution**: Command-line arguments supporting single-cycle dry runs, live single executions, or continuous loop operations.
+- **Automated Daily Blog (Treat Motivated Capital)**: Ported from `dexter-trader`, the blog publisher turns each day's round-trips into a polished WordPress post (market intro, per-ticker blurbs, a Dexter performance card, and a yearly calendar). The voice is **persona-swappable** — change `BLOG_PERSONA` and the next post is written in a completely different voice with no code edits. See [docs/blog_and_personas.md](docs/blog_and_personas.md).
 
 ---
 
@@ -39,15 +40,22 @@ agent-trade/
 │   └── logger_setup.py   # Application-wide logger configuration
 │
 ├── dashboard/            # Web Monitoring and Visualization
-│   └── dashboard.py      # Streamlit-based monitoring dashboard
+│   └── dashboard.py      # Autonomously serves live Alpaca account equity curve
+│                         #   + broker-side executed orders (dexter cutover)
 │
 ├── deploy/               # Deployment Automation
-│   └── deploy_cloud.ps1  # Cloud Run job + Cloud Scheduler deploy
-│   └── create_task.ps1   # PowerShell Windows Scheduled Task registrar
+│   ├── deploy_cloud.ps1  # Cloud Run job + Cloud Scheduler deploy
+│   ├── deploy_blog.ps1   # Blog Cloud Run job + scheduler deploy
+│   ├── deploy_dashboard.ps1 # Cloud Run dashboard deploy (reads dexter creds from .env)
+│   ├── create_task.ps1   # PowerShell Windows Scheduled Task registrar
+│   ├── Dockerfile.blog   # Blog image (entrypoint run_blog.py)
+│   ├── cloudbuild_blog.yaml # Blog cloud build config
+│   └── _create_blog_secrets.py # Creates WP/LLM Secret Manager secrets
 │
 ├── docs/                 # Technical documentation & incident notes
-    ├── strategist_model_ab.md        # strategist model A/B experiment (r1 vs Sonnet)
-│   ├── equity_desk_guardrails.md      # the 2026-09-02 loss-guardrail design
+    ├── blog_and_personas.md        # Full blog layer + how to make your own persona
+    ├── strategist_model_ab.md      # strategist model A/B experiment (r1 vs Sonnet)
+│   ├── equity_desk_guardrails.md   # the 2026-09-02 loss-guardrail design
 │   ├── held_positions_universe_guardrail_fix.md
 │   └── fractional_shares_and_jira_logging_fix.md
 │
@@ -55,9 +63,24 @@ agent-trade/
 │   └── equity_lessons.md # equity-desk loss playbook for Screener/MetaStrategist
 │
 ├── tools/                # Administrative Utilities
+│   ├── blog_update.py         # Dexter blog orchestrator (pull→bridge→grade→publish)
+│   ├── build_blog_db.py       # bridge: agent-trade round-trips → realized_trades mirror
+│   ├── publish_strategy_change.py # one-off notice-post publisher
+│   ├── liquidate_account.py   # dry-run-by-default account liquidation tool
 │   ├── equity_trade_forensics.py  # read-only loss forensics (equity desk)
 │   ├── pull_cloud_db.py           # pull authoritative cloud DB from GCS
 │   └── get_correct_balances.py    # Alpaca cash ledger & balance backfill tool
+│
+├── core/                 # (blog support lives alongside the trading engine)
+│   ├── personas.py       # swappable blog voices (dexter/oracle/rookie/pirate/derrick)
+│   ├── brain.py          # persona-swappable LLM layer (intro + ticker blurbs)
+│   ├── wordpress.py      # WordPress REST publisher + sidebar/calendar/Discord
+│   ├── cards.py          # performance card + yearly calendar + sidebar image
+│   ├── grader.py         # D-TAG trade grading (letter grades on posts)
+│   ├── blog_stats.py     # dashboard/round-trip stats → dexter DataFrame
+│   └── seo.py            # per-post SEO audit + metadata generation
+│
+├── run_blog.py           # Blog Cloud Run job entrypoint (publishes daily post)
 │
 └── tests/                # Code Quality and Sanity Verification Tests
     ├── test_universe_guardrail.py # strict-universe guardrail tests
@@ -183,6 +206,50 @@ All logs are stored in `trading_agent.db`. You can view them using any SQLite vi
 * **`decisions`**: Stores every single tick analysis: the calculated RSI/MACD indicators at that moment, the portfolio cash/equity balance, the raw LLM thought process, proposed action, and whether it was approved or rejected by guardrails.
 * **`trades`**: Stores actual executions with Alpaca order IDs, filled average price, timestamps, and order status.
 * **`portfolio_history`**: Tracks equity, cash, and PnL trends over time to construct charts.
+
+---
+
+## Daily Blog & Personas (Treat Motivated Capital)
+
+Agent-trade includes a **portable, persona-swappable daily blog publisher** that
+turns each day's round-trips into a WordPress post on
+[Treat Motivated Capital](https://treatmotivated.capital). It was ported from
+the retired `dexter-trader` project so the blog "keeps Dexter's voice" while the
+data now comes from agent-trade.
+
+### How the blog pipeline works
+
+```
+fresh trading_agent.db (GCS)  →  build_blog_db (bridge)  →  grade (D-TAG)
+   →  intro + ticker blurbs (LLM)  →  SEO metadata  →  publish to WordPress
+   →  sidebar widget  →  performance calendar  →  Discord notify
+```
+
+Each voice the blog writes in is just a **system prompt in
+[core/personas.py](core/personas.py)** — meaning the tone is a *runtime setting*,
+not code. Set `BLOG_PERSONA` and the next post is written in that voice.
+
+### Quick start (local dry-run — builds + grades, does NOT publish)
+
+```powershell
+> python -m tools.blog_update --dry --local-db
+```
+
+### Real publish
+
+```powershell
+> python -m tools.blog_update --local-db          # publish from local DB
+> python -m tools.blog_update                     # pull DB from GCS first
+```
+
+### Write in YOUR OWN voice
+
+Add a persona key to `PERSONAS` in `core/personas.py`, then set
+`BLOG_PERSONA=your_key`. Read
+[Using a different persona for your own daily reporting](docs/blog_and_personas.md)
+for the full walkthrough, the built-in personas (dexter, oracle, rookie,
+pirate, derrick), the branding rule, and the Cloud Run deployment
+(`deploy/deploy_blog.ps1`).
 
 ---
 

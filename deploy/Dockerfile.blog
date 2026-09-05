@@ -1,0 +1,16 @@
+# Blog job image for the Dexter blog update (run as a Cloud Run job).
+# Entrypoint is run_blog.py. This job only reads the DB from GCS, grades,
+# publishes, and updates the sidebar/calendar — it never trades.
+FROM python:3.11-slim
+
+WORKDIR /app
+ENV PYTHONPATH="/app"
+
+COPY requirements.txt .
+# Remove relative editable installs (local sibling deps not in image).
+RUN python -c "lines=[l for l in open('requirements.txt') if '-e ' not in l]; open('requirements.txt','w').write(''.join(lines))"
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENTRYPOINT ["python", "run_blog.py"]

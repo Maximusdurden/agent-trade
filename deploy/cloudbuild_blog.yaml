@@ -1,0 +1,13 @@
+# Cloud Build config for the Dexter blog image.
+# Builds Dockerfile.blog into gcr.io/$PROJECT_ID/dexter-blog.
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "deploy/Dockerfile.blog"
+      - "-t"
+      - "gcr.io/$PROJECT_ID/dexter-blog:$BUILD_ID"
+      - "."
+images:
+  - "gcr.io/$PROJECT_ID/dexter-blog:$BUILD_ID"
