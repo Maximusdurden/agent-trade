@@ -70,15 +70,17 @@ def pull_db_from_gcs() -> bool:
     from core import gcs_sync
     try:
         # Download (atomic replace) via the canonical sync path.
-        ok = gcs_sync.download_from_gcs()
+        # NOTE: gcs_sync.download_from_gcs() returns None on success (it only
+        # logs), so do NOT treat its return value as truthy. We judge success by
+        # whether a fresh DB now exists at DATABASE_PATH.
+        gcs_sync.download_from_gcs()
     except Exception as e:
         logger.error("Pull DB via gcs_sync failed: %s", e)
-        ok = False
 
     if not os.path.exists(str(config.DATABASE_PATH)):
         logger.error("No local DB after GCS download; aborting (no stale publish).")
         return False
-    return ok
+    return True
 
 
 # ---------------------------------------------------------------------------

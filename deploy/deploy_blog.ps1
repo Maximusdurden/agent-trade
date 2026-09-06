@@ -45,11 +45,22 @@ Write-Host "GCS Bucket:    $GcsBucket"
 Write-Host "Region:        $Region"
 Write-Host "Image:         $ImageTag"
 
-if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
-    Write-Error "gcloud CLI is not installed or not in PATH."
+# Resolve gcloud. Plain `gcloud` is sometimes missing from PATH in a PS
+# subprocess (e.g. when this script is invoked from a python/automation context),
+# so fall back to the standard Cloud SDK install path.
+$GCloud = ""
+if (Get-Command gcloud -ErrorAction SilentlyContinue) {
+    $GCloud = "gcloud"
+} elseif (Test-Path "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd") {
+    $GCloud = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
+} elseif (Test-Path "C:\Users\$env:USERNAME\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd") {
+    $GCloud = "C:\Users\$env:USERNAME\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
 }
-gcloud config set project $GcpProject
-gcloud services enable cloudscheduler.googleapis.com run.googleapis.com cloudbuild.googleapis.com
+if (-not $GCloud) {
+    Write-Error "gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK."
+}
+& $GCloud config set project $GcpProject
+& $GCloud services enable cloudscheduler.googleapis.com run.googleapis.com cloudbuild.googleapis.com
 
 # 2. Staging dir
 $StagingDir = "Z:\python\projects\agent-trade\deploy\temp_staging_blog"
@@ -77,13 +88,13 @@ $DockerfileContent | Out-File -FilePath $DockerProdPath -Encoding utf8
 
 # 4. Build image
 Write-Host "`n--- Building blog image ---"
-gcloud builds submit $StagingDir --tag $ImageTag
+& $GCloud builds submit $StagingDir --tag $ImageTag
 
 # 5. Deploy Cloud Run Job
 Write-Host "`n--- Deploying Cloud Run Job: $JobName ---"
 $OldPreference = $ErrorActionPreference
 $ErrorActionPreference = "SilentlyContinue"
-& gcloud run jobs describe $JobName --region $Region --format="value(name)" > $null 2>&1
+& $GCloud run jobs describe $JobName --region $Region --format="value(name)" > $null 2>&1
 $JobExists = ($LastExitCode -eq 0)
 $ErrorActionPreference = $OldPreference
 
@@ -92,31 +103,36 @@ $ErrorActionPreference = $OldPreference
 $EnvVariablesList = @(
     "GOOGLE_CLOUD_PROJECT=$GcpProject",
     "GCS_BUCKET_NAME=$GcsBucket",
+    "DATABASE_FILENAME=/tmp/trading_agent.db",
     "BLOG_PERSONA=dexter"
 )
 $SecretReferences = @(
-    "WP_USER=projects/$GcpProject/secrets/WP_USER:latest",
-    "WP_APP_PASSWORD=projects/$GcpProject/secrets/WP_APP_PASSWORD:latest",
-    "GEMINI_API_KEY=projects/$GcpProject/secrets/GEMINI_API_KEY:latest",
-    "OPENROUTER_API_KEY=projects/$GcpProject/secrets/OPENROUTER_API_KEY:latest"
+    "WP_USER=WP_USER:latest",
+    "WP_APP_PASSWORD=WP_APP_PASSWORD:latest",
+    "GEMINI_API_KEY=GEMINI_API_KEY:latest",
+    "OPENROUTER_API_KEY=OPENROUTER_API_KEY:latest",
+    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
 )
 if (-not $JobExists) {
-    gcloud run jobs create $JobName --image $ImageTag --region $Region `
+    & $GCloud run jobs create $JobName --image $ImageTag --region $Region `
         --set-env-vars ($EnvVariablesList -join ",") `
         --set-secrets ($SecretReferences -join ",")
 } else {
-    gcloud run jobs update $JobName --image $ImageTag --region $Region `
+    & $GCloud run jobs update $JobName --image $ImageTag --region $Region `
         --set-env-vars ($EnvVariablesList -join ",") `
         --set-secrets ($SecretReferences -join ",")
 }
 
-# 6. Cloud Scheduler after the strategy job's EOD sync. The cron is in UTC.
-# 19:05 ET (EDT) == 23:05 UTC in summer; adjust for your timezone. The schedule
-# below ("30 19") is a placeholder — set it to run a few minutes AFTER the
-# strategy job uploads its DB to GCS each trading day.
+# 6. Cloud Scheduler after the strategy job's DB sync each trading day.
+# The cron is expressed in UTC. 16:30 ET:
+#   - 16:30 EDT (Mar-Nov, daylight) == 20:30 UTC  -> schedule "30 20 * * 1-5"
+#   - 16:30 EST (Nov-Mar, standard) == 21:30 UTC   -> schedule "30 21 * * 1-5"
+# Adjust the scheduled time for your timezone / DST below. Day-of-week 1-5 =
+# weekdays (Mon-Fri) market days; 16:30 ET runs shortly after the 16:00 close so
+# the full day's round-trips are captured and the DB has synced to GCS.
 $SchedulerSa = "run-invoker@$GcpProject.iam.gserviceaccount.com"
-& gcloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
-gcloud scheduler jobs create http $SchedulerName --schedule="30 19 * * 1-5" `
+& $GCloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
+& $GCloud scheduler jobs create http $SchedulerName --schedule="30 20 * * 1-5" `
     --location $Region `
     --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/$JobName:run" `
     --http-method=POST `
@@ -124,5 +140,6 @@ gcloud scheduler jobs create http $SchedulerName --schedule="30 19 * * 1-5" `
     --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"
 
 Write-Host "`nDone: blog job $JobName deployed; scheduler $SchedulerName registered."
-Write-Host "NOTE: adjust --schedule so the blog runs AFTER the strategy job pushes its DB to GCS."
-Write-Host "Verify: gcloud run jobs describe $JobName --region $Region"
+Write-Host "Schedule runs 16:30 ET (Mon-Fri) via UTC cron '30 20 * * 1-5' (EDT)."
+Write-Host "If DST changes, flip to '30 21 * * 1-5' (EST)."
+Write-Host "Verify: & $GCloud run jobs describe $JobName --region $Region"
