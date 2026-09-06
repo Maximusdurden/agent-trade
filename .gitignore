@@ -49,6 +49,10 @@ trading.log
 # Scratch folder
 scratch/
 
+# Deploy staging dirs (transient cloud-build staging copies)
+deploy/temp_staging_*/
+deploy/temp_staging_blog/
+
 # Cache & Temp files
 daily_cash_reconstructed.json
 detailed_search_results.json
