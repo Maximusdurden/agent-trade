@@ -154,6 +154,10 @@ OPTIONS_WATCH_COOLDOWN_MINUTES = float(os.getenv("OPTIONS_WATCH_COOLDOWN_MINUTES
 OPTIONS_MAX_ALLOCATION_PCT = float(os.getenv("OPTIONS_MAX_ALLOCATION_PCT", "0.05"))
 # Max number of option contracts per ticker.
 OPTIONS_MAX_CONTRACTS_PER_TICKER = int(os.getenv("OPTIONS_MAX_CONTRACTS_PER_TICKER", "5"))
+# Max % of total equity that may be committed across ALL open option positions
+# (long calls + puts). Prevents the strategist's bearish-put authorization from
+# over-leveraging the book across many symbols. 0.15 = 15% of equity.
+OPTIONS_MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("OPTIONS_MAX_TOTAL_EXPOSURE_PCT", "0.15"))
 # Conviction threshold (0.0-1.0): conviction >= threshold routes to the option path (leverage).
 # Below threshold routes to the stock path. Deterministic mapping prevents stock<->option whipsaw.
 OPTIONS_CONVICTION_THRESHOLD = float(os.getenv("OPTIONS_CONVICTION_THRESHOLD", "0.7"))

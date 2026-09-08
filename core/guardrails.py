@@ -802,6 +802,28 @@ class RiskGuardrails:
             if obp <= 0:
                 return False, "Rejected: No options buying power available.", adjusted_decision
 
+            # TOTAL OPTIONS EXPOSURE CAP: prevent the strategist's bearish-put
+            # authorization from over-leveraging the book across many symbols.
+            # Sum the market value of all currently-held option positions and
+            # reject a new BUY-to-open if it would push total exposure above the
+            # configured % of equity.
+            try:
+                from core.feedback import is_option_contract_symbol
+                total_opt_mv = 0.0
+                for pos_sym, pos in (current_positions or {}).items():
+                    if is_option_contract_symbol(pos_sym):
+                        total_opt_mv += float(pos.get("market_value", 0.0) or 0.0)
+                max_total = equity * float(getattr(config, "OPTIONS_MAX_TOTAL_EXPOSURE_PCT", 0.15))
+                if total_opt_mv >= max_total:
+                    return False, (
+                        f"Rejected: Total options exposure ${total_opt_mv:,.2f} already "
+                        f"at/above the ${max_total:,.2f} cap "
+                        f"({getattr(config, 'OPTIONS_MAX_TOTAL_EXPOSURE_PCT', 0.15)*100:.0f}% of equity). "
+                        "New option BUY blocked."
+                    ), adjusted_decision
+            except Exception as exp_err:
+                logger.warning(f"Total options exposure check failed (fail-open): {exp_err}")
+
         adjusted_decision["instrument"] = "option"
         return True, f"Approved: Option {'BUY-to-open' if action == 'BUY' else 'SELL-to-close'} via instrument rule.", adjusted_decision
 

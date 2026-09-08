@@ -164,6 +164,10 @@ def init_db():
         # strategy_history: optional experiment/version tag so future round-trip
         # attribution can score rule versions against each other.
         add_column_if_missing("strategy_history", "strategy_version", "TEXT")
+        # strategy_history: optional instrument hint so the strategist can
+        # authorize a leveraged (option) expression of a high-conviction view.
+        # "stock" | "option" | "neutral" | NULL (no explicit authorization).
+        add_column_if_missing("strategy_history", "instrument_hint", "TEXT")
 
         conn.commit()
 
@@ -409,21 +413,28 @@ def get_recent_trades(limit: int = 10) -> list[dict]:
         return [dict(row) for row in rows]
 
 def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules: str, meta_reasoning: str,
-                         strategy_version: str | None = None) -> int:
-    """Logs a daily strategy shift for a ticker, optionally tagged with a version/experiment id."""
+                         strategy_version: str | None = None,
+                         instrument_hint: str | None = None) -> int:
+    """Logs a daily strategy shift for a ticker, optionally tagged with a version/experiment id.
+
+    ``instrument_hint`` lets the strategist authorize a leveraged expression of a
+    high-conviction view: "stock" (shares), "option" (long call/put), or "neutral"
+    (no explicit authorization). NULL means no authorization was expressed.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO strategy_history
-                (timestamp, ticker, yesterdays_rules, todays_rules, meta_reasoning, strategy_version)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (timestamp, ticker, yesterdays_rules, todays_rules, meta_reasoning, strategy_version, instrument_hint)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             ticker.upper(),
             yesterdays_rules,
             todays_rules,
             meta_reasoning,
-            strategy_version
+            strategy_version,
+            instrument_hint
         ))
         conn.commit()
         return get_last_insert_id(cursor)
@@ -441,6 +452,48 @@ def get_active_strategy(ticker: str) -> str:
             return row["todays_rules"]
         
         return f"No active strategy rules defined for {ticker}."
+
+
+def get_active_strategy_hint(ticker: str) -> str | None:
+    """Retrieve the latest persisted instrument_hint for a ticker, if any.
+
+    Returns "stock", "option", "neutral", or None when no explicit authorization
+    was recorded. The brain uses this to know whether the strategist has
+    authorized a leveraged (option) expression of a high-conviction view.
+    """
+    ticker = ticker.upper()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT instrument_hint FROM strategy_history WHERE ticker = ? ORDER BY id DESC LIMIT 1
+        """, (ticker,))
+        row = cursor.fetchone()
+        if row:
+            hint = row["instrument_hint"]
+            if hint:
+                return str(hint).lower().strip()
+        return None
+
+
+def get_option_authorized_tickers() -> list[str]:
+    """Return every ticker whose latest strategist rule authorizes options.
+
+    A ticker qualifies if the most recent ``instrument_hint`` recorded for it is
+    "option". Used by ``build_appraisal_universe`` so the brain actually appraises
+    a ticker the strategist has authorized for a leveraged (long call/put)
+    expression — otherwise the authorization would be moot because the brain
+    never reads its rule.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ticker FROM strategy_history
+            WHERE instrument_hint = 'option'
+              AND id IN (
+                  SELECT MAX(id) FROM strategy_history GROUP BY ticker
+              )
+        """)
+        return [row["ticker"].upper() for row in cursor.fetchall()]
 
 
 def get_strategy_before(ticker: str, timestamp: str) -> str | None:
@@ -825,4 +878,10 @@ class Database:
 
     def get_active_strategy(self, ticker: str) -> str:
         return get_active_strategy(ticker)
+
+    def get_active_strategy_hint(self, ticker: str) -> str | None:
+        return get_active_strategy_hint(ticker)
+
+    def get_option_authorized_tickers(self) -> list[str]:
+        return get_option_authorized_tickers()
 

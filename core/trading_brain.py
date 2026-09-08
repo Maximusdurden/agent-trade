@@ -233,6 +233,10 @@ class TradingBrain:
             
             # Fetch active strategy rule from our daily strategist database
             active_rule = database.get_active_strategy(symbol)
+            # Fetch the strategist's instrument authorization (if any). "option"
+            # means the strategist has explicitly authorized a leveraged (long
+            # call/put) expression of a high-conviction view for this symbol.
+            instrument_hint = database.get_active_strategy_hint(symbol)
             
             # Extract advanced pivots
             pivots = data.get("advanced_pivots", {})
@@ -291,6 +295,7 @@ Ticker: {symbol}
 - RECENT NEWS & MARKET EVENTS:
 {news_str}
 - MANDATORY TRADING RULE (Written by Meta-Strategist): "{active_rule}"
+- STRATEGIST INSTRUMENT AUTHORIZATION: "{instrument_hint or 'none'}"
 """
 
         recent_history_summary = ""
@@ -322,7 +327,8 @@ Ticker: {symbol}
         4. If "instrument" is "option" and the symbol is in the options universe, you may optionally request a specific DTE range via "option_dte_min" / "option_dte_max" (default {config.OPTIONS_DTE_MIN}-{config.OPTIONS_DTE_MAX} days) and OTM% via "option_strike_otm_pct".
         5. OPTIONS UNIVERSE: {universe_str}. Only symbols in this set are eligible for options.
         6. For a SELL of an existing option position, set direction opposite your view and keep conviction high; the executor sells the held contracts (never go short).
-        7. NARRATION: In "thought_process", always explicitly explain WHY you chose your instrument ("stock" vs "option") and conviction. State the exact "instrument" value you are outputting and the conviction number. If you set "instrument": "stock", STATE THAT CLEARLY — the system WILL respect your stock intent and buy shares.
+        7. STRATEGIST AUTHORIZATION: Each ticker's market data includes a "STRATEGIST INSTRUMENT AUTHORIZATION" line. If it says "option", the Meta-Strategist has explicitly authorized a leveraged (long call/put) expression of a high-conviction view for that symbol. This is a strong signal that you MAY set "instrument": "option" when your conviction is >= {config.OPTIONS_CONVICTION_THRESHOLD} and the symbol is in the options universe. A bearish authorization ("option" + bearish direction) maps to a long PUT; a bullish authorization maps to a long CALL. If the authorization is "stock" or "none", default to shares.
+        8. NARRATION: In "thought_process", always explicitly explain WHY you chose your instrument ("stock" vs "option") and conviction. State the exact "instrument" value you are outputting and the conviction number. If you set "instrument": "stock", STATE THAT CLEARLY — the system WILL respect your stock intent and buy shares.
         """
         
         # Add crypto-specific instructions to the system prompt

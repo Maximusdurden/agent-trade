@@ -42,9 +42,14 @@ def build_strategy_universe(positions: dict, watchlist_tickers: list[str]) -> li
     symbol``) and would generate a nonsensical stock rule for a contract.
     """
     from core.guardrails import is_occ_symbol
+    # Include OPTIONS_UNIVERSE symbols so the strategist can generate rules (and
+    # authorize puts) for option-eligible names that aren't in TRADING_UNIVERSE
+    # (e.g. GOOGL, AMD). Without this, the strategist would never see them and
+    # could never authorize a leveraged expression.
+    options_universe = list(getattr(config, "OPTIONS_UNIVERSE", []))
     return list(dict.fromkeys(
         ticker.upper()
-        for ticker in [*config.TRADING_UNIVERSE, *positions.keys(), *watchlist_tickers]
+        for ticker in [*config.TRADING_UNIVERSE, *options_universe, *positions.keys(), *watchlist_tickers]
         if not is_occ_symbol(ticker)
     ))
 
@@ -172,17 +177,27 @@ class MetaStrategist:
             # the version tag so the A/B harness can split outcomes by model.
             authored_by = result.get("ab_model") or (getattr(config, "STRATEGIST_MODEL_TIER", "heavyweight"))
             model_tag = authored_by.replace("/", "-").replace("_", "-") if authored_by else "unknown"
+            instrument_hint = result.get("instrument_hint")
+            # Normalize the hint to a safe value; only "option" is meaningful for
+            # the brain's routing, everything else is treated as no authorization.
+            if instrument_hint:
+                instrument_hint = str(instrument_hint).lower().strip()
+                if instrument_hint not in ("stock", "option", "neutral"):
+                    instrument_hint = None
             db_id = database.log_strategy_history(
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
                 meta_reasoning=result["meta_reasoning"],
-                strategy_version=f"{next_strategy_version()}|model={model_tag}"
+                strategy_version=f"{next_strategy_version()}|model={model_tag}",
+                instrument_hint=instrument_hint,
             )
             
             logger.info(f"Strategy updated for {ticker}. Database ID: {db_id}")
             logger.info(f"Meta-Reasoning: {result['meta_reasoning']}")
-            logger.info(f"New Rules: {result['todays_rules']}\n")
+            logger.info(f"New Rules: {result['todays_rules']}")
+            if instrument_hint:
+                logger.info(f"Instrument Hint: {instrument_hint}\n")
 
     def _summarize_bars(self, df) -> str:
         """Utility to convert recent candles into a dense textual representation."""
@@ -287,16 +302,18 @@ DIRECTIONS:
    - If the symbol's profit factor is < 1.0 or expectancy is negative, design more conservative rules: smaller starter size, tighter entry thresholds, and require confluences of Fibonacci support / psychological round numbers before triggers.
    - If max historical drawdown is high (>15%), prioritize capital preservation (defensive 1-3% sizing and a larger cash buffer).
    - Ensure the execution agent strictly avoids repeating previous errors or whipsaws.
-5. Write a single, highly refined paragraph that applies ONLY to {ticker}. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" threshold for {ticker} based on price, intraday VWAP, or vwap_dist_pct. Do not substitute another ticker in the operative instruction.
-6. The new rule MUST cite at least one CONCRETE, guardrail-adjustable knob (an intraday VWAP threshold, an RSI entry band, a max allocation %, or a holding-time exit) so the rule is testable against future round-trips. State that knob explicitly (e.g. "IF vwap_dist_pct > +1.5% THEN no new BUY").
-6. For any crypto ticker, preserve 24/7 operation and use volatility-appropriate thresholds without requiring equity-index data.
+5. BEARISH OPPORTUNITY (not just de-risking): A strong downtrend is a TRADEABLE downside view, not only a risk to avoid. If the ticker shows a sustained bearish regime (price below both 20-day and 50-day SMAs, MACD histogram deeply negative, RSI rolling over from overbought, or a breakdown below key swing support under negative news), you may write a rule that AUTHORIZES a high-conviction bearish position. For options-universe symbols, set "instrument_hint": "option" to authorize a long PUT when the downside view is high-conviction (conviction >= 0.7). A bearish BUY (long put) is DISTINCT from a bullish BUY — do NOT phrase it as "no new BUY" (which would block the put). Instead phrase it as "long PUT authorized on high-conviction bearish breakdown."
+6. Write a single, highly refined paragraph that applies ONLY to {ticker}. YOU MUST INCLUDE AT LEAST ONE CONDITIONAL "IF/THEN" threshold for {ticker} based on price, intraday VWAP, or vwap_dist_pct. Do not substitute another ticker in the operative instruction.
+7. The new rule MUST cite at least one CONCRETE, guardrail-adjustable knob (an intraday VWAP threshold, an RSI entry band, a max allocation %, or a holding-time exit) so the rule is testable against future round-trips. State that knob explicitly (e.g. "IF vwap_dist_pct > +1.5% THEN no new BUY").
+8. For any crypto ticker, preserve 24/7 operation and use volatility-appropriate thresholds without requiring equity-index data.
 
 OUTPUT FORMAT:
 Your response must be a single, valid JSON object ONLY.
 Schema:
 {{
   "meta_reasoning": "Your analytical breakdown of yesterday's performance, the technical trend regime, and your quant reasoning for keeping or modifying the strategy.",
-  "todays_rules": "The concise, refined paragraph of trading rules for the execution loop. Must be under 3 sentences."
+  "todays_rules": "The concise, refined paragraph of trading rules for the execution loop. Must be under 3 sentences.",
+  "instrument_hint": "Optional instrument authorization: 'stock' (shares), 'option' (long call/put leverage), or 'neutral' (no explicit authorization). Set 'option' ONLY when the ticker is in the options universe AND the setup is a high-conviction directional view (conviction >= 0.7). Set 'stock' for a normal shares view. Leave null/neutral when holding or no strong directional view."
 }}
 """
 
@@ -307,6 +324,7 @@ Schema:
                 class StrategistResponse(BaseModel):
                     meta_reasoning: str = Field(description="Analytical breakdown of yesterday's performance and market trend.")
                     todays_rules: str = Field(description="The concise paragraph of trading rules. Must be under 3 sentences and include at least one IF/THEN condition.")
+                    instrument_hint: str | None = Field(default=None, description="Optional instrument authorization: 'stock' (shares), 'option' (long call/put leverage), or 'neutral' (no explicit authorization). Set 'option' ONLY when the ticker is in the options universe AND the setup is a high-conviction directional view (conviction >= 0.7). Set 'stock' for a normal shares view. Leave null/neutral when holding or no strong directional view.")
 
                 result = self.llm_client.generate_structured(
                     prompt=prompt,
@@ -317,6 +335,7 @@ Schema:
                 return {
                     "meta_reasoning": result.get("meta_reasoning", "Maintained previous rule set due to matching market trend."),
                     "todays_rules": result.get("todays_rules", yesterdays_rules),
+                    "instrument_hint": result.get("instrument_hint"),
                     "ab_model": self.ab_model,
                 }
             except Exception as e:
@@ -335,7 +354,8 @@ Schema:
                     logger.error(f"Failed to log exception to JIRA: {ex}")
                 return {
                     "meta_reasoning": f"Failed to contact OpenRouter strategist AI client: {e}. Falling back to yesterday's guidelines.",
-                    "todays_rules": yesterdays_rules
+                    "todays_rules": yesterdays_rules,
+                    "instrument_hint": None,
                 }
 
         try:

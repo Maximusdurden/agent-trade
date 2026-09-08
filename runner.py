@@ -53,9 +53,22 @@ def build_appraisal_universe(screened_symbols: list[str], positions: dict,
     loop evaluates the *underlying* for a strategy rule and fetches stock bars for it,
     which an option contract has no data for. The underlying (NVDA) is still included
     if held/endorsed, so open option exposure is still appraised at the underlying level.
+
+    Symbols with a strategist ``instrument_hint`` of "option" are also included so the
+    brain actually appraises a ticker the strategist has authorized for a leveraged
+    (long call/put) expression — otherwise the authorization would be moot because the
+    brain never reads its rule.
     """
     from core.feedback import is_option_contract_symbol
     candidates = [*screened_symbols, *positions.keys()]
+
+    # Include symbols the strategist has explicitly authorized for options.
+    try:
+        from core import database as _db
+        candidates.extend(_db.get_option_authorized_tickers())
+    except Exception as e:
+        logger.warning(f"Could not fetch strategist instrument hints for appraisal universe: {e}")
+
     candidates = [s for s in candidates if not is_option_contract_symbol(s)]
     if not actual_market_open:
         candidates = [symbol for symbol in candidates if is_crypto_symbol(symbol)]
