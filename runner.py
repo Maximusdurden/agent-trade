@@ -466,20 +466,30 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         logger.info(f"US Equity Market is closed ({market_reason}). Continuing cycle for CRYPTO ONLY trading.")
 
 
-    # Run the dynamic AI screener to select top candidates
+    # Run the dynamic AI screener to select top candidates.
+    # Reserve separate watchlist slots per asset class: during market hours we
+    # want up to 5 equities + 3 crypto; outside market hours crypto-only (3).
+    # This prevents high-scoring crypto pairs from crowding equities out of the
+    # top-N during the trading session.
     try:
         from core.screener import run_screener, load_screener_pool
         screener_candidates = load_screener_pool()
         
-        # Filter screener candidates to crypto only if outside market hours
-        if not actual_market_open:
-            screener_candidates = [
-                symbol for symbol in screener_candidates 
-                if is_crypto_symbol(symbol)
-            ]
-            logger.info(f"US Equity Market is closed/outside hours. Filtering screener candidates to CRYPTO ONLY: {screener_candidates}")
+        if actual_market_open:
+            equity_limit = 5
+            crypto_limit = 3
+        else:
+            equity_limit = 0
+            crypto_limit = 3
+            logger.info(f"US Equity Market is closed/outside hours. Filtering screener candidates to CRYPTO ONLY: {[s for s in screener_candidates if is_crypto_symbol(s)]}")
             
-        screened_list = run_screener(alpaca_client, data_provider, watchlist_limit=5, candidates=screener_candidates)
+        screened_list = run_screener(
+            alpaca_client, data_provider,
+            watchlist_limit=equity_limit + crypto_limit,
+            candidates=screener_candidates,
+            equity_limit=equity_limit,
+            crypto_limit=crypto_limit,
+        )
         logger.info(f"Screener generated watchlist: {screened_list}")
     except Exception as screener_err:
         logger.error(f"Screener execution failed: {screener_err}. Falling back to static TRADING_UNIVERSE.")

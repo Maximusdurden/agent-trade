@@ -158,7 +158,8 @@ def calculate_technical_score(row: pd.Series) -> float:
             
     return score
 
-def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_limit: int = 5, candidates: list[str] | None = None) -> list[str]:
+def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_limit: int = 5, candidates: list[str] | None = None,
+                 equity_limit: int | None = None, crypto_limit: int | None = None) -> list[str]:
     """
     Runs the autonomous screener cycle:
     1. Loads candidates from screener_pool.json if none provided.
@@ -169,6 +170,14 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
     6. Adjusts scores using the SQLite trade feedback loop (win rate booster/penalty).
     7. Sorts and returns the top watchlist_limit symbols.
     8. Logs chosen watchlist to watchlist_history table.
+
+    ``equity_limit`` / ``crypto_limit`` let the caller reserve separate watchlist
+    slots per asset class (e.g. 5 equities during market hours + 3 crypto always)
+    so a high-scoring crypto pair cannot crowd equities out of the top-N. When
+    both are provided, the screener scores equities and crypto independently and
+    returns the top ``equity_limit`` equities + top ``crypto_limit`` crypto. When
+    only ``watchlist_limit`` is given (legacy callers), behavior is unchanged:
+    a single mixed top-N is returned.
     """
     logger.info("Starting Autonomous AI Screener execution...")
     
@@ -268,8 +277,19 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
     # Sort descending by score
     scored_symbols.sort(key=lambda x: x[1], reverse=True)
     
-    # Select top N watchlist candidates
-    final_watchlist = [item[0] for item in scored_symbols[:watchlist_limit]]
+    # Select top N watchlist candidates. When equity_limit/crypto_limit are
+    # provided, reserve separate slots per asset class so crypto cannot crowd
+    # equities out of the top-N during market hours.
+    if equity_limit is not None or crypto_limit is not None:
+        from core.strategy_rules import is_crypto_symbol
+        eq_limit = equity_limit if equity_limit is not None else watchlist_limit
+        cr_limit = crypto_limit if crypto_limit is not None else 0
+        equities = [item for item in scored_symbols if not is_crypto_symbol(item[0])]
+        cryptos = [item for item in scored_symbols if is_crypto_symbol(item[0])]
+        final_watchlist = [item[0] for item in equities[:eq_limit]] + [item[0] for item in cryptos[:cr_limit]]
+        logger.info(f"Screener split selection: {len(equities[:eq_limit])} equities + {len(cryptos[:cr_limit])} crypto.")
+    else:
+        final_watchlist = [item[0] for item in scored_symbols[:watchlist_limit]]
     
     logger.info(f"Screener complete. Top selected candidates:")
     for sym, score, vol in scored_symbols[:watchlist_limit]:
