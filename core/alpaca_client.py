@@ -1248,7 +1248,7 @@ class AlpacaClient:
                         symbol=symbol,
                         qty=qty,
                         side=order_side,
-                        time_in_force=TimeInForce.DAY
+                        time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY
                     )
                     return _submit_and_poll(market_order_data, order_type="market", fallback=True)
 
@@ -1270,7 +1270,7 @@ class AlpacaClient:
                         symbol=symbol,
                         qty=bracket_qty,
                         side=order_side,
-                        time_in_force=TimeInForce.DAY
+                        time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY
                     )
                     return _submit_and_poll(market_order_data, order_type="market", fallback=True)
             else:
