@@ -6,7 +6,7 @@ database = Database()
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from core import config
 from core.alpaca_client import AlpacaClient
@@ -153,17 +153,43 @@ def mark_shock_triggered(symbol: str) -> None:
 
 
 def ensure_active_strategy(symbol: str, alpaca_client: AlpacaClient) -> bool:
-    """Generate a missing strategy on demand and confirm that it was persisted.
+    """Generate a missing OR STALE strategy on demand and confirm that it persisted.
 
     Includes a cooldown so a ticker with a persistently-unproducible rule (e.g.
     missing_rule) doesn't re-trigger an expensive MetaStrategist LLM call every
     cycle. Once a refresh is attempted, we don't try again for
     STRATEGY_REFRESH_COOLDOWN_MINUTES unless the rule actually repairs itself.
+
+    A rule is treated as needing refresh when it is (a) missing/invalid OR
+    (b) older than ``STRATEGY_STALE_HOURS`` (default 26h). The latter closes the
+    "present but stale" hole that kept tickers like COST trading on a month-old
+    rule because the daily reset never actually ran.
     """
     active_rule = database.get_active_strategy(symbol)
     is_valid, validation_reason = validate_strategy_rule(symbol, active_rule)
-    if is_valid:
+
+    # Staleness check: a present-but-valid rule older than the threshold is stale.
+    stale = False
+    stale_hours = float(getattr(config, "STRATEGY_STALE_HOURS", 26))
+    if is_valid and stale_hours > 0:
+        try:
+            ts = database.get_active_strategy_timestamp(symbol)
+            if ts:
+                rule_dt = datetime.fromisoformat(str(ts))
+                if rule_dt.tzinfo is not None:
+                    rule_dt = rule_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                age_hours = (datetime.utcnow() - rule_dt).total_seconds() / 3600.0
+                if age_hours > stale_hours:
+                    stale = True
+                    validation_reason = f"rule is stale (age {age_hours:.1f}h > {stale_hours:.0f}h)"
+        except Exception as stale_err:
+            logger.debug(f"Staleness check failed for {symbol}: {stale_err}")
+
+    if is_valid and not stale:
         return True
+
+    if stale:
+        logger.info(f"Strategy for {symbol} is stale; refreshing on demand.")
 
     # Cooldown: skip re-triggering if we already tried to refine this ticker recently.
     last_attempt_key = f"strategy_refresh_attempt_{symbol.upper()}"
@@ -403,6 +429,35 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
     try:
         from core.discord_notifier import send_discord_message
         positions_str = format_positions(positions)
+
+        # A0. MORNING WARM-UP DAILY STRATEGIST (weekdays, before the 09:30 open).
+        #     The MetaStrategist rewrites fresh rules for the full universe
+        #     (TRADING_UNIVERSE + holdings + screener_pool) once per day so no
+        #     ticker trades on a stale rule (e.g. COST's 32-day-old rule). Running
+        #     BEFORE the open lets it factor in overnight/pre-market moves and news
+        #     to set the day's strategy. Gated once/day via a system_state key.
+        if weekday < 5 and (9 * 60) - 30 <= current_minutes < (9 * 60 + 30):
+            last_daily_strat = database.get_system_state("last_daily_strategy_run")
+            if last_daily_strat != today_str:
+                logger.info("Morning warm-up: running daily strategy refinement for full universe...")
+                try:
+                    # Archive the rules currently in force (i.e. yesterday's
+                    # strategies) BEFORE regenerating, keyed by the prior date.
+                    # This preserves the previous day's per-ticker strategies in a
+                    # queryable snapshot for auditing/backtest attribution.
+                    try:
+                        from datetime import timedelta as _td
+                        prior_date = (now_et - _td(days=1)).strftime('%Y-%m-%d')
+                        n = database.snapshot_all_strategies(prior_date)
+                        logger.info(f"Morning warm-up: archived {n} ticker strategy snapshot(s) for {prior_date}.")
+                    except Exception as snap_err:
+                        logger.warning(f"Morning warm-up strategy snapshot failed (non-fatal): {snap_err}")
+                    from core.strategist import MetaStrategist
+                    MetaStrategist().run_daily_strategy_refinement(alpaca_client)
+                    database.set_system_state("last_daily_strategy_run", today_str)
+                    logger.info("Morning warm-up: daily strategy refinement complete.")
+                except Exception as daily_strat_err:
+                    logger.error(f"Morning warm-up daily strategy refinement failed: {daily_strat_err}")
 
         # A. Morning Start Message (Weekdays Monday-Friday, at or after 09:00 ET)
         if weekday < 5 and current_minutes >= (9 * 60):

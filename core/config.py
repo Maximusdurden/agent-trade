@@ -92,6 +92,13 @@ INTRADAY_BREAKER_ENABLED = os.getenv("INTRADAY_BREAKER_ENABLED", "true").lower()
 # still allowed because we must be able to manage an existing position).
 STRICT_UNIVERSE_ENABLED = os.getenv("STRICT_UNIVERSE_ENABLED", "true").lower() == "true"
 
+# Strategy-rule staleness: if the active rule for a ticker is older than this
+# many hours, `ensure_active_strategy` treats it as stale and regenerates a
+# fresh one (mirroring the "missing rule" path). Prevents trading on rules that
+# were written days/weeks ago (e.g. COST's month-old rule). 0 disables the check.
+# Default 26h comfortably spans a weekend-free daily refresh.
+STRATEGY_STALE_HOURS = float(os.getenv("STRATEGY_STALE_HOURS", "26"))
+
 # Intraday VWAP gating
 # VWAP is cumulative within the current trading day. Early in the session there
 # are too few intraday bars for VWAP (and its bands / dist_pct) to be meaningful:

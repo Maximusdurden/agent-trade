@@ -108,6 +108,27 @@ def init_db():
             )
         """)
         
+        # 4b. Strategy Snapshots Table (per-day baseline of the rule in force for
+        #     every ticker). Captured each morning BEFORE the warm-up regenerates
+        #     fresh rules, so the prior day's strategies are preserved in a
+        #     queryable, date-keyed archive. Distinct from strategy_history (the
+        #     append-only per-update log) — this is one row per (date, ticker).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                rule TEXT,
+                instrument_hint TEXT,
+                strategy_version TEXT,
+                UNIQUE(snapshot_date, ticker)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_strategy_snapshots_date
+            ON strategy_snapshots (snapshot_date)
+        """)
+        
         # 5. Watchlist History Table (Autonomous Screener logs)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS watchlist_history (
@@ -439,6 +460,48 @@ def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules
         conn.commit()
         return get_last_insert_id(cursor)
 
+def snapshot_all_strategies(snapshot_date: str) -> int:
+    """Persist one row per ticker (date, ticker) of the rule currently in force.
+
+    Captures the latest ``todays_rules``/``instrument_hint``/version for every
+    ticker that has an active strategy, keyed by ``snapshot_date``. Used each
+    morning BEFORE the warm-up regenerates fresh rules, so the prior day's
+    strategies are preserved in a queryable archive. Idempotent per (date, ticker)
+    via ``INSERT OR REPLACE``. Returns the number of tickers snapshotted.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO strategy_snapshots
+                (snapshot_date, ticker, rule, instrument_hint, strategy_version)
+            SELECT ?, ticker, todays_rules, instrument_hint, strategy_version
+            FROM strategy_history sh
+            WHERE id = (SELECT MAX(id) FROM strategy_history WHERE ticker = sh.ticker)
+        """, (snapshot_date,))
+        conn.commit()
+        cursor.execute("SELECT COUNT(DISTINCT ticker) FROM strategy_snapshots WHERE snapshot_date = ?",
+                       (snapshot_date,))
+        return cursor.fetchone()[0]
+
+
+def get_strategy_snapshot(snapshot_date: str) -> dict[str, dict]:
+    """Return the archived strategies for a date as {TICKER: {rule, hint, version}}."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ticker, rule, instrument_hint, strategy_version
+            FROM strategy_snapshots WHERE snapshot_date = ?
+        """, (snapshot_date,))
+        rows = cursor.fetchall()
+        return {
+            r["ticker"].upper(): {
+                "rule": r["rule"],
+                "instrument_hint": r["instrument_hint"],
+                "strategy_version": r["strategy_version"],
+            }
+            for r in rows
+        }
+
 def get_active_strategy(ticker: str) -> str:
     """Retrieve the latest persisted strategy, without synthesizing fallback rules."""
     ticker = ticker.upper()
@@ -452,6 +515,18 @@ def get_active_strategy(ticker: str) -> str:
             return row["todays_rules"]
         
         return f"No active strategy rules defined for {ticker}."
+
+
+def get_active_strategy_timestamp(ticker: str) -> str | None:
+    """Return the timestamp of the latest persisted strategy for a ticker, or None."""
+    ticker = ticker.upper()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp FROM strategy_history WHERE ticker = ? ORDER BY id DESC LIMIT 1
+        """, (ticker,))
+        row = cursor.fetchone()
+        return row["timestamp"] if row else None
 
 
 def get_active_strategy_hint(ticker: str) -> str | None:
@@ -881,6 +956,15 @@ class Database:
 
     def get_active_strategy_hint(self, ticker: str) -> str | None:
         return get_active_strategy_hint(ticker)
+
+    def get_active_strategy_timestamp(self, ticker: str) -> str | None:
+        return get_active_strategy_timestamp(ticker)
+
+    def snapshot_all_strategies(self, snapshot_date: str) -> int:
+        return snapshot_all_strategies(snapshot_date)
+
+    def get_strategy_snapshot(self, snapshot_date: str) -> dict[str, dict]:
+        return get_strategy_snapshot(snapshot_date)
 
     def get_option_authorized_tickers(self) -> list[str]:
         return get_option_authorized_tickers()
