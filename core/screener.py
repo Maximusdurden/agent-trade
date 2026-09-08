@@ -24,18 +24,37 @@ DEFAULT_TICKERS = [
 ]
 
 def load_screener_pool() -> list[str]:
-    """Loads the broad candidate pool of tickers from screener_pool.json."""
+    """Loads the broad candidate pool of tickers from screener_pool.json.
+
+    Filters out crypto pairs Alpaca does not support (e.g. BNB/USD) so an
+    unsupported symbol never reaches the bars endpoint and triggers a
+    "Failed to fetch historical bars" error.
+    """
     pool_path = config.SCREENER_POOL_PATH
     if pool_path.exists():
         try:
             with open(pool_path, "r") as f:
                 tickers = json.load(f)
                 if isinstance(tickers, list) and tickers:
-                    return [t.upper() for t in tickers]
+                    return _filter_supported(tickers)
         except Exception as e:
             logger.error(f"Failed to read {pool_path}: {e}")
     logger.info("Falling back to default liquid tickers list.")
-    return DEFAULT_TICKERS
+    return _filter_supported(DEFAULT_TICKERS)
+
+
+def _filter_supported(tickers: list[str]) -> list[str]:
+    """Drop unsupported crypto pairs from a candidate list."""
+    supported_crypto = set(getattr(config, "SUPPORTED_CRYPTO_PAIRS", set()))
+    out = []
+    for t in tickers:
+        up = t.upper()
+        # Only filter symbols that look like crypto pairs (contain a slash).
+        if "/" in up and up not in supported_crypto:
+            logger.warning(f"Filtering unsupported crypto pair from pool: {up}")
+            continue
+        out.append(up)
+    return out
 
 def get_symbol_feedback() -> dict[str, dict]:
     """Decay-weighted per-symbol performance feedback for the screener.

@@ -212,6 +212,15 @@ TRADING_UNIVERSE = [
     "SOL/USD", "BTC/USD", "ETH/USD", "XRP/USD"  # Crypto
 ]
 
+# Crypto pairs Alpaca actually supports for trading/data. The screener pool and
+# any candidate list must be filtered against this so an unsupported pair (e.g.
+# BNB/USD) doesn't cause "Failed to fetch historical bars" errors. Kept in sync
+# with Alpaca's crypto asset universe (verified 2026-09-08).
+SUPPORTED_CRYPTO_PAIRS = {
+    "SOL/USD", "XRP/USD", "ETH/USD", "BTC/USD", "ADA/USD", "DOGE/USD",
+    "LTC/USD", "DOT/USD", "LINK/USD", "AVAX/USD", "UNI/USD", "SHIB/USD",
+}
+
 # API Configuration
 API_KEY = os.getenv("TRADING_API_KEY")
 API_SECRET = os.getenv("TRADING_API_SECRET")
