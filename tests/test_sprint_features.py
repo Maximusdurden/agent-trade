@@ -9,6 +9,10 @@ from unittest.mock import MagicMock, patch
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Isolate this test's DB so it doesn't inherit whatever the first-imported test
+# set via DATABASE_FILENAME (config.DATABASE_PATH is computed once at import).
+os.environ["DATABASE_FILENAME"] = "test_sprint_features.db"
+
 from core.gcs_sync import check_kill_switch, set_kill_switch_state
 from runner import format_positions, get_current_eastern_time
 
@@ -219,26 +223,29 @@ class TestSprintFeatures(unittest.TestCase):
         self.assertIn("would exceed the per-ticker limit of 30.0% of equity", msg)
 
     def test_daily_cadence_flag_persists_successfully_via_db(self):
-        from core.database import Database
+        # Use the module-level DB functions (which respect DATABASE_PATH) rather
+        # than the Database() class, so the test works regardless of which test
+        # module imported `config` first (DATABASE_PATH is fixed at import).
+        from core import database
         import sqlite3
-        db = Database()
+        database.init_db()  # ensure system_state table exists
         db_key = "test_last_morning_sent"
-        
+
         # Clear any existing value
-        with sqlite3.connect(db.db_path) as conn:
+        with database.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM system_state WHERE key = ?", (db_key,))
             conn.commit()
-            
+
         try:
-            val = db.get_system_state(db_key)
+            val = database.get_system_state(db_key)
             self.assertIsNone(val)
-            
-            db.set_system_state(db_key, "2026-07-30")
-            val = db.get_system_state(db_key)
+
+            database.set_system_state(db_key, "2026-07-30")
+            val = database.get_system_state(db_key)
             self.assertEqual(val, "2026-07-30")
         finally:
-            with sqlite3.connect(db.db_path) as conn:
+            with database.get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM system_state WHERE key = ?", (db_key,))
                 conn.commit()

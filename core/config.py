@@ -107,6 +107,36 @@ STRATEGY_STALE_HOURS = float(os.getenv("STRATEGY_STALE_HOURS", "26"))
 # false signal, VWAP-derived fields are exposed as None until the current day has
 # at least MIN_VWAP_BARS intraday bars.
 MIN_VWAP_BARS = int(os.getenv("MIN_VWAP_BARS", "4"))
+
+# Whipsaw-prevention knobs (2026-09-09). These target the WFC-style intraday
+# buy/sell flip-flop where a stateless brain re-decides every 15 min and churns
+# a tight range around VWAP.
+#
+# 1. VWAP dead zone (Fix 1): a BUY/SELL is only allowed when price is OUTSIDE
+#    the ±VWAP_DEAD_ZONE_SIGMA band around VWAP. Inside the band = HOLD. This
+#    creates a no-trade dead zone so tiny oscillations around VWAP don't flip
+#    the decision. Applied both as a prompt rule and a deterministic guardrail.
+VWAP_DEAD_ZONE_SIGMA = float(os.getenv("VWAP_DEAD_ZONE_SIGMA", "1.0"))
+#
+# 2. Per-ticker daily round-trip budget (Fix 3): once a symbol has closed this
+#    many round-trips today, force HOLD for the rest of the day (block new BUYs
+#    and new SELLs that would open a fresh round-trip; a full-exit SELL of an
+#    existing position is still allowed).
+MAX_ROUND_TRIPS_PER_DAY = int(os.getenv("MAX_ROUND_TRIPS_PER_DAY", "2"))
+#
+# 3. Minimum-edge gate (Fix 5): a REVERSAL (BUY after a recent SELL, or SELL
+#    after a recent BUY on the same symbol within the day) requires the price
+#    move from the last fill to exceed MIN_EDGE_PCT (percent). Otherwise reject
+#    as "insufficient edge to justify reversal." Kills micro-whipsaw in tight
+#    ranges where the gross move is smaller than spread+fees.
+MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.3"))
+#
+# 4. Day-direction lock (Fix 6): once the brain takes a direction on a ticker
+#    intraday, a reversal is blocked unless price crosses a VWAP band by more
+#    than DAY_DIRECTION_LOCK_SIGMA OR moves more than DAY_DIRECTION_LOCK_MOVE_PCT
+#    from the last fill — a real regime change, not noise.
+DAY_DIRECTION_LOCK_SIGMA = float(os.getenv("DAY_DIRECTION_LOCK_SIGMA", "1.0"))
+DAY_DIRECTION_LOCK_MOVE_PCT = float(os.getenv("DAY_DIRECTION_LOCK_MOVE_PCT", "0.5"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 

@@ -273,6 +273,181 @@ class RiskGuardrails:
             
         return True, "Market is open."
 
+    # ------------------------------------------------------------------
+    # WHIPSAW-PREVENTION GUARDRAILS (2026-09-09)
+    # ------------------------------------------------------------------
+
+    def _vwap_dead_zone_reason(self, symbol: str, action: str, current_price: float,
+                               indicators: dict | None) -> str | None:
+        """Return a rejection reason if a BUY/SELL is inside the VWAP dead zone.
+
+        Fix 1: the brain is told to "buy below VWAP, sell above VWAP" with no
+        dead zone, so any cross of VWAP flips the decision (WFC churned a ~$0.50
+        band around VWAP). This deterministic guardrail blocks a BUY/SELL while
+        price is inside the ±VWAP_DEAD_ZONE_SIGMA band around VWAP, forcing HOLD
+        in the no-trade zone. Only applies when VWAP fields are valid (respects
+        the existing MIN_VWAP_BARS gating that exposes them as None early in the
+        session).
+        """
+        if action not in ("BUY", "SELL"):
+            return None
+        if not indicators:
+            return None
+        vwap = indicators.get("vwap")
+        if vwap is None or current_price <= 0:
+            return None  # VWAP gated (too few intraday bars) -> no dead zone
+        sigma = float(getattr(config, "VWAP_DEAD_ZONE_SIGMA", 1.0))
+        # Use the precomputed ±1σ band when available; else derive from vwap.
+        upper = indicators.get("vwap_upper_1")
+        lower = indicators.get("vwap_lower_1")
+        if upper is None or lower is None:
+            return None
+        if lower <= current_price <= upper:
+            return (f"Rejected: VWAP dead zone. {symbol} at ${current_price:.2f} is inside "
+                    f"the ±{sigma:.0f}σ band (${lower:.2f}–${upper:.2f}) around VWAP "
+                    f"${vwap:.2f}. HOLD in the no-trade zone to avoid whipsawing "
+                    f"around VWAP.")
+        return None
+
+    def _round_trip_budget_reason(self, symbol: str, action: str) -> str | None:
+        """Return a rejection reason if the symbol has hit its daily round-trip budget.
+
+        Fix 3: cap churn regardless of what the LLM says. Counts today's CLOSED
+        round-trips (from core.feedback FIFO). Once the count >=
+        MAX_ROUND_TRIPS_PER_DAY, block new BUYs (a new BUY would open yet another
+        round-trip). A SELL is still allowed (it closes, not opens, a round-trip).
+        """
+        if action != "BUY":
+            return None
+        max_rt = int(getattr(config, "MAX_ROUND_TRIPS_PER_DAY", 2))
+        if max_rt <= 0:
+            return None
+        try:
+            from core.feedback import compute_closed_round_trips
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            trips = compute_closed_round_trips()
+            sym = normalize_symbol(symbol)
+            closed_today = sum(
+                1 for t in trips
+                if normalize_symbol(t["symbol"]) == sym
+                and str(t.get("close_ts", "")).startswith(today)
+            )
+            if closed_today >= max_rt:
+                return (f"Rejected: Daily round-trip budget. {symbol} has {closed_today} "
+                        f"closed round-trip(s) today >= MAX_ROUND_TRIPS_PER_DAY {max_rt}. "
+                        f"HOLD to stop churn.")
+        except Exception as err:
+            logger.error(f"Error checking round-trip budget for {symbol}: {err}")
+        return None
+
+    def _min_edge_reason(self, symbol: str, action: str, current_price: float) -> str | None:
+        """Return a rejection reason if a REVERSAL lacks sufficient edge.
+
+        Fix 5: a reversal (BUY after a recent SELL, or SELL after a recent BUY on
+        the same symbol within the day) requires the price move from the last fill
+        to exceed MIN_EDGE_PCT. Otherwise reject as "insufficient edge to justify
+        reversal." Kills micro-whipsaw in tight ranges where the gross move is
+        smaller than spread+fees.
+        """
+        if action not in ("BUY", "SELL"):
+            return None
+        min_edge = float(getattr(config, "MIN_EDGE_PCT", 0.3))
+        if min_edge <= 0 or current_price <= 0:
+            return None
+        try:
+            from core import database
+            recent = database.get_recent_trades(limit=50)
+            sym = normalize_symbol(symbol)
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            last_fill = None
+            for t in recent:
+                if (normalize_symbol(t.get("symbol", "")) == sym
+                        and str(t.get("timestamp", "")).startswith(today)
+                        and str(t.get("status", "")) in ("filled", "partially_filled")
+                        and t.get("filled_avg_price")):
+                    last_fill = t
+                    break
+            if not last_fill:
+                return None
+            last_side = str(last_fill.get("side", "")).lower()
+            last_price = float(last_fill.get("filled_avg_price", 0.0))
+            if last_price <= 0:
+                return None
+            # A reversal is BUY after SELL, or SELL after BUY.
+            is_reversal = (action == "BUY" and last_side == "sell") or \
+                          (action == "SELL" and last_side == "buy")
+            if not is_reversal:
+                return None
+            move_pct = abs(current_price - last_price) / last_price * 100.0
+            if move_pct < min_edge:
+                return (f"Rejected: Insufficient edge for reversal. {symbol} last "
+                        f"{last_side.upper()} at ${last_price:.2f}, now ${current_price:.2f} "
+                        f"({move_pct:.2f}% move < MIN_EDGE_PCT {min_edge:.2f}%). "
+                        f"Reversing would churn without covering spread+fees.")
+        except Exception as err:
+            logger.error(f"Error checking min-edge for {symbol}: {err}")
+        return None
+
+    def _day_direction_lock_reason(self, symbol: str, action: str, current_price: float,
+                                   indicators: dict | None) -> str | None:
+        """Return a rejection reason if a reversal violates the day-direction lock.
+
+        Fix 6: once the brain takes a direction on a ticker intraday, a reversal
+        is blocked unless price crosses a VWAP band by more than
+        DAY_DIRECTION_LOCK_SIGMA OR moves more than DAY_DIRECTION_LOCK_MOVE_PCT
+        from the last fill — a real regime change, not noise.
+        """
+        if action not in ("BUY", "SELL"):
+            return None
+        try:
+            from core import database
+            recent = database.get_recent_trades(limit=50)
+            sym = normalize_symbol(symbol)
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            last_fill = None
+            for t in recent:
+                if (normalize_symbol(t.get("symbol", "")) == sym
+                        and str(t.get("timestamp", "")).startswith(today)
+                        and str(t.get("status", "")) in ("filled", "partially_filled")
+                        and t.get("filled_avg_price")):
+                    last_fill = t
+                    break
+            if not last_fill:
+                return None
+            last_side = str(last_fill.get("side", "")).lower()
+            last_price = float(last_fill.get("filled_avg_price", 0.0))
+            if last_price <= 0:
+                return None
+            is_reversal = (action == "BUY" and last_side == "sell") or \
+                          (action == "SELL" and last_side == "buy")
+            if not is_reversal:
+                return None
+            # Regime-change test: VWAP band cross OR large price move.
+            move_pct = abs(current_price - last_price) / last_price * 100.0
+            move_threshold = float(getattr(config, "DAY_DIRECTION_LOCK_MOVE_PCT", 0.5))
+            if move_pct >= move_threshold:
+                return None  # big move = real regime change, allow reversal
+            if indicators:
+                vwap = indicators.get("vwap")
+                upper = indicators.get("vwap_upper_1")
+                lower = indicators.get("vwap_lower_1")
+                sigma = float(getattr(config, "DAY_DIRECTION_LOCK_SIGMA", 1.0))
+                if vwap is not None and upper is not None and lower is not None:
+                    # Did price cross a VWAP band boundary vs the last fill?
+                    crossed = (last_price <= upper < current_price) or \
+                              (last_price >= lower > current_price) or \
+                              (last_price <= lower < current_price) or \
+                              (last_price >= upper > current_price)
+                    if crossed:
+                        return None  # crossed a VWAP band = regime change
+            return (f"Rejected: Day-direction lock. {symbol} last {last_side.upper()} at "
+                    f"${last_price:.2f}, now ${current_price:.2f} ({move_pct:.2f}% move). "
+                    f"Reversal blocked without a regime change (VWAP band cross or "
+                    f"> {move_threshold:.2f}% move).")
+        except Exception as err:
+            logger.error(f"Error checking day-direction lock for {symbol}: {err}")
+        return None
+
     def validate_and_adjust_decision(self, decision: dict, account_state: dict, current_positions: dict,
                                      cycle_context: dict | None = None) -> tuple[bool, str, dict]:
         """
@@ -414,8 +589,15 @@ class RiskGuardrails:
             from core import database
             recent_trades = database.get_recent_trades(limit=10)
             last_trade = None
+            # Treat any EXECUTED status as a recent trade so a partial fill can't
+            # disarm the whipsaw guard. Only failed/canceled orders are ignored
+            # (they never actually moved shares). Fix 2 (2026-09-09): previously
+            # only matched status == "filled", so a "partially_filled" buy (e.g.
+            # WFC 16:18) fell through to an older trade and let a same-day SELL
+            # (16:43) slip through the 4-hour holding guard.
+            _executed_statuses = ("filled", "partially_filled", "submitted", "open")
             for t in recent_trades:
-                if t["symbol"] == symbol and t["status"] == "filled":
+                if t["symbol"] == symbol and t["status"] in _executed_statuses:
                     last_trade = t
                     break
                     
@@ -443,6 +625,32 @@ class RiskGuardrails:
         except Exception as err:
             logger.error(f"Error checking anti-whipsaw guardrail: {err}")
 
+        # 3d. Whipsaw-prevention guardrails (2026-09-09). These target the
+        # WFC-style intraday buy/sell flip-flop in a tight range around VWAP.
+        # They apply to both BUY and SELL (a reversal in either direction churns).
+        indicators = decision.get("indicators") if isinstance(decision.get("indicators"), dict) else {}
+        current_price = float(decision.get("current_price", 0.0))
+        if current_price <= 0:
+            return False, "Rejected: Missing or invalid current price for execution.", adjusted_decision
+
+        # 3d-1. VWAP dead zone (Fix 1): block BUY/SELL inside the ±1σ band.
+        vwap_reason = self._vwap_dead_zone_reason(symbol, action, current_price, indicators)
+        if vwap_reason:
+            adjusted_decision["quantity"] = 0.0
+            return False, vwap_reason, adjusted_decision
+
+        # 3d-2. Minimum-edge gate for reversals (Fix 5).
+        edge_reason = self._min_edge_reason(symbol, action, current_price)
+        if edge_reason:
+            adjusted_decision["quantity"] = 0.0
+            return False, edge_reason, adjusted_decision
+
+        # 3d-3. Day-direction lock (Fix 6).
+        lock_reason = self._day_direction_lock_reason(symbol, action, current_price, indicators)
+        if lock_reason:
+            adjusted_decision["quantity"] = 0.0
+            return False, lock_reason, adjusted_decision
+
         # 4. Check Daily Loss Limit (Equity Drawdown Guardrail)
         equity = account_state.get("equity", 0.0)
         cash = account_state.get("cash", 0.0)
@@ -458,8 +666,7 @@ class RiskGuardrails:
                 if action == "BUY":
                     return False, f"Rejected: Daily loss limit exceeded ({daily_drawdown_pct:.2%} >= {config.DAILY_LOSS_LIMIT_PCT:.2%}). All BUY orders blocked.", adjusted_decision
 
-        # Fetch current price
-        current_price = float(decision.get("current_price", 0.0))
+        # Fetch current price (already resolved above for the whipsaw guardrails)
         if current_price <= 0:
             return False, "Rejected: Missing or invalid current price for execution.", adjusted_decision
 
@@ -556,6 +763,14 @@ class RiskGuardrails:
             if breaker_reason:
                 adjusted_decision["quantity"] = 0.0
                 return False, breaker_reason, adjusted_decision
+
+            # Daily round-trip budget (Fix 3): cap churn even on a symbol that
+            # passes the circuit breakers. Runs AFTER the breakers so the more
+            # specific loss/whipsaw breakers take precedence.
+            rt_reason = self._round_trip_budget_reason(symbol, action)
+            if rt_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, rt_reason, adjusted_decision
 
             # Intra-day PnL circuit breaker: block new BUYs when the day's
             # realized + unrealized loss exceeds the limit (SELLs still allowed).

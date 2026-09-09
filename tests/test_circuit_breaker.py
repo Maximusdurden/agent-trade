@@ -61,10 +61,15 @@ class TestCircuitBreaker(unittest.TestCase):
         # Clear the feedback memo cache so each test sees fresh round-trips.
         import core.feedback as fb
         fb._memo.clear()
+        # Isolate the circuit breaker: disable the daily round-trip budget so it
+        # doesn't shadow the breaker being tested (Fix 3 guardrail).
+        self._orig_rt = getattr(config, "MAX_ROUND_TRIPS_PER_DAY", 2)
+        config.MAX_ROUND_TRIPS_PER_DAY = 999
         self.guardrails = RiskGuardrails()
 
     def tearDown(self):
         _clean_trades()
+        config.MAX_ROUND_TRIPS_PER_DAY = self._orig_rt
 
     def _decision(self, symbol, qty=10.0, price=100.0):
         return {

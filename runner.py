@@ -674,13 +674,18 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         target_symbol = decision.get("symbol", "").upper()
         current_price = 0.0
         atr_pct = None
+        indicators = {}
         for state in market_states:
             if state["symbol"] == target_symbol:
                 current_price = state["current_price"]
                 atr_pct = state.get("indicators", {}).get("atr_pct")
+                indicators = state.get("indicators", {}) or {}
                 break
         decision["current_price"] = current_price
         decision["atr_pct"] = atr_pct
+        # Attach the full indicator set so the whipsaw-prevention guardrails
+        # (VWAP dead zone, day-direction lock) can read VWAP bands.
+        decision["indicators"] = indicators
 
         # 6. Filter proposed decision through Risk Guardrails
         is_approved, status_msg, adjusted_decision = guardrails.validate_and_adjust_decision(

@@ -83,7 +83,12 @@ class TestStrategySnapshotAndStaleness(unittest.TestCase):
         mock_ms.assert_called_once()
 
     def test_fresh_rule_no_refresh(self):
-        self._log_rule("JNJ", "fresh rule", ts="2026-09-08T10:00:00")
+        # Use a timestamp 2h ago (well under the 26h staleness threshold) so the
+        # test is robust to when it runs, instead of a hardcoded date that goes
+        # stale over time.
+        from datetime import datetime, timedelta
+        fresh_ts = (datetime.utcnow() - timedelta(hours=2)).isoformat()
+        self._log_rule("JNJ", "fresh rule", ts=fresh_ts)
         with patch("core.strategist.MetaStrategist") as mock_ms:
             ok = ensure_active_strategy("JNJ", None)
         self.assertTrue(ok)

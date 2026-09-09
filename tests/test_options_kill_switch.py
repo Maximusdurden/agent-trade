@@ -55,6 +55,10 @@ class TestGuardrailOptionsKillSwitch(unittest.TestCase):
         from core.guardrails import RiskGuardrails
         g = RiskGuardrails()
         g.is_market_open_check = lambda: (True, "open")  # time-independent
+        # The earnings/IV filter makes a real API call (AAPL has earnings within
+        # the 60-day window). Stub it out so the kill-switch tests isolate the
+        # kill-switch logic, not the earnings filter.
+        g._has_earnings_before_expiry = lambda underlying, dte_max: ""
         return g
 
     def _option_buy_decision(self):

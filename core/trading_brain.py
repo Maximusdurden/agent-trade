@@ -268,7 +268,28 @@ class TradingBrain:
                     news_str += f"  - Headline {idx+1}: {n.get('headline')} (Source: {n.get('source')})\n    Summary: {n.get('summary')}\n"
             else:
                 news_str = "  - No recent news items found.\n"
-            
+
+            # Fix 4 (2026-09-09): per-ticker trade memory. Give the brain ALL
+            # recent executed trades for THIS symbol (not day-specific, not just
+            # the last 3 decisions) so it can see it's whipsawing and learn as it
+            # goes. Rendered oldest-first with time, side, qty, fill price, status.
+            trade_history_str = "  - No recent trades for this symbol.\n"
+            try:
+                sym_trades = database.get_recent_trades_by_symbol(symbol, limit=50)
+                if sym_trades:
+                    lines = []
+                    for t in sym_trades:
+                        ts = str(t.get("timestamp", ""))[11:16] or str(t.get("timestamp", ""))
+                        side = str(t.get("side", "")).upper()
+                        qty = t.get("qty")
+                        price = t.get("filled_avg_price")
+                        status = t.get("status", "")
+                        price_s = f"${float(price):,.2f}" if price is not None else "n/a"
+                        lines.append(f"    - {ts} {side} {qty} @ {price_s} ({status})")
+                    trade_history_str = "\n".join(lines) + "\n"
+            except Exception as trade_err:
+                logger.warning(f"Could not fetch trade history for {symbol}: {trade_err}")
+
             market_summary += f"""
 ---
 Ticker: {symbol}
@@ -294,6 +315,8 @@ Ticker: {symbol}
   - Support & Resistance Swing Zones: {zones_str}
 - RECENT NEWS & MARKET EVENTS:
 {news_str}
+- RECENT TRADES (this symbol, last 50, oldest-first):
+{trade_history_str}
 - MANDATORY TRADING RULE (Written by Meta-Strategist): "{active_rule}"
 - STRATEGIST INSTRUMENT AUTHORIZATION: "{instrument_hint or 'none'}"
 """
@@ -348,7 +371,7 @@ ROLE:
 You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate an independent high-conviction trade choice (BUY, SELL, or HOLD) for EVERY ticker in the provided market data. You output a "decisions" array with one decision object per appraised ticker.
 
 DIRECTIONS:
-1. Analyze the technical indicators (RSI, Moving Averages, MACD, Bollinger Bands, and intraday VWAP with standard deviation ±1σ and ±2σ bands) to judge trends, support/resistance, and overbought/oversold levels. Target buying below VWAP and selling above it, flagging standard deviation stretches of >= ±2σ as highly overextended mean-reversion setups.
+1. Analyze the technical indicators (RSI, Moving Averages, MACD, Bollinger Bands, and intraday VWAP with standard deviation ±1σ and ±2σ bands) to judge trends, support/resistance, and overbought/oversold levels. Target buying below VWAP and selling above it, flagging standard deviation stretches of >= ±2σ as highly overextended mean-reversion setups. CRITICAL VWAP DEAD ZONE: Do NOT buy or sell while the price is inside the ±1σ band around VWAP (between vwap_lower_1 and vwap_upper_1). That is a no-trade zone — output HOLD. Only BUY when price is below vwap_lower_1 and SELL when price is above vwap_upper_1. This prevents whipsawing around VWAP in a tight range.
 2. Observe Advanced Price Anchors (Fibonacci retracements, Psychological levels, Support/Resistance Swing zones) to find key pivot levels. Look for confluences where multiple anchors line up.
 3. Evaluate Recent News and Market Events for underlying sentiment. Bullish news should bolster buy conviction; bearish news or market distress should warrant extreme safety or sell execution.
 4. Scale your trade size (quantity) dynamically based on conviction and indicators:

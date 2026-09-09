@@ -433,6 +433,46 @@ def get_recent_trades(limit: int = 10) -> list[dict]:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+
+def get_recent_trades_by_symbol(symbol: str, limit: int = 50) -> list[dict]:
+    """Returns the most recent executed trades for ONE symbol (oldest-first).
+
+    Fix 4 (2026-09-09): gives the brain real per-ticker trade memory so it can
+    see it's whipsawing and learn as it goes. Excludes failed/canceled orders
+    (they never moved shares). Returns chronological order (oldest first) so the
+    brain reads the sequence of fills in time order.
+    """
+    sym = (symbol or "").upper()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp, symbol, side, qty, filled_avg_price, status
+            FROM trades
+            WHERE UPPER(symbol) = ? AND status IN ('filled', 'partially_filled', 'open', 'submitted')
+            ORDER BY id ASC
+            LIMIT ?
+        """, (sym, limit))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_recent_trades_all(limit: int = 200) -> list[dict]:
+    """Returns recent executed trades across ALL symbols (oldest-first).
+
+    Fix 4: portfolio-level trade memory for the brain. Excludes failed/canceled.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp, symbol, side, qty, filled_avg_price, status
+            FROM trades
+            WHERE status IN ('filled', 'partially_filled', 'open', 'submitted')
+            ORDER BY id ASC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
 def log_strategy_history(ticker: str, yesterdays_rules: str | None, todays_rules: str, meta_reasoning: str,
                          strategy_version: str | None = None,
                          instrument_hint: str | None = None) -> int:
@@ -921,6 +961,12 @@ class Database:
         
     def get_recent_trades(self, limit: int = 15) -> list[dict]:
         return get_recent_trades(limit)
+
+    def get_recent_trades_by_symbol(self, symbol: str, limit: int = 50) -> list[dict]:
+        return get_recent_trades_by_symbol(symbol, limit)
+
+    def get_recent_trades_all(self, limit: int = 200) -> list[dict]:
+        return get_recent_trades_all(limit)
         
     def log_portfolio_history(self, equity: float, cash: float, unrealized_pnl: float) -> Optional[int]:
         return log_portfolio_history(equity, cash, unrealized_pnl)
