@@ -69,6 +69,31 @@ class TestDustLiquidation(unittest.TestCase):
         self.assertEqual(adj["quantity"], 2.5)
         self.assertNotIn("full liquidation", msg)
 
+    def test_all_shares_locked_approves_full_liquidation(self):
+        # All shares locked in open bracket orders (qty_available=0) but we own
+        # the position -> approve a full-liquidation SELL so the executor can
+        # cancel the bracket legs and release the shares (instead of deferring
+        # forever).
+        owned = 3.0
+        approved, msg, adj = self.guardrails.validate_and_adjust_decision(
+            self._decision(qty=3.0, price=900.0),
+            self._account(),
+            self._positions(owned=owned, available=0.0),
+        )
+        self.assertTrue(approved, f"Locked-shares SELL should be approved: {msg}")
+        self.assertEqual(adj["quantity"], owned)
+        self.assertIn("Full-liquidation", msg)
+
+    def test_zero_owned_still_rejected(self):
+        # qty_available=0 AND owned=0 -> still rejected (nothing to sell)
+        approved, msg, adj = self.guardrails.validate_and_adjust_decision(
+            self._decision(qty=1.0, price=900.0),
+            self._account(),
+            self._positions(owned=0.0, available=0.0),
+        )
+        self.assertFalse(approved)
+        self.assertIn("do not own any shares", msg)
+
     def test_min_sell_value_config_present(self):
         self.assertGreater(config.MIN_SELL_VALUE, 0)
 

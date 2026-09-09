@@ -471,18 +471,37 @@ class RiskGuardrails:
             
             owned_qty = current_positions[symbol]["qty"]
             qty_available = current_positions[symbol].get("qty_available", owned_qty)
-            
+
+            # Locked-shares case: ALL shares are reserved by open bracket (TP/SL)
+            # orders (qty_available == 0) but we still own the position. The
+            # executor's SELL path cancels open orders and waits for shares to
+            # release before selling, so approve a FULL liquidation here and let
+            # the executor cancel-and-sell. This unblocks positions that would
+            # otherwise be stuck "deferred" forever because nothing ever cancels
+            # the bracket legs. Checked BEFORE the scaling block so a positive
+            # proposed_qty isn't zeroed out first.
+            if qty_available == 0:
+                if owned_qty <= 0:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, f"Rejected: Attempted to sell {symbol} but do not own any shares.", adjusted_decision
+                logger.warning(
+                    f"All {owned_qty} shares of {symbol} are locked in open orders "
+                    f"(qty_available=0). Approving full-liquidation SELL so the "
+                    f"executor can cancel the bracket legs and release the shares."
+                )
+                adjusted_decision["quantity"] = owned_qty
+                proposed_qty = owned_qty
+                return True, f"Approved: Full-liquidation SELL of {owned_qty} shares of {symbol} (all shares locked in open orders; executor will cancel and release).", adjusted_decision
+
             # If the proposed quantity exceeds qty_available, log a warning and scale it down to qty_available.
             if proposed_qty > qty_available:
                 logger.warning(f"Adjusting SELL quantity for {symbol} from {proposed_qty} to available {qty_available} (owned: {owned_qty}, locked in other orders: {owned_qty - qty_available}).")
                 adjusted_decision["quantity"] = qty_available
                 proposed_qty = qty_available
-                
-            if qty_available == 0 or proposed_qty <= 0:
+
+            if proposed_qty <= 0:
                 adjusted_decision["quantity"] = 0.0
-                # Distinct, non-alarming reason so the dashboard can render this as
-                # an informational "deferred" card rather than a risk rejection.
-                return False, f"Deferred: Sell of {symbol} deferred because all owned shares ({owned_qty}) are currently locked/held in other open or pending-cancel orders.", adjusted_decision
+                return False, f"Deferred: Sell of {symbol} deferred because proposed quantity is zero.", adjusted_decision
 
             # Dust-liquidation guardrail: if the whole position (or the proposed
             # sell) is worth less than MIN_SELL_VALUE, escalate to a full exit so
