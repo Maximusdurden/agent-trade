@@ -20,6 +20,57 @@ class LLMClientError(Exception):
     """Custom exception raised when LLM generation fails."""
     pass
 
+
+def _repair_truncated_json(text: str):
+    """Attempt to repair a truncated JSON object (e.g. OpenRouter cut it off).
+
+    OpenRouter frequently truncates long responses mid-string or mid-object,
+    leaving an unterminated string and unbalanced braces. This walks the text
+    once, tracking string/escape state and brace depth, then:
+      - closes any unterminated string with a closing quote,
+      - appends the missing closing braces/brackets to balance the structure.
+    Returns the repaired JSON string on success, or None if the text does not
+    even start with a '{' (i.e. it is not a truncated JSON object at all).
+    """
+    text = (text or "").strip()
+    if not text.startswith("{"):
+        return None
+
+    in_string = False
+    escaped = False
+    depth = 0
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+
+    repaired = text
+    # Close an unterminated string (text ends inside a quoted value).
+    if in_string:
+        repaired += '"'
+    # Append missing closing braces to balance the structure. The strategist and
+    # brain both output JSON objects, so '}' is the correct closer.
+    if depth > 0:
+        repaired += "}" * depth
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except Exception:
+        return None
+
+
 class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
@@ -481,11 +532,21 @@ class SharedLLMClient:
                         break
         
         if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-            logger.critical(f"Invalid JSON structure in response. Full response: {response_text}")
-            logger.debug(f"Cleaned text: {cleaned_text}")
-            raise LLMClientError("Invalid JSON structure in LLM response")
-        
-        json_str = json_str[start_idx:end_idx+1]
+            # The response is likely TRUNCATED (OpenRouter cut it off mid-string or
+            # mid-object). Before giving up, attempt a truncation repair: close any
+            # unterminated string and append the missing closing braces so the JSON
+            # becomes parseable. This is the #1 cause of the morning strategist
+            # "Invalid JSON structure" failures (SPY/META/TXN).
+            repaired = _repair_truncated_json(cleaned_text)
+            if repaired is not None:
+                json_str = repaired
+                logger.warning("Repaired truncated JSON response by closing unterminated string/braces.")
+            else:
+                logger.critical(f"Invalid JSON structure in response. Full response: {response_text}")
+                logger.debug(f"Cleaned text: {cleaned_text}")
+                raise LLMClientError("Invalid JSON structure in LLM response")
+        else:
+            json_str = json_str[start_idx:end_idx+1]
         
         # Validate string termination
         quote_count = json_str.count('"')

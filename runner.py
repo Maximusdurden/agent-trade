@@ -626,6 +626,24 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
     if not isinstance(decisions, list):
         decisions = [decisions]  # tolerate a single dict fallback
 
+    # Safety net: never let the brain propose a SELL for a symbol we do not hold.
+    # The prompt forbids it, but if the LLM ignores that, coerce the SELL to HOLD
+    # here so it never reaches the guardrail rejection path (which would otherwise
+    # clutter the dashboard decision stream with "do not own any shares" cards).
+    held_symbols = set(s.upper() for s in appraised_positions.keys())
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        sym = str(decision.get("symbol", "") or "").upper()
+        action = str(decision.get("action", "") or "").upper()
+        if action == "SELL" and sym and sym not in held_symbols:
+            logger.warning(
+                f"Coercing SELL for {sym} to HOLD: symbol is not in current holdings "
+                f"(brain proposed a SELL for an unowned ticker)."
+            )
+            decision["action"] = "HOLD"
+            decision["quantity"] = 0.0
+
     # Shared cycle context for cumulative budget / per-cycle trade cap across all
     # per-ticker decisions this cycle. A single cycle_id groups this batch of
     # per-ticker decisions so the dashboard can read them as one "cycle run".

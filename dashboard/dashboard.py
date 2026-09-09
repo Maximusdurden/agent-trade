@@ -2946,7 +2946,16 @@ HTML_CONTENT = """<!DOCTYPE html>
 
                             let alertIcon = '';
                             if (!isApproved) {
-                                alertIcon = `<span class="badge" style="background: rgba(239, 68, 68, 0.15); color: var(--color-crimson); margin-left: 0.5rem; text-transform: none;">REJECTED BY RISK GUARDRAIL: ${dec.rejection_reason || 'Unknown'}</span>`;
+                                // A "Deferred" rejection (e.g. all shares locked in
+                                // open bracket orders) is expected behavior, not a
+                                // risk failure — render it as an informational amber
+                                // badge instead of a red guardrail rejection.
+                                const reason = dec.rejection_reason || '';
+                                if (reason.startsWith('Deferred:')) {
+                                    alertIcon = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: var(--color-amber); margin-left: 0.5rem; text-transform: none;">${reason}</span>`;
+                                } else {
+                                    alertIcon = `<span class="badge" style="background: rgba(239, 68, 68, 0.15); color: var(--color-crimson); margin-left: 0.5rem; text-transform: none;">REJECTED BY RISK GUARDRAIL: ${reason || 'Unknown'}</span>`;
+                                }
                             } else if (action !== 'HOLD') {
                                 if (hasFilled) {
                                     alertIcon = `<span class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--color-green); margin-left: 0.5rem; text-transform: none;">EXECUTED</span>`;

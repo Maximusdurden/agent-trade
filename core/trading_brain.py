@@ -358,6 +358,7 @@ DIRECTIONS:
      - BUY CONFLUENCE: Price is sitting directly on major Fibonacci support (50.0% or 61.8%), near a round psychological support, near a recent swing low zone, RSI is oversold (<35), and recent news is supportive or consolidating.
      - SELL CONFLUENCE: Price is sitting directly on major Fibonacci resistance (61.8% or 100%), near psychological resistance, RSI is overbought (>70), or price breaks down below key swing support under negative news.
 5. Observe your current portfolio state. Ensure you hold a stock before deciding to SELL. Verify you have enough cash to BUY.
+5b. CRITICAL SELL RULE: You may ONLY propose a SELL for a symbol that appears in the CURRENT HOLDINGS section below. If a symbol is NOT in CURRENT HOLDINGS, you MUST NOT propose SELL for it — output HOLD (or BUY if the setup justifies it) instead. Proposing a SELL for a symbol you do not hold is a hard error that will be rejected and clutter the decision log.
 6. LEARN FROM HISTORICAL PERFORMANCE SUCCESSES & FAILURES:
    - Carefully review the HISTORICAL PORTFOLIO PERFORMANCE section below. 
    - If our historical win rate is low (<50%) or max drawdown is high (>15%), you MUST be extremely conservative: scale down trade sizes to 1-3%, avoid buying any asset with high recent failures, and keep a larger cash buffer.

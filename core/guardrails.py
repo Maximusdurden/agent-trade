@@ -480,7 +480,9 @@ class RiskGuardrails:
                 
             if qty_available == 0 or proposed_qty <= 0:
                 adjusted_decision["quantity"] = 0.0
-                return False, f"Rejected: Sell quantity scaled down to 0 because all owned shares ({owned_qty}) are currently locked/held in other open or pending-cancel orders.", adjusted_decision
+                # Distinct, non-alarming reason so the dashboard can render this as
+                # an informational "deferred" card rather than a risk rejection.
+                return False, f"Deferred: Sell of {symbol} deferred because all owned shares ({owned_qty}) are currently locked/held in other open or pending-cancel orders.", adjusted_decision
 
             # Dust-liquidation guardrail: if the whole position (or the proposed
             # sell) is worth less than MIN_SELL_VALUE, escalate to a full exit so

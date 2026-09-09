@@ -53,6 +53,29 @@ def build_strategy_universe(positions: dict, watchlist_tickers: list[str]) -> li
         if not is_occ_symbol(ticker)
     ))
 
+
+def _safe_default_rule(ticker: str, yesterdays_rules: str | None) -> str:
+    """Return a usable strategy rule when the strategist fails AND no prior rule exists.
+
+    When ``yesterdays_rules`` is a real prior rule, it is returned unchanged (the
+    strategist already falls back to it). But when there is NO prior rule (the
+    ``get_active_strategy`` placeholder), returning it verbatim makes
+    ``validate_strategy_rule`` emit a ``missing_rule`` error and a Jira ticket
+    every cycle. Instead, synthesize a conservative, ticker-scoped default rule
+    so the ticker stays appraisable and no spurious error is logged.
+    """
+    text = (yesterdays_rules or "").strip()
+    if text and not text.startswith("No active strategy rules defined for "):
+        return text
+    # Conservative default: defensive sizing, no averaging down, exit on weakness.
+    return (
+        f"For {ticker.upper()}: use defensive 1-3% of equity sizing. "
+        f"IF RSI is above 70 THEN no new BUY and consider trimming any held position. "
+        f"IF price breaks below the 20-day SMA THEN exit/avoid. "
+        f"Keep a larger cash buffer and avoid averaging down into losses."
+    )
+
+
 class MetaStrategist:
     """The high-level portfolio strategist that runs daily to audit performance and generate dynamic rules."""
     
@@ -354,7 +377,7 @@ Schema:
                     logger.error(f"Failed to log exception to JIRA: {ex}")
                 return {
                     "meta_reasoning": f"Failed to contact OpenRouter strategist AI client: {e}. Falling back to yesterday's guidelines.",
-                    "todays_rules": yesterdays_rules,
+                    "todays_rules": _safe_default_rule(ticker, yesterdays_rules),
                     "instrument_hint": None,
                 }
 
@@ -394,7 +417,7 @@ Schema:
             logger.error(f"Error calling AI strategist for {ticker}: {e}. Falling back to yesterday's rules.")
             return {
                 "meta_reasoning": f"Failed to contact strategist AI client: {e}. Falling back to yesterday's guidelines.",
-                "todays_rules": yesterdays_rules
+                "todays_rules": _safe_default_rule(ticker, yesterdays_rules)
             }
 
     def run_single_ticker_refinement(self, ticker: str, alpaca_client: AlpacaClient) -> bool:
