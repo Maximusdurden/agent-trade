@@ -276,6 +276,15 @@ else:
 # Screener Configuration
 SCREENER_POOL_PATH = BASE_DIR / "screener_pool.json"
 
+# Watchlist size (number of symbols the screener monitors).
+# The runner reserves separate slots per asset class so crypto cannot crowd
+# equities out of the top-N during market hours:
+#   - WATCHLIST_EQUITY_LIMIT: equities monitored while the US market is open.
+#   - WATCHLIST_CRYPTO_LIMIT: crypto pairs monitored 24/7.
+# Doubled from 5/3 -> 10/6 (2026-09-09) so the agent monitors more names.
+WATCHLIST_EQUITY_LIMIT = int(os.getenv("WATCHLIST_EQUITY_LIMIT", "10"))
+WATCHLIST_CRYPTO_LIMIT = int(os.getenv("WATCHLIST_CRYPTO_LIMIT", "6"))
+
 # Dashboard & Security Configurations
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 SESSION_SALT = os.getenv("SESSION_SALT", "age_desk_secure_salt_change_me")

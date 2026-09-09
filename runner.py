@@ -556,12 +556,14 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         from core.screener import run_screener, load_screener_pool
         screener_candidates = load_screener_pool()
         
+        # Watchlist size is configurable (WATCHLIST_EQUITY_LIMIT / WATCHLIST_CRYPTO_LIMIT).
+        # During market hours monitor both equities and crypto; outside hours, crypto only.
         if actual_market_open:
-            equity_limit = 5
-            crypto_limit = 3
+            equity_limit = config.WATCHLIST_EQUITY_LIMIT
+            crypto_limit = config.WATCHLIST_CRYPTO_LIMIT
         else:
             equity_limit = 0
-            crypto_limit = 3
+            crypto_limit = config.WATCHLIST_CRYPTO_LIMIT
             logger.info(f"US Equity Market is closed/outside hours. Filtering screener candidates to CRYPTO ONLY: {[s for s in screener_candidates if is_crypto_symbol(s)]}")
             
         screened_list = run_screener(
