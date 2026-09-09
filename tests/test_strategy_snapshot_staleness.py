@@ -15,6 +15,12 @@ from unittest.mock import patch
 sys.path.insert(0, r"Z:\python\projects")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Isolate this test's DB AND trigger the Jira test-env guard (logger_setup
+# skips Jira attachment when DATABASE_FILENAME starts with "test_"). Without
+# this, the intentional "ZZZZ missing_rule" error in test_missing_rule_triggers_refresh
+# files a real Jira bug ticket (TMCL-915) during test runs.
+os.environ["DATABASE_FILENAME"] = "test_strategy_snapshot_staleness.db"
+
 from core import database
 from runner import ensure_active_strategy
 

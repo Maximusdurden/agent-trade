@@ -15,6 +15,10 @@ from unittest.mock import patch
 sys.path.insert(0, r"Z:\python\projects")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Isolate this test's DB AND trigger the Jira test-env guard (logger_setup
+# skips Jira attachment when DATABASE_FILENAME starts with "test_").
+os.environ["DATABASE_FILENAME"] = "test_strategist_instrument_hint.db"
+
 from core import database
 from core.guardrails import RiskGuardrails
 

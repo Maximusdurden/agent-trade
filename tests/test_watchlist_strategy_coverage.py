@@ -5,6 +5,12 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Isolate this test's DB AND trigger the Jira test-env guard (logger_setup
+# skips Jira attachment when DATABASE_FILENAME starts with "test_"). This test
+# exercises ensure_active_strategy's missing_rule path which logs an ERROR that
+# would otherwise file a real Jira bug ticket.
+os.environ["DATABASE_FILENAME"] = "test_watchlist_strategy_coverage.db"
+
 from core import config, database
 from core.strategist import build_strategy_universe
 from runner import (
