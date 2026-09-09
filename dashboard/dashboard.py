@@ -36,6 +36,12 @@ PORT = 8080
 # Thread-safe global cache and locking mechanism
 LATEST_STATUS_CACHE = {}
 CACHE_LOCK = threading.Lock()
+# Dedicated lock so only ONE GCS download runs at a time (protects against
+# overlapping syncs if the sync interval is short).
+GCS_SYNC_LOCK = threading.Lock()
+# Interval (seconds) between GCS DB downloads. Kept separate from the cache
+# worker's 10s loop so the download never blocks the cache refresh.
+GCS_SYNC_INTERVAL_SECONDS = 120
 
 def sync_database_from_gcs():
     """
@@ -63,53 +69,71 @@ def sync_database_from_gcs():
         if last_sync and (now - last_sync) < 120:
             return
 
-    try:
-        from google.cloud import storage
-        print(f"[GCS Sync] Checking for file updates in gs://{gcs_bucket}...", flush=True)
-        client = storage.Client()
-        bucket = client.bucket(gcs_bucket)
-        
-        # 1. Download database
-        blob = bucket.blob("trading_agent.db")
-        os.makedirs(os.path.dirname(local_temp_db), exist_ok=True)
-        # Download to a temp file first, then atomically replace the live DB.
-        # This prevents readers (e.g. the chat handler) from opening a
-        # partially-written or locked SQLite file mid-download, which caused
-        # intermittent "database is locked" 500 errors on /api/chat.
-        tmp_db = local_temp_db + ".tmp"
-        blob.download_to_filename(tmp_db)
-        os.replace(tmp_db, local_temp_db)
-        print(f"[GCS Sync] Successfully synchronized {local_temp_db} from Cloud Storage.", flush=True)
-        
-        # Ensure database tables exist in the downloaded database (Auto-Migration)
+    with GCS_SYNC_LOCK:
         try:
-            database.init_db()
-            print("[GCS Sync] Database tables auto-initialized/migrated successfully.", flush=True)
-        except Exception as init_err:
-            print(f"[GCS Sync WARNING] Failed to auto-initialize database tables: {init_err}", file=sys.stderr)
-        
-        # 2. Download trading.log
-        log_blob = bucket.blob("trading.log")
-        try:
-            if log_blob.exists():
-                log_blob.download_to_filename("/tmp/trading.log")
-                print("[GCS Sync] Successfully synchronized /tmp/trading.log from Cloud Storage.", flush=True)
-        except Exception as log_sync_err:
-            print(f"[GCS Sync WARNING] Failed to sync trading.log: {log_sync_err}", file=sys.stderr)
+            from google.cloud import storage
+            print(f"[GCS Sync] Checking for file updates in gs://{gcs_bucket}...", flush=True)
+            client = storage.Client()
+            bucket = client.bucket(gcs_bucket)
             
-        # 3. Download portfolio_dod_balances.csv
-        csv_blob = bucket.blob("portfolio_dod_balances.csv")
-        try:
-            if csv_blob.exists():
-                csv_blob.download_to_filename("/tmp/portfolio_dod_balances.csv")
-                print("[GCS Sync] Successfully synchronized /tmp/portfolio_dod_balances.csv from Cloud Storage.", flush=True)
-        except Exception as csv_sync_err:
-            print(f"[GCS Sync WARNING] Failed to sync portfolio_dod_balances.csv: {csv_sync_err}", file=sys.stderr)
+            # 1. Download database
+            blob = bucket.blob("trading_agent.db")
+            os.makedirs(os.path.dirname(local_temp_db), exist_ok=True)
+            # Download to a temp file first, then atomically replace the live DB.
+            # This prevents readers (e.g. the chat handler) from opening a
+            # partially-written or locked SQLite file mid-download, which caused
+            # intermittent "database is locked" 500 errors on /api/chat.
+            tmp_db = local_temp_db + ".tmp"
+            blob.download_to_filename(tmp_db)
+            os.replace(tmp_db, local_temp_db)
+            print(f"[GCS Sync] Successfully synchronized {local_temp_db} from Cloud Storage.", flush=True)
+            
+            # Ensure database tables exist in the downloaded database (Auto-Migration)
+            try:
+                database.init_db()
+                print("[GCS Sync] Database tables auto-initialized/migrated successfully.", flush=True)
+            except Exception as init_err:
+                print(f"[GCS Sync WARNING] Failed to auto-initialize database tables: {init_err}", file=sys.stderr)
+            
+            # 2. Download trading.log
+            log_blob = bucket.blob("trading.log")
+            try:
+                if log_blob.exists():
+                    log_blob.download_to_filename("/tmp/trading.log")
+                    print("[GCS Sync] Successfully synchronized /tmp/trading.log from Cloud Storage.", flush=True)
+            except Exception as log_sync_err:
+                print(f"[GCS Sync WARNING] Failed to sync trading.log: {log_sync_err}", file=sys.stderr)
+                
+            # 3. Download portfolio_dod_balances.csv
+            csv_blob = bucket.blob("portfolio_dod_balances.csv")
+            try:
+                if csv_blob.exists():
+                    csv_blob.download_to_filename("/tmp/portfolio_dod_balances.csv")
+                    print("[GCS Sync] Successfully synchronized /tmp/portfolio_dod_balances.csv from Cloud Storage.", flush=True)
+            except Exception as csv_sync_err:
+                print(f"[GCS Sync WARNING] Failed to sync portfolio_dod_balances.csv: {csv_sync_err}", file=sys.stderr)
 
-        with CACHE_LOCK:
-            LATEST_STATUS_CACHE[last_sync_key] = now
-    except Exception as e:
-        print(f"[GCS Sync WARNING] Failed to sync files from GCS: {e}", file=sys.stderr)
+            with CACHE_LOCK:
+                LATEST_STATUS_CACHE[last_sync_key] = now
+        except Exception as e:
+            print(f"[GCS Sync WARNING] Failed to sync files from GCS: {e}", file=sys.stderr)
+
+
+def gcs_sync_worker():
+    """Background daemon thread that periodically downloads the DB/logs from GCS.
+
+    Runs independently of the status-cache worker so a slow 79.5 MB GCS download
+    NEVER blocks the dashboard's data refresh. The cache worker always serves the
+    last-good payload instantly; when the download completes, the next cache
+    cycle picks up the fresh DB.
+    """
+    print("[Dashboard Server] Background GCS sync worker started.", flush=True)
+    while True:
+        try:
+            sync_database_from_gcs()
+        except Exception as e:
+            print(f"[GCS Sync Worker] Error in sync cycle: {e}", file=sys.stderr)
+        time.sleep(GCS_SYNC_INTERVAL_SECONDS)
 
 def get_portfolio_history():
     """Retrieves portfolio history from the SQLite database."""
@@ -252,8 +276,9 @@ def status_cache_worker():
     print("[Dashboard Server] Background status cache worker started.", flush=True)
     while True:
         try:
-            # Sync SQLite database if configured for Google Cloud Storage
-            sync_database_from_gcs()
+            # NOTE: GCS DB sync now runs in its own daemon thread (gcs_sync_worker)
+            # so a slow 79.5 MB download never blocks this cache refresh. The cache
+            # always serves the last-good payload instantly.
 
             # Initialize default / fallback structures for Alpaca
             account = {}
@@ -436,6 +461,12 @@ def status_cache_worker():
                 "freshness": freshness,
                 "latest_decision_at": latest_decision_at,
                 "latest_portfolio_at": latest_portfolio_at,
+                # Option 4: loading/staleness flags so the frontend can show a
+                # "refreshing..." state instead of flashing "No data" while the
+                # cache is being rebuilt or the GCS DB is mid-download.
+                "initializing": False,
+                "stale": False,
+                "cache_built_at": time.time(),
                 "error": None
             }
 
@@ -977,6 +1008,21 @@ HTML_CONTENT = """<!DOCTYPE html>
             max-height: 700px;
             overflow-y: auto;
             padding-right: 0.25rem;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 1rem;
+            height: 1rem;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-top-color: var(--color-gold);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.5rem;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
 
         .thought-card {
@@ -1846,6 +1892,10 @@ HTML_CONTENT = """<!DOCTYPE html>
                         <div class="status-dot" style="background-color: rgba(0, 242, 254, 0.8);"></div>
                         <span>DB SYNC: ACTIVE</span>
                     </div>
+                    <div class="status-badge" id="last-updated-badge" style="background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 0.25rem 0.5rem; display: flex; align-items: center; gap: 0.25rem;">
+                        <div class="status-dot" style="background-color: var(--color-green);"></div>
+                        <span id="last-updated-text">UPDATED: --:--:--</span>
+                    </div>
                 </div>
             </div>
         </header>
@@ -2669,6 +2719,18 @@ HTML_CONTENT = """<!DOCTYPE html>
                 // Update system status dynamically
                 const statusDot = document.getElementById('status-dot');
                 const statusText = document.getElementById('system-status-text');
+                // Option 4: update the "last updated" badge with the cache build time.
+                const lastUpdatedEl = document.getElementById('last-updated-text');
+                if (lastUpdatedEl) {
+                    const builtAt = (data && data.cache_built_at) || 0;
+                    if (builtAt) {
+                        const d = new Date(builtAt * 1000);
+                        const pad = n => String(n).padStart(2, '0');
+                        lastUpdatedEl.innerText = 'UPDATED: ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+                    } else {
+                        lastUpdatedEl.innerText = 'UPDATED: --:--:--';
+                    }
+                }
                 if (statusText && statusDot) {
                     if (data.kill_switch === "HALTED") {
                         statusText.innerText = "SYSTEM HALTED (GCS KILL SWITCH)";
@@ -2901,7 +2963,16 @@ HTML_CONTENT = """<!DOCTYPE html>
                     streamEl.innerHTML = '';
                     const decisions = (data && data.decisions) || [];
                     if (decisions.length === 0) {
-                        streamEl.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 2rem;">No historical trading thoughts logged yet.</div>';
+                        // Option 4: show a loading/refreshing state instead of
+                        // flashing "No data" while the cache is being built or
+                        // the GCS DB is mid-download.
+                        if (data && data.initializing) {
+                            streamEl.innerHTML = '<div style="text-align: center; color: var(--color-gold); padding: 2rem;"><span class="spinner"></span> Loading real-time data...</div>';
+                        } else if (data && data.stale) {
+                            streamEl.innerHTML = '<div style="text-align: center; color: var(--color-amber); padding: 2rem;"><span class="spinner"></span> Refreshing data...</div>';
+                        } else {
+                            streamEl.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 2rem;">No historical trading thoughts logged yet.</div>';
+                        }
                     } else {
                         // Build a lookup of execution attempts keyed by decision_id
                         const executions = (data && data.executions) || [];
@@ -4374,8 +4445,17 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                         "interval": config.TRADING_INTERVAL_MINUTES,
                         "is_mock": True,
                         "is_paper": config.ALPACA_PAPER,
-                        "initializing": True
+                        "initializing": True,
+                        "stale": False,
+                        "cache_built_at": 0.0
                     }
+                    # Compute staleness dynamically: if the cache was built more than
+                    # STALE_AFTER_SECONDS ago, flag it so the frontend shows a
+                    # "refreshing..." state instead of flashing "No data".
+                    built_at = payload.get("cache_built_at", 0.0) or 0.0
+                    stale_after = 30.0
+                    payload["stale"] = bool(built_at) and (time.time() - built_at) > stale_after
+                    payload["initializing"] = bool(payload.get("initializing", False)) or not bool(built_at)
                 
                 encoded_payload = json.dumps(payload).encode('utf-8')
                 self.send_response(200)
@@ -4641,6 +4721,10 @@ def run_server():
     # Start the background status cache worker daemon thread
     worker_thread = threading.Thread(target=status_cache_worker, daemon=True)
     worker_thread.start()
+
+    # Start the background GCS sync worker daemon thread (non-blocking DB download)
+    gcs_thread = threading.Thread(target=gcs_sync_worker, daemon=True)
+    gcs_thread.start()
 
     # Attempt to start server on specified port, retry on 8081 if occupied
     global PORT
