@@ -57,15 +57,28 @@ def build_appraisal_universe(screened_symbols: list[str], positions: dict,
     Symbols with a strategist ``instrument_hint`` of "option" are also included so the
     brain actually appraises a ticker the strategist has authorized for a leveraged
     (long call/put) expression — otherwise the authorization would be moot because the
-    brain never reads its rule.
+    brain never reads its rule. However, an option authorization alone is NOT enough to
+    pull a ticker into the appraisal universe: the ticker must ALSO be screener-endorsed
+    (in the watchlist) or currently held. This keeps the appraisal universe aligned with
+    the watchlist shown on the dashboard, so the decision stream never assesses names
+    that aren't in the watchlist or held (e.g. AMGN/RTX/ADBE that the strategist
+    authorized for options but the screener never picked).
     """
     from core.feedback import is_option_contract_symbol
     candidates = [*screened_symbols, *positions.keys()]
 
-    # Include symbols the strategist has explicitly authorized for options.
+    # Include symbols the strategist has explicitly authorized for options, but ONLY
+    # if they are also screener-endorsed or held. This prevents option-authorized
+    # tickers that are neither watched nor held from cluttering the appraisal loop.
     try:
         from core import database as _db
-        candidates.extend(_db.get_option_authorized_tickers())
+        option_authorized = _db.get_option_authorized_tickers()
+        screened_set = set(s.upper() for s in screened_symbols)
+        held_set = set(s.upper() for s in positions.keys())
+        for sym in option_authorized:
+            up = sym.upper()
+            if up in screened_set or up in held_set:
+                candidates.append(sym)
     except Exception as e:
         logger.warning(f"Could not fetch strategist instrument hints for appraisal universe: {e}")
 

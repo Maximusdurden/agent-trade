@@ -80,13 +80,35 @@ class TestStrategistInstrumentHint(unittest.TestCase):
         self.assertIn("STRATEGIST INSTRUMENT AUTHORIZATION", prompt)
         self.assertIn('"option"', prompt)
 
-    def test_appraisal_universe_includes_option_hint(self):
+    def test_appraisal_universe_includes_option_hint_when_watched_or_held(self):
         from runner import build_appraisal_universe
         database.log_strategy_history(
             ticker="GOOGL", yesterdays_rules="old", todays_rules="new",
             meta_reasoning="bearish", strategy_version="v1", instrument_hint="option",
         )
+        # GOOGL is option-authorized AND in the watchlist -> included.
+        universe = build_appraisal_universe(["NVDA", "GOOGL"], {}, True)
+        self.assertIn("GOOGL", universe)
+
+    def test_appraisal_universe_excludes_option_hint_when_not_watched_or_held(self):
+        from runner import build_appraisal_universe
+        database.log_strategy_history(
+            ticker="GOOGL", yesterdays_rules="old", todays_rules="new",
+            meta_reasoning="bearish", strategy_version="v1", instrument_hint="option",
+        )
+        # GOOGL is option-authorized but NOT in the watchlist and NOT held ->
+        # excluded, so the decision stream stays aligned with the watchlist.
         universe = build_appraisal_universe(["NVDA"], {}, True)
+        self.assertNotIn("GOOGL", universe)
+
+    def test_appraisal_universe_includes_option_hint_when_held(self):
+        from runner import build_appraisal_universe
+        database.log_strategy_history(
+            ticker="GOOGL", yesterdays_rules="old", todays_rules="new",
+            meta_reasoning="bearish", strategy_version="v1", instrument_hint="option",
+        )
+        # GOOGL is option-authorized AND held -> included.
+        universe = build_appraisal_universe(["NVDA"], {"GOOGL": {"qty": 1.0}}, True)
         self.assertIn("GOOGL", universe)
 
     def test_total_options_exposure_cap_blocks_buy(self):
