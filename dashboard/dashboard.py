@@ -327,11 +327,44 @@ def status_cache_worker():
                 # portfolio_history table, which still contains the prior demo
                 # account's equity. Fall back to the DB if broker history is
                 # unavailable.
+                #
+                # FIX (2026-09-09): Alpaca's DAILY (1D) portfolio history timestamps
+                # each bar at 00:00 UTC, which renders as the PREVIOUS day in Eastern
+                # time (e.g. today's 09/09 bar shows as "09/08 20:00"). That made the
+                # Equity Valuation Curve appear to have "no data for today". Fetch
+                # INTRADAY (15Min) history for the recent window so today has real
+                # intraday points with correct timestamps, and merge with the daily
+                # history for the long-term curve.
                 try:
-                    history = client.get_alpaca_portfolio_history(timeframe="1D")
+                    # Intraday 15Min history (covers today + recent timeframe buttons).
+                    # Alpaca caps intraday at a 30-day period; use 1W so today has
+                    # real intraday points (1D/5D/1W buttons). Longer windows fall
+                    # back to the daily history merged below.
+                    intraday_history = client.get_alpaca_portfolio_history(timeframe="15Min", period="1W")
                 except Exception as ph_err:
-                    print(f"[Dashboard Server] Alpaca portfolio history failed ({ph_err}); falling back to DB.", file=sys.stderr)
-                    history = []
+                    print(f"[Dashboard Server] Alpaca intraday portfolio history failed ({ph_err}); using daily only.", file=sys.stderr)
+                    intraday_history = []
+                try:
+                    # Daily 1D history for the full long-term curve (ALL / LM buttons).
+                    daily_history = client.get_alpaca_portfolio_history(timeframe="1D")
+                except Exception as ph_err:
+                    print(f"[Dashboard Server] Alpaca daily portfolio history failed ({ph_err}); using intraday only.", file=sys.stderr)
+                    daily_history = []
+
+                # Merge: prefer intraday points (they carry correct intraday
+                # timestamps for today), then append any daily points that fall
+                # OUTSIDE the intraday window so the long-term curve is preserved.
+                # Dedupe by timestamp, keep chronological order.
+                history = []
+                seen = set()
+                for item in (intraday_history + daily_history):
+                    ts = item.get("timestamp")
+                    if ts in seen:
+                        continue
+                    seen.add(ts)
+                    history.append(item)
+                history.sort(key=lambda it: it.get("timestamp", ""))
+
                 if not history:
                     history = get_portfolio_history()
 
