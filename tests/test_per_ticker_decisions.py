@@ -49,6 +49,28 @@ class TestBrainEmitsList(unittest.TestCase):
             self.assertIn("conviction", d)
             self.assertIn("action", d)
 
+    def test_normalize_decision_strips_whitespace_action(self):
+        """Regression: the LLM occasionally emits 'HOL D' (a space inside the
+        action token). _normalize_decision must strip whitespace and coerce
+        invalid actions to HOLD so the malformed value never reaches the DB."""
+        from core.trading_brain import TradingBrain
+        raw = {"action": "HOL D", "symbol": "NVDA", "quantity": 0.0,
+               "direction": "neutral", "conviction": 0.0}
+        normalized = TradingBrain._normalize_decision(raw)
+        self.assertEqual(normalized["action"], "HOLD")
+
+        # A truly invalid action is coerced to HOLD.
+        raw2 = {"action": "BUY NOW", "symbol": "NVDA", "quantity": 5.0,
+                "direction": "bullish", "conviction": 0.8}
+        normalized2 = TradingBrain._normalize_decision(raw2)
+        self.assertEqual(normalized2["action"], "HOLD")
+
+        # Valid actions pass through unchanged.
+        raw3 = {"action": "SELL", "symbol": "NVDA", "quantity": 1.0,
+                "direction": "bearish", "conviction": 0.8}
+        normalized3 = TradingBrain._normalize_decision(raw3)
+        self.assertEqual(normalized3["action"], "SELL")
+
     def test_mock_brain_never_buys(self):
         """The rule-based fallback is a SELL/HOLD-only safety net. It must never
         emit a BUY (which could be routed to an option contract when the LLM is

@@ -101,7 +101,15 @@ class TradingBrain:
     def _normalize_decision(decision: dict) -> dict:
         """Normalizes a single per-ticker decision dict (shared by providers)."""
         decision = dict(decision)
-        decision["action"] = str(decision.get("action", "HOLD")).upper()
+        # Normalize action: strip whitespace and coerce anything that isn't a
+        # valid action to HOLD. The LLM occasionally emits 'HOL D' (a space
+        # inside the token) or other malformed actions; without this, the
+        # malformed value would be persisted to the decisions table and break
+        # downstream validation/consumers.
+        action = str(decision.get("action", "HOLD")).upper().replace(" ", "").strip()
+        if action not in ("BUY", "SELL", "HOLD", "NO_ACTION"):
+            action = "HOLD"
+        decision["action"] = action
         decision["symbol"] = str(decision.get("symbol", "")).upper()
         try:
             decision["quantity"] = float(decision.get("quantity", 0.0))
