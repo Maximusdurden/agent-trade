@@ -1,5 +1,6 @@
 import logging
 import re
+import math
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from core import config
@@ -533,6 +534,19 @@ class RiskGuardrails:
             opts_eligible = (options_on and in_universe
                              and conviction >= threshold
                              and direction in ("bullish", "bearish"))
+            if opts_requested and not opts_eligible:
+                # The brain explicitly asked for an option but the symbol is not
+                # options-eligible (not in OPTIONS_UNIVERSE, options disabled,
+                # conviction below threshold, or neutral direction). Reject the
+                # BUY outright instead of silently downgrading to a stock buy.
+                # This prevents the "wanted a put, got stock" mismatch (AMGN
+                # 2026-09-10) where a bearish option intent became an unintended
+                # long stock position that the brain then tried to unwind.
+                reason = self._option_intent_rejection_reason(
+                    symbol, options_on, in_universe, conviction, threshold, direction
+                )
+                adjusted_decision["quantity"] = 0.0
+                return False, reason, adjusted_decision
             if opts_eligible and opts_requested:
                 instrument = "option"
                 adjusted_decision["instrument"] = "option"
@@ -925,6 +939,29 @@ class RiskGuardrails:
             if proposed_qty <= 0:
                 return False, "Rejected: Buy quantity scaled down to 0 due to cash limits.", adjusted_decision
 
+            # Whole-share floor for equities (Fix F, 2026-09-10): Alpaca
+            # rejects fractional-share bracket (OCO) orders for equities with
+            # "cost basis must be >= minimal amount of order 1" (seen on AMGN
+            # 2026-09-10 when the brain proposed qty 0.00012). Floor equity
+            # buys to whole shares so a valid, high-conviction BUY never dies on a
+            # fractional-share artifact. Crypto keeps fractional quantities (it is
+            # the profitable book and Alpaca supports fractional crypto).
+            if not is_crypto_member(symbol):
+                floored_qty = math.floor(proposed_qty)
+                if floored_qty < 1:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, (f"Rejected: Buy quantity for {symbol} floored to "
+                                    f"{floored_qty} whole share(s) (proposed {proposed_qty:.4f}). "
+                                    f"Position too small to buy a whole share."), adjusted_decision
+                if floored_qty != proposed_qty:
+                    logger.warning(
+                        f"Whole-share floor for {symbol}: rounding buy qty from "
+                        f"{proposed_qty:.4f} to {floored_qty} shares (Alpaca rejects "
+                        f"fractional equity bracket orders)."
+                    )
+                    proposed_qty = floored_qty
+                    proposed_trade_value = proposed_qty * current_price
+
             adjusted_decision["quantity"] = proposed_qty
             return True, f"Approved: Buy order of {proposed_qty} shares of {symbol} validated.", adjusted_decision
 
@@ -933,6 +970,29 @@ class RiskGuardrails:
     # ------------------------------------------------------------------
     # OPTIONS VALIDATION
     # ------------------------------------------------------------------
+
+    def _option_intent_rejection_reason(self, symbol: str, options_on: bool,
+                                        in_universe: bool, conviction: float,
+                                        threshold: float, direction: str) -> str:
+        """Build a human-readable rejection reason for an ineligible option intent.
+
+        Called when the brain explicitly requested ``instrument: "option"`` but the
+        symbol is not options-eligible. Returns a specific reason so the decision
+        stream shows exactly why the option BUY was rejected (rather than silently
+        converting it to a stock buy).
+        """
+        if not options_on:
+            return (f"Rejected: Option intent for {symbol} but options trading is "
+                    f"disabled (OPTIONS_ENABLED=false). No trade taken.")
+        if not in_universe:
+            return (f"Rejected: Option intent for {symbol} but {symbol} is not in the "
+                    f"options universe. No trade taken (refusing to silently buy stock "
+                    f"for an option intent).")
+        if direction not in ("bullish", "bearish"):
+            return (f"Rejected: Option intent for {symbol} but direction is "
+                    f"'{direction}' (options require bullish/bearish). No trade taken.")
+        return (f"Rejected: Option intent for {symbol} but conviction "
+                f"{conviction:.2f} < threshold {threshold:.2f}. No trade taken.")
 
     def _validate_option_decision(self, decision: dict, adjusted_decision: dict,
                                   account_state: dict, current_positions: dict) -> tuple[bool, str, dict]:

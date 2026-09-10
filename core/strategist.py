@@ -207,6 +207,22 @@ class MetaStrategist:
                 instrument_hint = str(instrument_hint).lower().strip()
                 if instrument_hint not in ("stock", "option", "neutral"):
                     instrument_hint = None
+            # Guard: never authorize an option expression for a ticker that is not
+            # in the options universe. The strategist may hallucinate an "option"
+            # hint for any symbol (e.g. AMGN 2026-09-10), but the guardrail can
+            # only route options for OPTIONS_UNIVERSE members. Authorizing options
+            # for a non-member produces a misleading rule that the brain follows
+            # ("I'll open a long put") only to have the guardrail silently convert
+            # it to a stock buy. Downgrade to no authorization so the rule stays
+            # consistent with what the system can actually execute.
+            if instrument_hint == "option":
+                options_universe = set(getattr(config, "OPTIONS_UNIVERSE", []))
+                if ticker.upper() not in options_universe:
+                    logger.warning(
+                        f"Strategist authorized 'option' for {ticker} but it is not in "
+                        f"OPTIONS_UNIVERSE; downgrading instrument_hint to none."
+                    )
+                    instrument_hint = None
             db_id = database.log_strategy_history(
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,

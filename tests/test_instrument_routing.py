@@ -60,10 +60,35 @@ class TestInstrumentRouting(unittest.TestCase):
         self.assertEqual(adj.get("instrument"), "option")
 
     def test_option_intent_but_low_conviction_routed_to_stock(self):
-        """Conviction is a GATE: below threshold, even option intent is stock."""
+        """Conviction is a GATE: below threshold, even option intent is stock.
+
+
+        NOTE (2026-09-10, Fix A): this behavior CHANGED. Previously an
+        option intent with low conviction silently routed to a stock buy. Now we
+        REJECT the option intent outright instead of silently buying stock, so
+        the brain never ends up with an unintended long position (the AMGN
+        "wanted a put, got stock" mismatch). The test now asserts rejection.
+        """
         ok, msg, adj = _run(self._buy("option", 0.6))
-        self.assertTrue(ok)
-        self.assertEqual(adj.get("instrument"), "stock")
+        self.assertFalse(ok)
+        self.assertIn("Option intent", msg)
+
+    def test_option_intent_symbol_not_in_universe_rejected(self):
+        """AMGN case: option intent for a symbol NOT in the options universe must
+        be REJECTED, not silently converted to a stock buy.
+
+
+        The strategist authorized a long PUT for AMGN, but AMGN is not in
+        OPTIONS_UNIVERSE. The old guardrail silently downgraded the option intent
+        to a stock BUY, producing an unintended long position the brain then tried
+        to unwind. Fix A rejects the option intent outright instead.
+        """
+        decision = {"action": "BUY", "symbol": "AMGN", "quantity": 1.0,
+                    "conviction": 0.8, "direction": "bearish",
+                    "instrument": "option", "current_price": 383.0}
+        ok, msg, adj = _run(decision)
+        self.assertFalse(ok)
+        self.assertIn("not in the options universe", msg)
 
     def test_no_instrument_field_defaults_to_stock(self):
         """Legacy decisions without an instrument field must not route to options."""
