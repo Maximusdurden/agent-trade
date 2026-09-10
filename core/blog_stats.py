@@ -183,16 +183,30 @@ def latest_equity_from_report() -> Optional[float]:
 # Internal
 # ---------------------------------------------------------------------------
 def _resolve_today(today) -> pd.Timestamp:
+    """Resolve ``today`` to an ET-aware Timestamp at END of that day.
+
+    Returning end-of-day (23:59:59.999999) ensures the current day's closed
+    trades are included in ``calculate_dashboard_stats`` / ``get_last_10_days_performance``
+    (which filter ``exit_date <= today``). If we returned midnight, the day's own
+    trades would be excluded and the streak/stats would lag by a day (e.g. a loss
+    day showing the previous win day's green dot).
+    """
     if today is None:
-        return pd.Timestamp.now(tz=EASTER_TZ).normalize()
+        return pd.Timestamp.now(tz=EASTER_TZ).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     if isinstance(today, str):
         today = pd.to_datetime(today).date()
     if isinstance(today, date) and not isinstance(today, pd.Timestamp):
-        return pd.Timestamp(today, tz=EASTER_TZ)
+        ts = pd.Timestamp(today, tz=EASTER_TZ)
+        return ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     ts = pd.Timestamp(today)
     if ts.tzinfo is None:
-        return ts.tz_localize(EASTER_TZ)
-    return ts.tz_convert(EASTER_TZ)
+        ts = ts.tz_localize(EASTER_TZ)
+    else:
+        ts = ts.tz_convert(EASTER_TZ)
+    # If a full datetime was passed, keep its time; if it's midnight, push to EOD.
+    if ts.time() == pd.Timestamp(ts.date(), tz=EASTER_TZ).time():
+        return ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return ts
 
 
 if __name__ == "__main__":
