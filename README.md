@@ -57,7 +57,9 @@ agent-trade/
     ├── strategist_model_ab.md      # strategist model A/B experiment (r1 vs Sonnet)
 │   ├── equity_desk_guardrails.md   # the 2026-09-02 loss-guardrail design
 │   ├── held_positions_universe_guardrail_fix.md
-│   └── fractional_shares_and_jira_logging_fix.md
+│   ├── fractional_shares_and_jira_logging_fix.md
+│   ├── validation_framework.md     # DB integrity + snapshot compare + validation runner
+│   └── guardrail_brain_fixes_2026-09-10.md # option-intent, whole-share, VWAP-None, action-normalization fixes
 │
 ├── feedback/             # Agent-facing "do-not-do-X" learning briefs
 │   └── equity_lessons.md # equity-desk loss playbook for Screener/MetaStrategist
@@ -69,7 +71,10 @@ agent-trade/
 │   ├── liquidate_account.py   # dry-run-by-default account liquidation tool
 │   ├── equity_trade_forensics.py  # read-only loss forensics (equity desk)
 │   ├── pull_cloud_db.py           # pull authoritative cloud DB from GCS
-│   └── get_correct_balances.py    # Alpaca cash ledger & balance backfill tool
+│   ├── get_correct_balances.py    # Alpaca cash ledger & balance backfill tool
+│   ├── validate_db.py             # DB integrity validation (schema, orphans, data)
+│   ├── snapshot_compare.py        # pre/post-change snapshot capture & comparison
+│   └── run_validation.py          # validation runner (lint + dry-run + pytest + DB)
 │
 ├── core/                 # (blog support lives alongside the trading engine)
 │   ├── personas.py       # swappable blog voices (dexter/oracle/rookie/pirate/derrick)
