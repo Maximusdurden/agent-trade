@@ -592,6 +592,13 @@ class AlpacaClient:
             except Exception:
                 tf = TimeFrame.Minute # Safe fallback if custom unit creation fails
             day_multiplier = 10  # Cover enough days back to satisfy limit of 15m intervals
+        elif timeframe_str in ("5min", "5m"):
+            try:
+                from alpaca.data.timeframe import TimeFrameUnit
+                tf = TimeFrame(5, TimeFrameUnit.Minute)
+            except Exception:
+                tf = TimeFrame.Minute  # Safe fallback if custom unit creation fails
+            day_multiplier = 10  # Cover enough days back to satisfy limit of 5m intervals
         else:
             tf = TimeFrame.Day
             day_multiplier = 2

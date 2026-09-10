@@ -266,6 +266,10 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool) -> int:
         if card_path and os.path.exists(card_path):
             media = wp.upload_image_from_path(card_path, f"Daily Summary {target_date}")
             if media:
+                # The theme bakes the sidebar image into the home template, so we
+                # MUST update the template (not just the synced pattern) for the
+                # change to be visible on the live site.
+                wp.update_home_template_sidebar(media.get("source_url"))
                 wp.update_synced_pattern(media.get("source_url"))
         if cal_html:
             wp.update_performance_page(cal_html)
@@ -293,6 +297,20 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool) -> int:
     html_body += f"<h1>{intro['title']}</h1><p style='color:#5d4037; font-size:17px;'>{intro['body']}</p>"
 
     if not day_rows.empty:
+        # Pre-filter the original round-trips to those closed on the target date
+        # (ET) so we can render per-ticker candlestick charts.
+        day_trips = []
+        for rt in trips or []:
+            try:
+                close = pd.Timestamp(rt.get("close_ts"))
+                if close.tzinfo is None:
+                    close = close.tz_localize("UTC")
+                close_et = close.tz_convert(EASTER_TZ)
+                if start <= close_et < end:
+                    day_trips.append(rt)
+            except Exception:
+                continue
+
         for ticker in tickers:
             group = day_rows[day_rows["ticker"] == ticker]
             group_pnl = float(group["pnl_dollar"].sum())
@@ -302,10 +320,34 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool) -> int:
             blurb = wp.autolink_tickers(raw, tickers)
             blurb = wp.autolink_financial_terms(blurb)
             color = "#4caf50" if group_pnl > 0 else "#f44336"
+
+            # Per-ticker candlestick chart (buy/sell markers), like the old blog.
+            chart_html = ""
+            try:
+                from core.charts import generate_trade_chart
+                ticker_trips = [rt for rt in day_trips
+                                if (rt.get("symbol") or "").upper() == ticker.upper()
+                                or (rt.get("symbol") or "").upper() == _get_root_ticker(ticker).upper()]
+                if not ticker_trips:
+                    ticker_trips = [rt for rt in day_trips
+                                    if _get_root_ticker(rt.get("symbol") or "") == _get_root_ticker(ticker)]
+                chart_path = generate_trade_chart(ticker, ticker_trips)
+                if chart_path and os.path.exists(chart_path):
+                    media = wp.upload_image_from_path(chart_path, f"Chart {ticker} {target_date}")
+                    if media:
+                        chart_html = (f'<div style="margin:16px 0;text-align:center;">'
+                                      f'<a href="{media["source_url"]}" target="_blank">'
+                                      f'<img src="{media["source_url"]}" '
+                                      f'style="width:100%;border:1px solid #d7ccc8;border-radius:12px;'
+                                      f'box-shadow:0 4px 12px rgba(0,0,0,0.08);"></a></div>')
+            except Exception as e:
+                logger.warning("Chart render/upload skipped for %s: %s", ticker, e)
+
             html_body += f"""
             <div style="padding:24px; border-left:8px solid {color}; background:#ffffff; margin:20px 0; border-radius:15px; border:1px solid #d7ccc8;">
                 <h3 style="margin-top:0; color:#008080; font-weight:800;">{ticker} Analysis</h3>
                 <p style="color:#5d4037; line-height:1.7; font-size:17px;">{blurb}</p>
+                {chart_html}
             </div>"""
     else:
         html_body += ("<p style='color:#8d6e63;'>No round-trips closed today. "

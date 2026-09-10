@@ -8,7 +8,8 @@ Discord notifications via ``core.discord_notifier``.
 Surface:
     get_auth_header, get_retry_session, get_or_create_tag_id, autolink_tickers,
     autolink_financial_terms, get_disclaimer_html, upload_image_from_path,
-    update_synced_pattern (sidebar), update_performance_page (calendar),
+    update_synced_pattern (sidebar), update_home_template_sidebar (sidebar),
+    update_performance_page (calendar), get_or_create_category_id,
     get_latest_published_date, publish_post
 
 BRANDING is preserved: links/titles reference only Treat Motivated Capital.
@@ -79,6 +80,24 @@ def get_or_create_tag_id(tag_name: str) -> int | None:
             return create_resp.json()["id"]
     except Exception as e:
         logger.warning("Tag error (%s): %s", tag_name, e)
+    return None
+
+
+def get_or_create_category_id(category_name: str) -> int | None:
+    """Find (or create) a WP category by name and return its id."""
+    headers = get_auth_header()
+    try:
+        resp = requests.get(f"{WP_URL}/wp-json/wp/v2/categories?search={category_name}", headers=headers)
+        if resp.status_code == 200:
+            for c in resp.json():
+                if c["name"].strip().lower() == category_name.strip().lower():
+                    return c["id"]
+        create_resp = get_retry_session().post(
+            f"{WP_URL}/wp-json/wp/v2/categories", headers=headers, json={"name": category_name})
+        if create_resp.status_code == 201:
+            return create_resp.json()["id"]
+    except Exception as e:
+        logger.warning("Category error (%s): %s", category_name, e)
     return None
 
 
@@ -203,6 +222,61 @@ def update_synced_pattern(image_url: str) -> bool:
         return False
 
 
+def update_home_template_sidebar(image_url: str) -> bool:
+    """Update the sidebar performance image in the child-theme home template.
+
+    The theme's home template (``treatmotivated-child//home``) bakes the sidebar
+    image URL directly into its HTML, so updating the synced pattern alone does
+    NOT change what visitors see. This fetches the template, swaps the
+    ``dexter-sidebar-image`` img src, and POSTs it back.
+    """
+    headers = get_auth_header()
+    template_id = config.WP_HOME_TEMPLATE_ID
+    url = f"{WP_URL}/wp-json/wp/v2/templates/{template_id}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            logger.error("Could not fetch home template: %s", resp.status_code)
+            return False
+        data = resp.json()
+        content = data.get("content", {})
+        raw = content.get("raw") if isinstance(content, dict) else content
+        if not raw:
+            logger.error("Home template has no raw content.")
+            return False
+
+        # Swap the src of the dexter-sidebar-image (fall back to any img).
+        new_raw = re.sub(
+            r'(<img[^>]*class="[^"]*dexter-sidebar-image[^"]*"[^>]*src=")[^"]*(")',
+            lambda m: m.group(1) + image_url + m.group(2),
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if new_raw == raw:
+            # No dexter-sidebar-image found; try replacing the first img src.
+            new_raw = re.sub(
+                r'(<img[^>]*src=")[^"]*(")',
+                lambda m: m.group(1) + image_url + m.group(2),
+                raw,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        if new_raw == raw:
+            logger.error("Could not locate an <img> to update in home template.")
+            return False
+
+        payload = {"content": new_raw}
+        rr = get_retry_session().post(url, headers=headers, json=payload, timeout=30)
+        if rr.status_code in (200, 201):
+            logger.info("Home template sidebar image updated -> %s", image_url)
+            return True
+        logger.error("Home template update failed: %s - %s", rr.status_code, rr.text[:300])
+        return False
+    except Exception as e:
+        logger.warning("Home template update error: %s", e)
+        return False
+
+
 def update_performance_page(html_content: str) -> None:
     """Find or create the 'Trading Performance' page and update it."""
     headers = get_auth_header()
@@ -244,7 +318,18 @@ def get_latest_published_date() -> date:
 
 
 def publish_post(post_data: dict) -> requests.Response:
-    """POST a post to WordPress (title/content/status/tags/featured_media...)."""
+    """POST a post to WordPress (title/content/status/tags/featured_media...).
+
+    Automatically sets the author (Dexter) and a real category so posts never
+    land as "admin" in "Uncategorized". Callers may override via
+    ``post_data["author"]`` / ``post_data["categories"]``.
+    """
+    post_data = dict(post_data)
+    post_data.setdefault("author", config.WP_AUTHOR_ID)
+    if "categories" not in post_data:
+        cat_id = get_or_create_category_id(config.WP_CATEGORY_NAME)
+        if cat_id:
+            post_data["categories"] = [cat_id]
     return get_retry_session().post(
         f"{WP_URL}/wp-json/wp/v2/posts", headers=get_auth_header(), json=post_data, timeout=15)
 

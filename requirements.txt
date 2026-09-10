@@ -9,5 +9,8 @@ yfinance>=0.2.40
 # Blog (Treat Motivated Capital) dashboard rendering
 Pillow>=10.0.0
 requests>=2.31.0
+# Per-trade candlestick charts (buy/sell markers) for blog posts
+matplotlib>=3.8.0
+mplfinance>=0.12.10b0
 -e ../agent-jira-client
 

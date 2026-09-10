@@ -318,6 +318,17 @@ DEXTER_LOGO_URL = os.getenv("DEXTER_LOGO_URL", "")
 WP_SIDEBAR_WIDGET_TITLE = os.getenv("WP_SIDEBAR_WIDGET_TITLE", "Dexter Sidebar Widget")
 WP_PERFORMANCE_PAGE_TITLE = os.getenv("WP_PERFORMANCE_PAGE_TITLE", "Trading Performance")
 
+# Author + category for blog posts. WP_AUTHOR_ID is the WP user id of "Dexter Dog"
+# (id=2 on treatmotivated.capital). WP_CATEGORY_NAME is the category posts are
+# filed under; it is created on first use if missing.
+WP_AUTHOR_ID = int(os.getenv("WP_AUTHOR_ID", "2"))
+WP_CATEGORY_NAME = os.getenv("WP_CATEGORY_NAME", "Dexter's Journal")
+
+# The child-theme home template that renders the sidebar performance image.
+# The blog job must update THIS template (not just the synced pattern) because
+# the theme bakes the image URL directly into the template HTML.
+WP_HOME_TEMPLATE_ID = os.getenv("WP_HOME_TEMPLATE_ID", "treatmotivated-child//home")
+
 # -- GCS DB sync uses core/gcs_sync.py with GCS_BUCKET_NAME (set in deploy/env) --
 
 # Jira Configurations
