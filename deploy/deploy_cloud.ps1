@@ -175,6 +175,8 @@ if ($JobExists) {
         --tasks 1 `
         --max-retries 1 `
         --task-timeout 10m `
+        --memory 1Gi `
+        --cpu 1 `
         --set-env-vars $EnvString
 } else {
     Write-Host "Creating new Cloud Run Job..."
@@ -186,6 +188,8 @@ if ($JobExists) {
         --tasks 1 `
         --max-retries 1 `
         --task-timeout 10m `
+        --memory 1Gi `
+        --cpu 1 `
         --set-env-vars $EnvString
 }
 
