@@ -138,17 +138,64 @@ def _fetch_bars(client, api_symbol, start_dt, end_dt):
 
 
 def _calculate_indicators(data):
-    """Add a 200-EMA trend overlay column to the bars df."""
+    """Add trend (200 EMA) + fast/slow EMA overlays to the bars df.
+
+    Matches dexter-trader's chart_analyzer: a 200 EMA trend line plus fast/slow
+    EMAs so the chart shows meaningful moving averages that track intraday price.
+    """
     df = data.copy()
     col_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
     df = df.rename(columns=col_map)
     hlc3 = (df["High"] + df["Low"] + df["Close"]) / 3
     df["trend_ema"] = hlc3.ewm(span=200, adjust=False).mean()
+    # Fast/slow EMAs (dexter defaults: 9/21) so intraday charts have usable MAs.
+    df["fast_ema"] = hlc3.ewm(span=9, adjust=False).mean()
+    df["slow_ema"] = hlc3.ewm(span=21, adjust=False).mean()
     return df
 
 
+def _fetch_order_fills(client, api_symbol, start_dt, end_dt):
+    """Fetch every individual executed order fill for a symbol in the window.
+
+    Returns a list of dicts: {ts (ET-aware pd.Timestamp), side, qty, price}.
+    Uses Alpaca's executed-orders feed so EVERY fill that influenced a buy/sell
+    is captured (not just the FIFO-averaged round-trip entry/exit prices).
+    """
+    fills = []
+    try:
+        orders = client.get_executed_orders(limit=500)
+        for o in orders or []:
+            sym = (o.get("symbol") or "").upper()
+            # Match the api_symbol (handle slashless crypto like JNJ vs BTC/USD).
+            if sym.replace("/", "") != api_symbol.replace("/", "").upper():
+                continue
+            ts = _parse_ts(o.get("timestamp"))
+            if ts is None:
+                continue
+            if not (start_dt <= ts <= end_dt):
+                continue
+            price = o.get("filled_avg_price")
+            qty = o.get("qty")
+            if not price or not qty:
+                continue
+            fills.append({
+                "ts": ts,
+                "side": (o.get("side") or "").lower(),
+                "qty": float(qty),
+                "price": float(price),
+            })
+    except Exception as e:
+        logger.warning("Order fills fetch failed for %s: %s", api_symbol, e)
+    return fills
+
+
 def _prepare_overlays(client, df, ticker, start_dt, end_dt, round_trips):
-    """Build mplfinance addplots + legend for buy/sell markers and trend EMA."""
+    """Build mplfinance addplots + legend for buy/sell markers and trend EMA.
+
+    Every individual order fill that influenced a buy/sell is plotted as a
+    marker (not just the FIFO-averaged round-trip entry/exit prices), so the
+    chart shows all the data points that drove the trade.
+    """
     ap = []
     legends = []
     annotations = []
@@ -168,35 +215,64 @@ def _prepare_overlays(client, df, ticker, start_dt, end_dt, round_trips):
     if "trend_ema" in df:
         ap.append(mpf.make_addplot(df["trend_ema"], color="orange", width=2.0, alpha=0.7))
         legends.append(Line2D([0], [0], color="orange", linewidth=2, label="Trend (200 EMA)"))
+    # Fast/slow EMAs (dexter defaults 9/21) so intraday charts have usable MAs.
+    if "fast_ema" in df:
+        ap.append(mpf.make_addplot(df["fast_ema"], color="#FF69B4", width=1.5))
+        legends.append(Line2D([0], [0], color="#FF69B4", linewidth=1.5, label="Fast EMA (9)"))
+    if "slow_ema" in df:
+        ap.append(mpf.make_addplot(df["slow_ema"], color="#FFB6C1", width=1.5))
+        legends.append(Line2D([0], [0], color="#FFB6C1", linewidth=1.5, label="Slow EMA (21)"))
 
-    # Buy/sell markers from the round-trips themselves (entry/exit prices).
+    # Every individual order fill (all data points that influenced buy/sell).
+    fills = _fetch_order_fills(client, ticker, start_dt, end_dt)
     buy_filled = [np.nan] * len(df)
     sell_filled = [np.nan] * len(df)
     has_orders = False
-    for rt in round_trips or []:
-        open_ts = _parse_ts(rt.get("open_ts"))
-        close_ts = _parse_ts(rt.get("close_ts"))
-        entry_price = rt.get("entry_price")
-        exit_price = rt.get("exit_price")
-        qty = rt.get("qty")
-        if open_ts is not None and entry_price:
-            idx = df.index.get_indexer([open_ts.replace(tzinfo=None)], method="nearest")
-            if idx[0] != -1:
-                buy_filled[idx[0]] = entry_price
-                annotations.append({
-                    "x": idx[0], "y": entry_price,
-                    "text": f"BUY {qty}\n@{entry_price:.2f}", "color": "#00FF00",
-                })
-                has_orders = True
-        if close_ts is not None and exit_price:
-            idx = df.index.get_indexer([close_ts.replace(tzinfo=None)], method="nearest")
-            if idx[0] != -1:
-                sell_filled[idx[0]] = exit_price
-                annotations.append({
-                    "x": idx[0], "y": exit_price,
-                    "text": f"SELL {qty}\n@{exit_price:.2f}", "color": "#FF4444",
-                })
-                has_orders = True
+    for f in fills:
+        idx = df.index.get_indexer([f["ts"].replace(tzinfo=None)], method="nearest")
+        if idx[0] == -1:
+            continue
+        if f["side"] == "buy":
+            buy_filled[idx[0]] = f["price"]
+            annotations.append({
+                "x": idx[0], "y": f["price"],
+                "text": f"BUY {f['qty']}\n@{f['price']:.2f}", "color": "#00FF00",
+            })
+        else:
+            sell_filled[idx[0]] = f["price"]
+            annotations.append({
+                "x": idx[0], "y": f["price"],
+                "text": f"SELL {f['qty']}\n@{f['price']:.2f}", "color": "#FF4444",
+            })
+        has_orders = True
+
+    # Fallback: if no order fills were returned, use the round-trip entry/exit
+    # prices so the chart still shows the trade.
+    if not has_orders:
+        for rt in round_trips or []:
+            open_ts = _parse_ts(rt.get("open_ts"))
+            close_ts = _parse_ts(rt.get("close_ts"))
+            entry_price = rt.get("entry_price")
+            exit_price = rt.get("exit_price")
+            qty = rt.get("qty")
+            if open_ts is not None and entry_price:
+                idx = df.index.get_indexer([open_ts.replace(tzinfo=None)], method="nearest")
+                if idx[0] != -1:
+                    buy_filled[idx[0]] = entry_price
+                    annotations.append({
+                        "x": idx[0], "y": entry_price,
+                        "text": f"BUY {qty}\n@{entry_price:.2f}", "color": "#00FF00",
+                    })
+                    has_orders = True
+            if close_ts is not None and exit_price:
+                idx = df.index.get_indexer([close_ts.replace(tzinfo=None)], method="nearest")
+                if idx[0] != -1:
+                    sell_filled[idx[0]] = exit_price
+                    annotations.append({
+                        "x": idx[0], "y": exit_price,
+                        "text": f"SELL {qty}\n@{exit_price:.2f}", "color": "#FF4444",
+                    })
+                    has_orders = True
 
     if not all(np.isnan(buy_filled)):
         ap.append(mpf.make_addplot(buy_filled, type="scatter", marker=buy_marker, markersize=120, color=buy_color))
@@ -276,6 +352,17 @@ def generate_trade_chart(ticker: str, round_trips: list[dict], out_dir: str = "r
         return None
     start_dt = min(valid_ts) - timedelta(minutes=PRE_TRADE_BUFFER_MIN)
     end_dt = max(valid_ts) + timedelta(minutes=POST_TRADE_BUFFER_MIN)
+
+    # Clamp the window to the exit day (the day the trade closed) so overnight
+    # holds don't produce a confusing two-day chart with a gap. The chart should
+    # show the price action on the day the round-trip closed, with all fills
+    # that influenced the buy/sell marked.
+    exit_day = max(close_ts_list).normalize() if close_ts_list else None
+    if exit_day is not None:
+        day_start = exit_day
+        day_end = exit_day + timedelta(days=1)
+        start_dt = max(start_dt, day_start)
+        end_dt = min(end_dt, day_end)
 
     underlying, asset_type, _, folder_cat = _parse_ticker_details(ticker)
     api_symbol = underlying if asset_type in ("CALL", "PUT") else ticker
