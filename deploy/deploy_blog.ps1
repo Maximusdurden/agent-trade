@@ -130,7 +130,20 @@ if (-not $JobExists) {
 # Adjust the scheduled time for your timezone / DST below. Day-of-week 1-5 =
 # weekdays (Mon-Fri) market days; 16:30 ET runs shortly after the 16:00 close so
 # the full day's round-trips are captured and the DB has synced to GCS.
-$SchedulerSa = "run-invoker@$GcpProject.iam.gserviceaccount.com"
+#
+# NOTE (2026-09-10): Use the DEFAULT compute service account, NOT a custom
+# `run-invoker` SA. The `run-invoker@<project>.iam.gserviceaccount.com` SA does
+# not exist in this project, so referencing it made scheduler creation fail
+# silently during a redeploy and dropped `dexter-blog-scheduler` entirely (no
+# daily posts). The working `agent-trade-scheduler` uses the default compute SA
+# (812795138269-compute@developer.gserviceaccount.com). Resolve it dynamically
+# so this stays correct across projects.
+$DefaultComputeSa = (& $GCloud iam service-accounts list --format="value(email)" 2>$null |
+    Where-Object { $_ -like "*-compute@developer.gserviceaccount.com" } | Select-Object -First 1)
+if (-not $DefaultComputeSa) {
+    Write-Error "Could not resolve default compute service account for scheduler."
+}
+$SchedulerSa = $DefaultComputeSa
 & $GCloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
 & $GCloud scheduler jobs create http $SchedulerName --schedule="30 20 * * 1-5" `
     --location $Region `
