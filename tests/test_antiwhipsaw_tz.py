@@ -94,6 +94,48 @@ class TestAntiWhipsawTimezone(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("anti-whipsaw", msg.lower())
 
+    @patch("core.database.get_recent_trades")
+    def test_losing_exit_sell_not_blocked(self, mock_trades):
+        """A SELL that exits a LOSING position (price below avg entry) is a
+        risk-reduction/stop-loss exit and must NOT be blocked by the anti-whipsaw
+        guardrail, even if the last BUY was <4h ago. This prevents trapping the
+        book in a falling position (e.g. DOT/USD scaled in all day)."""
+        recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        mock_trades.return_value = [{
+            "timestamp": recent_ts,
+            "symbol": "DOT/USD",
+            "side": "buy",
+            "status": "filled",
+        }]
+        # Held position with avg entry $1.10, current price $1.05 (below entry).
+        positions = {"DOT/USD": {"qty": 1000.0, "avg_entry_price": 1.10}}
+        approved, msg, adj = self.guardrails.validate_and_adjust_decision(
+            _decision("DOT/USD", action="SELL", qty=500.0, price=1.05),
+            _account(), positions
+        )
+        # Must NOT be blocked by anti-whipsaw (it's a losing exit).
+        self.assertTrue(approved, msg)
+
+    @patch("core.database.get_recent_trades")
+    def test_profitable_exit_sell_still_blocked(self, mock_trades):
+        """A SELL that exits a PROFITABLE position (price above avg entry) within
+        4h of a BUY is still churn and must remain blocked by anti-whipsaw."""
+        recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        mock_trades.return_value = [{
+            "timestamp": recent_ts,
+            "symbol": "NVDA",
+            "side": "buy",
+            "status": "filled",
+        }]
+        # Held position with avg entry $100, current price $105 (above entry).
+        positions = {"NVDA": {"qty": 10.0, "avg_entry_price": 100.0}}
+        approved, msg, adj = self.guardrails.validate_and_adjust_decision(
+            _decision("NVDA", action="SELL", qty=5.0, price=105.0),
+            _account(), positions
+        )
+        self.assertFalse(approved)
+        self.assertIn("anti-whipsaw", msg.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

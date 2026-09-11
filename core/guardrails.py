@@ -633,7 +633,22 @@ class RiskGuardrails:
                 if hours_since_last_trade < MIN_HOLDING_HOURS:
                     last_side = last_trade["side"].upper()
                     if last_side == "BUY" and action == "SELL":
-                        return False, f"Rejected: Anti-whipsaw guardrail. Asset bought too recently ({hours_since_last_trade:.2f} hours ago < {MIN_HOLDING_HOURS} hours limit). Selling blocked.", adjusted_decision
+                        # A SELL that exits a LOSING position (current price below
+                        # the position's average entry) is a risk-reduction / stop-
+                        # loss exit, NOT churn. Blocking it traps the book in a
+                        # falling position (e.g. DOT/USD scaled in all day, price
+                        # dropped below entry, brain wanted to exit but was blocked
+                        # every cycle). Only block a SELL that would churn a
+                        # profitable/flat position within the holding window.
+                        held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+                        avg_entry = 0.0
+                        if isinstance(held, dict):
+                            avg_entry = float(held.get("avg_entry_price", 0.0) or 0.0)
+                        current_price = float(decision.get("current_price", 0.0) or 0.0)
+                        is_losing_exit = (avg_entry > 0 and current_price > 0
+                                          and current_price < avg_entry)
+                        if not is_losing_exit:
+                            return False, f"Rejected: Anti-whipsaw guardrail. Asset bought too recently ({hours_since_last_trade:.2f} hours ago < {MIN_HOLDING_HOURS} hours limit). Selling blocked.", adjusted_decision
                     elif last_side == "SELL" and action == "BUY":
                         return False, f"Rejected: Anti-whipsaw guardrail. Asset sold too recently ({hours_since_last_trade:.2f} hours ago < {MIN_HOLDING_HOURS} hours limit). Re-buying blocked.", adjusted_decision
         except Exception as err:
