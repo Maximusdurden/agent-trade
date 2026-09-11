@@ -141,9 +141,11 @@ if (-not $JobExists) {
 $DefaultComputeSa = (& $GCloud iam service-accounts list --format="value(email)" 2>$null |
     Where-Object { $_ -like "*-compute@developer.gserviceaccount.com" } | Select-Object -First 1)
 if (-not $DefaultComputeSa) {
-    Write-Error "Could not resolve default compute service account for scheduler."
+    # Fallback: the standard default compute SA email for the project.
+    $DefaultComputeSa = "$GcpProject-number-compute@developer.gserviceaccount.com"
 }
 $SchedulerSa = $DefaultComputeSa
+Write-Host "Scheduler service account: $SchedulerSa"
 & $GCloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
 & $GCloud scheduler jobs create http $SchedulerName --schedule="30 20 * * 1-5" `
     --location $Region `
@@ -151,6 +153,9 @@ $SchedulerSa = $DefaultComputeSa
     --http-method=POST `
     --oauth-service-account-email=$SchedulerSa `
     --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Scheduler creation failed (exit $LASTEXITCODE). The blog job will not run daily. Fix and re-run."
+}
 
 Write-Host "`nDone: blog job $JobName deployed; scheduler $SchedulerName registered."
 Write-Host "Schedule runs 16:30 ET (Mon-Fri) via UTC cron '30 20 * * 1-5' (EDT)."
