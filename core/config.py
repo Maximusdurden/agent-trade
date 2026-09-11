@@ -63,6 +63,15 @@ CRYPTO_BRACKET_ENABLED = os.getenv("CRYPTO_BRACKET_ENABLED", "true").lower() == 
 CRYPTO_TAKE_PROFIT_PCT = float(os.getenv("CRYPTO_TAKE_PROFIT_PCT", "0.05"))
 CRYPTO_STOP_LOSS_PCT = float(os.getenv("CRYPTO_STOP_LOSS_PCT", "0.03"))
 
+# Minimum crypto order notional (USD). Alpaca rejects crypto orders whose cost
+# basis is below its per-pair minimum with
+# "cost basis must be >= minimal amount of order 10" (seen on DOT/USD
+# 2026-09-11). Equities already have a whole-share floor in the guardrails;
+# crypto keeps fractional quantities, so it needs an explicit dollar floor.
+# A crypto BUY whose notional is below this is rejected by the guardrail
+# (never submitted) so the broker rejection can't file a Jira ticket.
+MIN_CRYPTO_ORDER_NOTIONAL = float(os.getenv("MIN_CRYPTO_ORDER_NOTIONAL", "10.0"))
+
 # Volatility-Based Position Sizing
 # When True, BUY quantities are scaled down for high-volatility assets so the
 # same dollar *risk* is taken regardless of asset. Uses ATR% (from data_provider)

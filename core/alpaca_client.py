@@ -37,12 +37,51 @@ logger = logging.getLogger("AlpacaClient")
 _client_instance = None
 
 
+def _is_transient_data_error(err: Exception) -> bool:
+    """Return True if an Alpaca data-fetch error is a transient/network blip.
+
+    A single upstream wobble (e.g. ``backend request timeout``) used to fan out
+    into one ERROR log per symbol in the batch-fallback loop, each of which the
+    Jira logging handler turned into a separate Bug ticket (TMCL-922..928,
+    2026-09-11). Transient errors are expected to clear on their own, so we
+    retry them (in ``_fetch_with_retry``) and, if they persist, degrade with a
+    single aggregate WARNING instead of per-symbol ERRORs.
+    """
+    text = str(err).lower()
+    transient_markers = (
+        "timeout", "timed out", "backend request timeout",
+        "connection reset", "connection aborted", "temporarily unavailable",
+        "service unavailable", "502", "503", "504", "429", "too many requests",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
 def get_client_instance() -> "AlpacaClient":
     """Returns the shared AlpacaClient singleton (creates it if needed)."""
     global _client_instance
     if _client_instance is None:
         _client_instance = AlpacaClient()
     return _client_instance
+
+
+class MinimumNotionalError(Exception):
+    """Raised when an order's notional is below Alpaca's per-asset minimum.
+
+    Alpaca rejects crypto orders below its per-pair minimum with
+    "cost basis must be >= minimal amount of order 10" (seen on DOT/USD
+    2026-09-11). This is a benign, expected condition (not a system fault), so
+    the runner catches it and logs a WARNING rather than a CRITICAL (which would
+    file a Jira ticket, e.g. TMCL-921).
+    """
+
+    def __init__(self, symbol: str, notional: float, minimum: float):
+        self.symbol = symbol
+        self.notional = notional
+        self.minimum = minimum
+        super().__init__(
+            f"Order notional for {symbol} (${notional:.2f}) is below Alpaca's "
+            f"minimum order size (${minimum:.2f})."
+        )
 
 
 class AlpacaClient:
@@ -699,6 +738,7 @@ class AlpacaClient:
                     stock_dfs.append(bars.df)
             except Exception as e:
                 logger.warning(f"Batch stock fetch failed for {stock_symbols}: {e}. Retrying symbols individually.")
+                failed_syms = []
                 for sym in stock_symbols:
                     try:
                         stock_bars_request_kwargs = {
@@ -714,7 +754,9 @@ class AlpacaClient:
                         if bars and bars.df is not None and not bars.df.empty:
                             stock_dfs.append(bars.df)
                     except Exception as sym_err:
-                        logger.error(f"Failed to fetch stock bars for {sym}: {sym_err}")
+                        failed_syms.append((sym, sym_err))
+                if failed_syms:
+                    self._log_bar_fetch_failures("stock", failed_syms)
         return stock_dfs
         
     def _fetch_crypto_data(self, crypto_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
@@ -733,6 +775,7 @@ class AlpacaClient:
                     crypto_dfs.append(bars.df)
             except Exception as e:
                 logger.warning(f"Batch crypto fetch failed for {crypto_symbols}: {e}. Retrying symbols individually.")
+                failed_syms = []
                 for sym in crypto_symbols:
                     try:
                         request_params = CryptoBarsRequest(
@@ -745,8 +788,32 @@ class AlpacaClient:
                         if bars and bars.df is not None and not bars.df.empty:
                             crypto_dfs.append(bars.df)
                     except Exception as sym_err:
-                        logger.error(f"Failed to fetch crypto bars for {sym}: {sym_err}")
+                        failed_syms.append((sym, sym_err))
+                if failed_syms:
+                    self._log_bar_fetch_failures("crypto", failed_syms)
         return crypto_dfs
+
+    def _log_bar_fetch_failures(self, kind: str, failed_syms: list[tuple[str, Exception]]) -> None:
+        """Log a batch of per-symbol bar-fetch failures without ticket spam.
+
+        A single upstream incident (e.g. an Alpaca ``backend request timeout``)
+        used to emit one ERROR per symbol, and the Jira logging handler turned
+        each into its own Bug ticket (TMCL-922..928, 2026-09-11). When EVERY
+        failure in the batch is transient we emit ONE aggregate WARNING (which
+        does not file a ticket). If any failure is a genuine/permanent error we
+        still surface it at ERROR so real breakage isn't hidden.
+        """
+        symbols = [s for s, _ in failed_syms]
+        all_transient = all(_is_transient_data_error(err) for _, err in failed_syms)
+        summary = "; ".join(f"{s}: {err}" for s, err in failed_syms)
+        if all_transient:
+            logger.warning(
+                f"Transient {kind} bar fetch failure for {symbols} "
+                f"({len(failed_syms)} symbol(s)); degrading gracefully (no bars this cycle). "
+                f"Details: {summary}"
+            )
+        else:
+            logger.error(f"Failed to fetch {kind} bars for {symbols}: {summary}")
         
     def _fetch_with_retry(self, client, request_params, fetch_func, max_retries: int = 3):
         """Helper to fetch data with retry logic."""
@@ -758,88 +825,6 @@ class AlpacaClient:
                 if attempt == max_retries - 1:
                     raise
                 time.sleep(1 * (attempt + 1))
-
-        stock_dfs = []
-        if stock_symbols:
-            try:
-                stock_bars_request_kwargs = {
-                    "symbol_or_symbols": stock_symbols,
-                    "timeframe": tf,
-                    "start": start_time,
-                    "end": datetime.now()
-                }
-                if DATA_FEED_AVAILABLE:
-                    stock_bars_request_kwargs["feed"] = DataFeed.IEX
-                request_params = StockBarsRequest(**stock_bars_request_kwargs)
-                bars = fetch_with_retry(self.data_client, request_params, self.data_client.get_stock_bars)
-                if bars and bars.df is not None and not bars.df.empty:
-                    stock_dfs.append(bars.df)
-            except Exception as e:
-                logger.warning(f"Batch stock fetch failed for {stock_symbols}: {e}. Retrying symbols individually.")
-                for sym in stock_symbols:
-                    try:
-                        stock_bars_request_kwargs = {
-                            "symbol_or_symbols": sym,
-                            "timeframe": tf,
-                            "start": start_time,
-                            "end": datetime.now()
-                        }
-                        if DATA_FEED_AVAILABLE:
-                            stock_bars_request_kwargs["feed"] = DataFeed.IEX
-                        request_params = StockBarsRequest(**stock_bars_request_kwargs)
-                        bars = fetch_with_retry(self.data_client, request_params, self.data_client.get_stock_bars)
-                        if bars and bars.df is not None and not bars.df.empty:
-                            stock_dfs.append(bars.df)
-                    except Exception as sym_err:
-                        logger.error(f"Failed to fetch stock bars for {sym}: {sym_err}")
-
-        crypto_dfs = []
-        if crypto_symbols:
-            try:
-                request_params = CryptoBarsRequest(
-                    symbol_or_symbols=crypto_symbols,
-                    timeframe=tf,
-                    start=start_time,
-                    end=datetime.now()
-                )
-                bars = fetch_with_retry(self.crypto_data_client, request_params, self.crypto_data_client.get_crypto_bars)
-                if bars and bars.df is not None and not bars.df.empty:
-                    crypto_dfs.append(bars.df)
-            except Exception as e:
-                logger.warning(f"Batch crypto fetch failed for {crypto_symbols}: {e}. Retrying symbols individually.")
-                for sym in crypto_symbols:
-                    try:
-                        request_params = CryptoBarsRequest(
-                            symbol_or_symbols=sym,
-                            timeframe=tf,
-                            start=start_time,
-                            end=datetime.now()
-                        )
-                        bars = fetch_with_retry(self.crypto_data_client, request_params, self.crypto_data_client.get_crypto_bars)
-                        if bars and bars.df is not None and not bars.df.empty:
-                            crypto_dfs.append(bars.df)
-                    except Exception as sym_err:
-                        logger.error(f"Failed to fetch crypto bars for {sym}: {sym_err}")
-
-        all_dfs = stock_dfs + crypto_dfs
-        if not all_dfs:
-            return pd.DataFrame()
-            
-        combined_df = pd.concat(all_dfs)
-        
-        if not is_list:
-            single_sym = symbols_list[0]
-            if isinstance(combined_df.index, pd.MultiIndex):
-                if single_sym in combined_df.index.levels[0]:
-                    combined_df = combined_df.xs(single_sym)
-                else:
-                    return pd.DataFrame()
-            return combined_df.tail(limit)
-        else:
-            # Ensure the combined_df is multi-indexed and apply tail limit per symbol
-            if isinstance(combined_df.index, pd.MultiIndex):
-                combined_df = combined_df.groupby(level=0, group_keys=False).apply(lambda x: x.tail(limit))
-            return combined_df
 
     def cancel_open_orders(self, symbol: str) -> None:
         """Cancels all open orders for a specific symbol."""
@@ -1201,6 +1186,22 @@ class AlpacaClient:
             order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
             is_crypto = "/" in symbol or "USD" in symbol or "SOL" in symbol
 
+            # Minimum-notional pre-check (Fix G, 2026-09-11). Alpaca rejects
+            # crypto orders below its per-pair minimum ("cost basis must be
+            # >= minimal amount of order 10", seen on DOT/USD). Reject locally
+            # with a benign, typed error BEFORE submitting so the broker never
+            # returns the rejection and the runner can log a WARNING (not a
+            # CRITICAL that files a Jira ticket). SELLs are exempt: we must always
+            # be able to exit/liquidate a dust position.
+            if is_crypto and side == "buy":
+                min_notional = float(getattr(config, "MIN_CRYPTO_ORDER_NOTIONAL", 10.0))
+                try:
+                    ref_price = self.get_latest_price(symbol)
+                except Exception:
+                    ref_price = 0.0
+                if ref_price > 0 and (float(qty) * ref_price) < min_notional:
+                    raise MinimumNotionalError(symbol, float(qty) * ref_price, min_notional)
+
             def _submit_and_poll(req, order_type="market", fallback=False):
                 """Submit an order and poll for fill confirmation."""
                 order = self.trading_client.submit_order(order_data=req)
@@ -1309,6 +1310,12 @@ class AlpacaClient:
                             )
                             return _submit_and_poll(market_order_data, order_type="market", fallback=True)
                     raise
+        except MinimumNotionalError as e:
+            # Benign, expected condition: the order is simply too small for the
+            # broker's minimum. Log a WARNING (never files a Jira ticket) and
+            # re-raise so the caller can skip the order cleanly.
+            logger.warning(str(e))
+            raise
         except Exception as e:
             err_msg = str(e)
             # Check if this is an Alpaca validation error about stop_loss.stop_price or take_profit.limit_price

@@ -905,7 +905,20 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
             cycle_context["trades"] = int(cycle_context.get("trades", 0)) + 1
             cycle_context["spent"] = float(cycle_context.get("spent", 0.0)) + qty * float(order_result.get("filled_avg_price", current_price) or current_price)
         except Exception as e:
-            logger.critical(f"FATAL: Order execution failed for {symbol}: {e}")
+            # A minimum-notional rejection is benign/expected (the position was
+            # simply too small for the broker's per-asset floor). Log it at
+            # WARNING so it doesn't file a CRITICAL Jira ticket; all other
+            # execution failures remain CRITICAL.
+            try:
+                from core.alpaca_client import MinimumNotionalError
+                _is_min_notional = isinstance(e, MinimumNotionalError)
+            except Exception:
+                _is_min_notional = False
+
+            if _is_min_notional:
+                logger.warning(f"Skipped order for {symbol}: {e}")
+            else:
+                logger.critical(f"FATAL: Order execution failed for {symbol}: {e}")
             try:
                 database.log_execution(
                     decision_id=decision_id, attempt=1, symbol=symbol, side=action, qty=qty,

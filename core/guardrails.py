@@ -961,6 +961,21 @@ class RiskGuardrails:
                     )
                     proposed_qty = floored_qty
                     proposed_trade_value = proposed_qty * current_price
+            else:
+                # Minimum-notional floor for crypto (Fix G, 2026-09-11): Alpaca
+                # rejects crypto orders below its per-pair minimum with
+                # "cost basis must be >= minimal amount of order 10" (seen on
+                # DOT/USD 2026-09-11). Crypto keeps fractional quantities, so the
+                # equity whole-share floor above doesn't apply. Reject (never
+                # submit) a crypto BUY whose dollar notional is below the broker
+                # minimum so the rejection can't bubble up as a Jira-filing ERROR
+                # in the client and a CRITICAL in the runner.
+                min_notional = float(getattr(config, "MIN_CRYPTO_ORDER_NOTIONAL", 10.0))
+                if proposed_trade_value < min_notional:
+                    adjusted_decision["quantity"] = 0.0
+                    return False, (f"Rejected: Crypto BUY notional for {symbol} "
+                                    f"(${proposed_trade_value:.2f}) is below Alpaca's "
+                                    f"minimum order size (${min_notional:.2f})."), adjusted_decision
 
             adjusted_decision["quantity"] = proposed_qty
             return True, f"Approved: Buy order of {proposed_qty} shares of {symbol} validated.", adjusted_decision
