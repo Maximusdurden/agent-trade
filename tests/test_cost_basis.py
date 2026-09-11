@@ -159,10 +159,15 @@ def test_reconcile_backfills_broker_sells():
     # DB has a buy, but broker also executed a sell (TP/SL fill) not in DB.
     log_trade(decision_id=1, alpaca_order_id="a1", symbol="SOL/USD",
               side="buy", qty=100.0, filled_avg_price=100.0, status="filled")
+    # The broker sell must be chronologically AFTER the buy (log_trade stamps
+    # the buy with "now"). FIFO matching sorts by timestamp, so a sell with an
+    # earlier timestamp than the buy would be processed first and never match.
+    from datetime import datetime, timedelta, timezone
+    sell_ts = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     broker_orders = [
         {
             "alpaca_order_id": "broker-sell-1",
-            "timestamp": "2026-08-28T12:00:00+00:00",
+            "timestamp": sell_ts,
             "symbol": "SOL/USD",
             "side": "sell",
             "qty": 50.0,
