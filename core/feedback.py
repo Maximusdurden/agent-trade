@@ -195,9 +195,19 @@ def _fetch_filled_trades(database):
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, timestamp, symbol, side, qty, filled_avg_price, status "
-            "FROM trades WHERE status IN ('filled', 'partially_filled') ORDER BY id ASC"
+            "FROM trades WHERE status IN ('filled', 'partially_filled')"
         )
-        return [dict(r) for r in cursor.fetchall()]
+        rows = [dict(r) for r in cursor.fetchall()]
+    # FIFO matching REQUIRES chronological order. The `id` column is NOT a
+    # reliable proxy for time (trades can be backfilled / re-inserted out of
+    # order, and timestamps use mixed formats), so sort by parsed timestamp
+    # with `id` as a stable tiebreaker. Sorting by id alone produced negative
+    # holding hours (buys matched to earlier sells), which falsely tripped the
+    # whipsaw-trap circuit breaker (every negative hour counts as <4h).
+    def _sort_key(r):
+        dt = _parse_ts(r["timestamp"])
+        return (dt if dt is not None else datetime.min, r["id"])
+    return sorted(rows, key=_sort_key)
 
 
 def compute_open_position_cost_basis() -> dict[str, dict]:

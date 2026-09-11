@@ -12,12 +12,21 @@ Covers:
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import config
 from core.guardrails import RiskGuardrails
+
+
+def _today_ts(hour=16, minute=0):
+    """Return an ISO UTC timestamp for TODAY (the guardrails filter recent
+    trades by today's date via datetime.utcnow()). Hardcoding a past date
+    (e.g. 2026-09-09) makes these tests silently pass on that day and then
+    fail the next day, so generate the date dynamically."""
+    return datetime.now(timezone.utc).replace(hour=hour, minute=minute, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 class TestVwapDeadZone(unittest.TestCase):
@@ -185,8 +194,8 @@ class TestRoundTripBudget(unittest.TestCase):
         # Price 88.90 is below the VWAP lower band (89.10) so the dead-zone
         # guardrail doesn't fire first; the round-trip budget guard rejects.
         mock_trips.return_value = [
-            {"symbol": "WFC", "close_ts": "2026-09-09T15:00:00Z"},
-            {"symbol": "WFC", "close_ts": "2026-09-09T16:00:00Z"},
+            {"symbol": "WFC", "close_ts": _today_ts(hour=15)},
+            {"symbol": "WFC", "close_ts": _today_ts(hour=16)},
         ]
         mock_trades.return_value = []
         approved, msg, adj = self.guardrails.validate_and_adjust_decision(
@@ -231,13 +240,19 @@ class TestMinEdgeGate(unittest.TestCase):
         return {"WFC": {"qty": owned, "qty_available": owned}}
 
     @mock.patch("core.database.get_recent_trades")
-    def test_small_move_reversal_rejected(self, mock_trades):
+    @mock.patch("core.guardrails.datetime")
+    def test_small_move_reversal_rejected(self, mock_dt, mock_trades):
         # Last fill SELL @ 89.30; now BUY @ 89.05 = 0.28% move < 0.3% -> reject.
         # Price 89.05 is below the VWAP lower band (89.10) so the dead-zone
         # guardrail doesn't fire first; the min-edge guard rejects.
+        # Pin "now" so the trade timestamp is TODAY but >4h old (skips the
+        # anti-whipsaw recency guard, which runs before the min-edge guard).
+        from datetime import datetime as _real_dt
+        mock_dt.utcnow.return_value = _real_dt(2026, 9, 11, 16, 0, 0)
+        mock_dt.fromisoformat.side_effect = _real_dt.fromisoformat
         mock_trades.return_value = [{
             "symbol": "WFC", "side": "SELL", "status": "filled",
-            "filled_avg_price": 89.30, "timestamp": "2026-09-09T16:00:00Z",
+            "filled_avg_price": 89.30, "timestamp": "2026-09-11T11:00:00Z",
         }]
         approved, msg, adj = self.guardrails.validate_and_adjust_decision(
             self._decision("BUY", 89.05),
@@ -295,13 +310,19 @@ class TestDayDirectionLock(unittest.TestCase):
         return {"WFC": {"qty": owned, "qty_available": owned}}
 
     @mock.patch("core.database.get_recent_trades")
-    def test_reversal_without_regime_change_blocked(self, mock_trades):
+    @mock.patch("core.guardrails.datetime")
+    def test_reversal_without_regime_change_blocked(self, mock_dt, mock_trades):
         # Last fill BUY @ 89.70 (above upper band 89.60); now SELL @ 89.99.
         # Move = 0.32% (passes min-edge 0.3%) but < 0.5% (fails day-direction),
         # and no VWAP band is crossed (both fills above the band) -> lock fires.
+        # Pin "now" so the trade timestamp is TODAY but >4h old (skips the
+        # anti-whipsaw recency guard, which runs before the day-direction lock).
+        from datetime import datetime as _real_dt
+        mock_dt.utcnow.return_value = _real_dt(2026, 9, 11, 16, 0, 0)
+        mock_dt.fromisoformat.side_effect = _real_dt.fromisoformat
         mock_trades.return_value = [{
             "symbol": "WFC", "side": "BUY", "status": "filled",
-            "filled_avg_price": 89.70, "timestamp": "2026-09-09T16:00:00Z",
+            "filled_avg_price": 89.70, "timestamp": "2026-09-11T11:00:00Z",
         }]
         approved, msg, adj = self.guardrails.validate_and_adjust_decision(
             self._decision("SELL", 89.99),

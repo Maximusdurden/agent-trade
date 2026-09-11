@@ -35,8 +35,12 @@ def _add_round_trip(symbol, buy_price, sell_price, qty=1.0, hold_hours=0.0):
     existing tests isolating the circuit breaker.
     """
     from datetime import datetime, timedelta
-    sell_ts = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    # Compute buy_ts FIRST, then sell_ts = buy_ts + hold_hours, so the buy is
+    # always strictly before the sell. (Computing them from two separate
+    # datetime.utcnow() calls could give the sell a slightly EARLIER timestamp
+    # when hold_hours=0, which breaks chronological FIFO matching.)
     buy_ts = (datetime.utcnow() - timedelta(hours=5 + hold_hours)).isoformat()
+    sell_ts = (datetime.utcnow() - timedelta(hours=5)).isoformat()
     _order_counter[0] += 1
     n = _order_counter[0]
     with get_db_connection() as conn:

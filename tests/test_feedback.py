@@ -21,6 +21,10 @@ def _clean_trades():
     with get_db_connection() as conn:
         conn.execute("DELETE FROM trades")
         conn.commit()
+    # Clear the feedback FIFO memo cache so a prior test's memoized trades
+    # don't leak into this test (the cache TTL is 60s, longer than a test run).
+    import core.feedback as fb
+    fb._memo.clear()
 
 
 def test_fifo_round_trips_and_pnl():
