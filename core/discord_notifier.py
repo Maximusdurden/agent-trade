@@ -53,3 +53,27 @@ def send_discord_embed(embed: dict) -> bool:
 def send_discord_embeds(embeds: list[dict]) -> bool:
     """Sends multiple rich embed messages to Discord."""
     return send_discord_webhook({"embeds": embeds})
+
+
+def send_ticker_roster_summary(roster: dict) -> bool:
+    """Send a Discord summary of a ticker roster (promote/relegate/watch).
+
+    ``roster`` is the dict from ``tools.ticker_promotion_relegation.build_roster``
+    (keys: tiers, to_add, to_remove, stats). Builds a compact message.
+    """
+    tiers = roster.get("tiers", {})
+    lines = ["📊 **Ticker Roster**"]
+    to_add = roster.get("to_add", [])
+    to_remove = roster.get("to_remove", [])
+    watch = tiers.get("WATCH", [])
+
+    if to_add:
+        lines.append(f"🔺 **Promoted:** {', '.join(to_add)}")
+    if to_remove:
+        lines.append(f"🔻 **Relegated:** {', '.join(to_remove)}")
+    if watch:
+        lines.append(f"⚠️ **Watch:** {', '.join(watch)}")
+    if not (to_add or to_remove or watch):
+        lines.append("No roster changes.")
+
+    return send_discord_message("\n".join(lines))

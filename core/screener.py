@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -26,10 +27,33 @@ DEFAULT_TICKERS = [
 def load_screener_pool() -> list[str]:
     """Loads the broad candidate pool of tickers from screener_pool.json.
 
-    Filters out crypto pairs Alpaca does not support (e.g. BNB/USD) so an
-    unsupported symbol never reaches the bars endpoint and triggers a
-    "Failed to fetch historical bars" error.
+    Prefers the GCS-backed copy (so weekly roster edits take effect without an
+    image rebuild), falling back to the baked-in local file, then to the default
+    liquid tickers list. Filters out crypto pairs Alpaca does not support (e.g.
+    BNB/USD) so an unsupported symbol never reaches the bars endpoint.
     """
+    # 1. Try the GCS-backed pool first (runtime-editable, no rebuild needed).
+    try:
+        from core.gcs_sync import download_screener_pool
+        tmp = download_screener_pool()
+        if tmp:
+            try:
+                with open(tmp, "r") as f:
+                    tickers = json.load(f)
+                if isinstance(tickers, list) and tickers:
+                    logger.info(f"Loaded {len(tickers)} tickers from GCS screener pool.")
+                    return _filter_supported(tickers)
+            except Exception as e:
+                logger.error(f"Failed to read GCS screener pool: {e}")
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning(f"GCS screener pool unavailable: {e}")
+
+    # 2. Fall back to the baked-in local file.
     pool_path = config.SCREENER_POOL_PATH
     if pool_path.exists():
         try:

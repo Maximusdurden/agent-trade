@@ -201,6 +201,61 @@ def upload_to_gcs():
     except Exception as e:
         logger.error(f"Failed to upload files to GCS: {e}")
 
+# ---------------------------------------------------------------------------
+# Screener pool sync (GCS-backed so weekly roster edits take effect without a
+# full image rebuild). The pool is stored in GCS and read at runtime, with the
+# baked-in local file as fallback.
+# ---------------------------------------------------------------------------
+SCREENER_POOL_BLOB = "screener_pool.json"
+
+
+def download_screener_pool() -> str | None:
+    """Download screener_pool.json from GCS to a temp path.
+
+    Returns the temp file path, or None if unavailable. Caller is responsible
+    for reading (and cleaning up) the returned path.
+    """
+    gcs_bucket = os.getenv("GCS_BUCKET_NAME")
+    if not gcs_bucket:
+        return None
+    try:
+        client = get_gcs_client()
+        if client is None:
+            return None
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(SCREENER_POOL_BLOB)
+        if not blob.exists():
+            return None
+        tmp = SCREENER_POOL_BLOB + ".tmp"
+        blob.download_to_filename(tmp)
+        return tmp
+    except Exception as e:
+        logger.warning(f"Failed to download screener pool from GCS: {e}")
+        return None
+
+
+def upload_screener_pool(pool: list) -> bool:
+    """Upload a screener pool list to GCS as screener_pool.json."""
+    import json
+    gcs_bucket = os.getenv("GCS_BUCKET_NAME")
+    if not gcs_bucket:
+        logger.warning("GCS_BUCKET_NAME not set. Cannot upload screener pool.")
+        return False
+    try:
+        client = get_gcs_client()
+        if client is None:
+            return False
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(SCREENER_POOL_BLOB)
+        blob.upload_from_string(json.dumps(pool, indent=4),
+                                content_type="application/json")
+        logger.info(f"Uploaded screener pool ({len(pool)} tickers) to gs://{gcs_bucket}/{SCREENER_POOL_BLOB}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upload screener pool to GCS: {e}")
+        return False
+
+
 def check_kill_switch() -> dict:
     """
     Downloads kill_switch.json from GCS, parses it, and returns the status.
