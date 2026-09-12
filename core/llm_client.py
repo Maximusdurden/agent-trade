@@ -125,7 +125,8 @@ class SharedLLMClient:
         prompt: str,
         system_prompt: str,
         tier: str | None = None,
-        max_output_tokens: int | None = None
+        max_output_tokens: int | None = None,
+        explicit_model: str | None = None
     ) -> str:
         """Execute a chat completion with OpenRouter primary, Gemini fallback.
 
@@ -135,10 +136,15 @@ class SharedLLMClient:
         model overload) it falls through to the native ``google-genai`` client so
         the trading cycle is never disrupted by a single provider outage.
 
+        ``explicit_model`` (optional): an exact OpenRouter model id to use,
+        bypassing the tier->model mapping. Used by the blog brain so ``BLOG_MODEL``
+        is respected exactly (the tier mapping alone would route blog content to
+        ``openrouter/free``, a free-tier model that leaks chain-of-thought).
+
         Returns the raw text content of the model response.
         """
         resolved_tier = tier.lower() if tier else "daily_driver"
-        model_id = self.tier_mapping.get(resolved_tier, self.tier_mapping["daily_driver"])
+        model_id = explicit_model or self.tier_mapping.get(resolved_tier, self.tier_mapping["daily_driver"])
         
         # Try OpenRouter first
         if self.client:

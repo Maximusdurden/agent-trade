@@ -172,7 +172,10 @@ def _fetch_order_fills(client, api_symbol, start_dt, end_dt):
             ts = _parse_ts(o.get("timestamp"))
             if ts is None:
                 continue
-            if not (start_dt <= ts <= end_dt):
+            # start_dt/end_dt are naive (ET) after _fetch_bars strips tz; compare
+            # against the naive ET form of ts to avoid offset-naive/aware errors.
+            ts_naive = ts.replace(tzinfo=None)
+            if not (start_dt.replace(tzinfo=None) <= ts_naive <= end_dt.replace(tzinfo=None)):
                 continue
             price = o.get("filled_avg_price")
             qty = o.get("qty")

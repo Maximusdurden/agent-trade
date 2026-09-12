@@ -149,7 +149,8 @@ def grade_trades(db_path, date_str) -> None:
 # ---------------------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------------------
-def run(use_local_db: bool, dry: bool, date_override: str | None) -> int:
+def run(use_local_db: bool, dry: bool, date_override: str | None,
+        update_post_id: int | None = None) -> int:
     setup_dexter_logging()
     target_date = date_override or datetime.now().strftime("%Y-%m-%d")
 
@@ -182,7 +183,7 @@ def run(use_local_db: bool, dry: bool, date_override: str | None) -> int:
         return 1
 
     # 3. Build the post (grade + assemble + publish via the real pipeline).
-    return _build_and_publish(trips, db_path, target_date, dry)
+    return _build_and_publish(trips, db_path, target_date, dry, update_post_id)
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +216,14 @@ def _market_research(date_str: str, tickers) -> str:
         return "Market context available for the day."
 
 
-def _build_and_publish(trips, db_path: str, target_date: str, dry: bool) -> int:
+def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
+                       update_post_id: int | None = None) -> int:
     """Grade + build the post (intro, blurbs, card, calendar) + publish.
 
     In ``dry`` mode everything is generated except WP publish / Discord send.
+    If ``update_post_id`` is given, the existing post is updated in place
+    (preserving its ID/URL/comments) instead of creating a new one — used when
+    regenerating a day's post after a chart/content fix.
     Returns 0 on success (or would-publish).
     """
     # ---- 1. Build dexter-shaped df + today's PnL ----
@@ -382,6 +387,16 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool) -> int:
                     intro["title"], format_pnl(total_pnl), len(grade_map))
         return 0
 
+    if update_post_id is not None:
+        resp = wp.update_post(update_post_id, post_data)
+        if resp.status_code == 200:
+            link = resp.json().get("link", "no link")
+            logger.info("Updated post %s: %s -> %s", update_post_id, intro["title"], link)
+            return 0
+        logger.error("Update post %s failed: %s - %s",
+                     update_post_id, resp.status_code, resp.text[:500])
+        return 1
+
     resp = wp.publish_post(post_data)
     if resp.status_code == 201:
         link = resp.json().get("link", "no link")
@@ -401,9 +416,11 @@ def main() -> int:
     parser.add_argument("--local-db", action="store_true", help="use local agent DB (dev)")
     parser.add_argument("--dry", action="store_true", help="build/grade/print only; don't publish")
     parser.add_argument("--date", default=None, help="target date YYYY-MM-DD (default today)")
+    parser.add_argument("--update-post-id", type=int, default=None,
+                        help="update an existing post id in place instead of creating a new one")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    return run(args.local_db, args.dry, args.date)
+    return run(args.local_db, args.dry, args.date, args.update_post_id)
 
 
 if __name__ == "__main__":

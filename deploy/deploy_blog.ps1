@@ -106,6 +106,22 @@ $EnvVariablesList = @(
     "DATABASE_FILENAME=/tmp/trading_agent.db",
     "BLOG_PERSONA=dexter"
 )
+# Alpaca keys are REQUIRED for the per-ticker candlestick charts. Without them
+# get_client_instance() falls into mock mode and generates fake ~$400 bars,
+# forcing a secondary y-axis and breaking the chart (the 9/10-9/11 regression).
+# Inject them as plain env vars from .env, matching the strategy job's pattern.
+$AlpacaKeys = @("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER")
+Get-Content $EnvPath | ForEach-Object {
+    $Line = $_.Trim()
+    if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
+        $Parts = $Line.Split("=", 2)
+        $Key = $Parts[0].Trim()
+        $Val = $Parts[1].Trim().Trim("'`"")
+        if ($AlpacaKeys -contains $Key -and $Val -and -not $Val.StartsWith("your_")) {
+            $EnvVariablesList += "$Key=$Val"
+        }
+    }
+}
 $SecretReferences = @(
     "WP_USER=WP_USER:latest",
     "WP_APP_PASSWORD=WP_APP_PASSWORD:latest",

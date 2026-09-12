@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from datetime import datetime
 
@@ -102,6 +103,59 @@ def _record_api_call():
 
 
 # ---------------------------------------------------------------------------
+# Output sanitizer — strips leaked chain-of-thought / safety artifacts
+# ---------------------------------------------------------------------------
+# Some free-tier / reasoning models emit their internal "thinking process" or
+# safety-classification labels directly into the response body. These must never
+# reach the published blog. This strips the common patterns defensively so a
+# model regression can't leak internal notes to readers again.
+#
+# Two passes:
+#   1. Regex-strip specific leaked labels (e.g. "User Safety: safe") that may be
+#      appended to an otherwise-legitimate paragraph.
+#   2. Drop any paragraph that is purely leaked reasoning (contains a reasoning
+#      header like "thinking process" / "Analyze the Request"). These are always
+#      internal and never legitimate blog content.
+_LEAK_LABEL_RE = re.compile(
+    r"(?:User\s+)?Safety\s*:\s*\w+\s*", re.IGNORECASE
+)
+_REASONING_MARKERS = [
+    "thinking process", "my thinking", "let me think", "let me reason",
+    "let me analyze", "brainstorm", "deconstruct constraints",
+    "analyze the request", "analyze the trade",
+    "persona traits", "system identity", "raw data / context", "your task",
+    "sentence limit", "price/duration", "trade grader integration",
+    "no introductions", "mandatory limit", "forbidden:",
+]
+
+
+def _sanitize_blog_output(text: str) -> str:
+    """Remove leaked reasoning / safety artifacts from an LLM blog response.
+
+    Returns the cleaned text. If cleaning leaves nothing meaningful, returns the
+    original so the caller's fallback (raw content) still applies.
+    """
+    if not text:
+        return text
+    # Pass 1: strip leaked safety labels anywhere (they may share a paragraph
+    # with legitimate content).
+    text = _LEAK_LABEL_RE.sub("", text)
+    # Pass 2: drop paragraphs that are purely leaked reasoning.
+    paragraphs = re.split(r"\n\s*\n", text)
+    kept = []
+    for para in paragraphs:
+        low = para.lower()
+        if any(marker in low for marker in _REASONING_MARKERS):
+            logger.debug("BlogBrain sanitizer dropped leaked paragraph: %s", para[:80])
+            continue
+        kept.append(para)
+    cleaned = "\n\n".join(kept).strip()
+    # If everything was dropped, return the original so the caller's fallback
+    # (raw content) still applies rather than publishing an empty blurb.
+    return cleaned if cleaned else text
+
+
+# ---------------------------------------------------------------------------
 # Style-transfer core
 # ---------------------------------------------------------------------------
 def _apply_persona(raw_content: str, task_instruction: str) -> str:
@@ -139,14 +193,12 @@ def _apply_persona(raw_content: str, task_instruction: str) -> str:
             system_prompt=full_system,
             tier="utility",          # cheap creative tier
             max_output_tokens=int(os.getenv("BLOG_MAX_OUTPUT_TOKENS", "1024")),
+            explicit_model=resolved_model,  # respect BLOG_MODEL exactly (see note)
         )
         _record_api_call()
-        # NOTE: _execute_completion doesn't take an explicit model override; if we
-        # need BLOG_MODEL respected exactly, construct the client per-call model
-        # via a small wrapper. For now the tier mapping drives the model.
         elapsed = time.time() - started
         logger.debug("BlogBrain LLM call took %.1fs", elapsed)
-        return result.strip() if result else raw_content
+        return _sanitize_blog_output(result) if result else raw_content
     except Exception as e:
         logger.error("BlogBrain LLM call failed: %s", e)
         return raw_content
@@ -194,14 +246,22 @@ def generate_trade_blurb(ticker, pnl, logs, grade_info=None) -> str:
     grade_context = ""
     grade_instruction = ""
     if grade_info:
+        def _fmt_num(key: str, fmt: str) -> str:
+            val = grade_info.get(key)
+            if val is None:
+                return ""
+            try:
+                return f"{float(val):{fmt}}"
+            except (ValueError, TypeError):
+                return ""
         grade_context = (
             f"\n\n--- TRADE GRADER INFO ---\n"
             f"Assigned Letter Grade: {grade_info.get('grade')}\n"
-            f"Composite Score: {grade_info.get('composite_score'):.1f}/100\n"
-            f"Alpha vs SPY: {grade_info.get('alpha_vs_spy'):+.2f}%\n"
-            f"Alpha vs Sector: {grade_info.get('alpha_vs_sector'):+.2f}%\n"
-            f"MAE Drawdown: {grade_info.get('mae_pct'):+.2f}%\n"
-            f"MFE Capture: {grade_info.get('capture_ratio'):.1f}%\n"
+            f"Composite Score: {_fmt_num('composite_score', '.1f')}/100\n"
+            f"Alpha vs SPY: {_fmt_num('alpha_vs_spy', '+.2f')}%\n"
+            f"Alpha vs Sector: {_fmt_num('alpha_vs_sector', '+.2f')}%\n"
+            f"MAE Drawdown: {_fmt_num('mae_pct', '+.2f')}%\n"
+            f"MFE Capture: {_fmt_num('capture_ratio', '.1f')}%\n"
         )
         grade_instruction = (
             "\n6. TRADE GRADER INTEGRATION: explicitly reference and critique the "

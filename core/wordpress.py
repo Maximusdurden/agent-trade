@@ -341,6 +341,70 @@ def notify_new_post(title: str, pnl: float, link: str) -> None:
     send_discord_message(msg)
 
 
+def update_post(post_id: int, post_data: dict) -> requests.Response:
+    """Update an existing WordPress post by id (title/content/status/date...).
+
+    Used to regenerate a day's post in place, preserving the post ID, URL/slug,
+    and any comments — rather than delete+recreate (which orphans media and
+    breaks internal links). Returns the requests.Response.
+    """
+    return get_retry_session().post(
+        f"{WP_URL}/wp-json/wp/v2/posts/{post_id}", headers=get_auth_header(),
+        json=post_data, timeout=20)
+
+
+def get_posts_by_date(date_str: str, status: str = "publish") -> list[dict]:
+    """Fetch published posts whose date matches ``date_str`` (YYYY-MM-DD).
+
+    Returns a list of post dicts (id, title, link, date). Used to locate and
+    delete/recreate a day's post when regenerating charts or content.
+    """
+    headers = get_auth_header()
+    posts = []
+    page = 1
+    while True:
+        url = (f"{WP_URL}/wp-json/wp/v2/posts"
+               f"?per_page=100&page={page}&status={status}"
+               f"&after={date_str}T00:00:00&before={date_str}T23:59:59"
+               f"&_fields=id,title,link,date,status")
+        try:
+            resp = get_retry_session().get(url, headers=headers, timeout=20)
+        except Exception as e:
+            logger.warning("get_posts_by_date request failed: %s", e)
+            break
+        if resp.status_code != 200:
+            logger.warning("get_posts_by_date status %s: %s", resp.status_code, resp.text[:200])
+            break
+        batch = resp.json()
+        if not batch:
+            break
+        posts.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return posts
+
+
+def delete_post(post_id: int) -> bool:
+    """Permanently delete a WordPress post by id.
+
+    Returns True on success (HTTP 200). Uses ``force=true`` so the post is
+    removed entirely rather than trashed, which is required before recreating a
+    post with the same date/slug.
+    """
+    url = f"{WP_URL}/wp-json/wp/v2/posts/{post_id}?force=true"
+    try:
+        resp = get_retry_session().delete(url, headers=get_auth_header(), timeout=20)
+        if resp.status_code == 200:
+            logger.info("Deleted post %s.", post_id)
+            return True
+        logger.error("Delete post %s failed: %s - %s", post_id, resp.status_code, resp.text[:200])
+        return False
+    except Exception as e:
+        logger.error("Delete post %s error: %s", post_id, e)
+        return False
+
+
 def add_json_ld_schema(content: str, schema: dict) -> str:
     """Append an injected JSON-LD BlogPosting schema script to post content."""
     schema_json = json.dumps(schema, indent=2)
