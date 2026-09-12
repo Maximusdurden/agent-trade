@@ -8,6 +8,12 @@ load_dotenv(override=True)
 # Risk Management Parameters
 MAX_TRADE_ALLOCATION_PCT = 0.10  # Max % of equity per trade
 MAX_TICKER_ALLOCATION_PCT = 0.30  # Max % of equity per ticker (new)
+# Oversized-losing-position guardrail: when a held position is at/above this
+# fraction of MAX_TICKER_ALLOCATION_PCT AND trading below its average entry
+# (a losing, oversized book), force a full-exit SELL so the system de-risks
+# instead of scaling into a falling position (e.g. DOT/USD 2026-09-11/12).
+# 1.0 = only when the position is at the full per-ticker cap.
+FORCE_EXIT_AT_CAP_FRACTION = float(os.getenv("FORCE_EXIT_AT_CAP_FRACTION", "1.0"))
 DAILY_LOSS_LIMIT_PCT = 0.05  # Max daily equity drawdown before blocking buys
 MIN_CASH_BUFFER_PCT = 0.20  # Minimum cash reserve % of equity
 MIN_SELL_VALUE = float(os.getenv("MIN_SELL_VALUE", "50.0"))  # Min $ value of a SELL position; dust below this is fully liquidated

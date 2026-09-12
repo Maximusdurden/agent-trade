@@ -153,6 +153,46 @@ class RiskGuardrails:
                 f"Adding to a losing position is the MS dip-add failure mode. "
                 f"Use SELL/HOLD to de-risk instead of averaging down.")
 
+    def _oversized_losing_position_reason(self, symbol: str, current_price: float,
+                                          current_positions: dict, equity: float) -> str | None:
+        """Return a reason if a held position is oversized AND losing (force-exit).
+
+        The DOT/USD failure (2026-09-11/12) was a position scaled in all day to
+        ~29% of equity (at the 30% per-ticker cap) while price fell below entry.
+        The brain kept generating BUY-the-dip signals (blocked by the cap) and
+        never emitted a SELL, so the oversized losing book was never de-risked.
+
+        This guardrail detects that state: a held position at/above
+        ``FORCE_EXIT_AT_CAP_FRACTION`` of the per-ticker cap AND trading below its
+        average entry. When present, it forces a full-exit SELL so the system
+        de-risks instead of scaling into a falling position.
+
+        Returns a reason string when a force-exit is warranted, else None.
+        """
+        if current_price <= 0 or equity <= 0:
+            return None
+        pos = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+        if not isinstance(pos, dict):
+            return None
+        owned_qty = float(pos.get("qty", 0.0) or 0.0)
+        avg_entry = float(pos.get("avg_entry_price", 0.0) or 0.0)
+        if owned_qty <= 0 or avg_entry <= 0:
+            return None
+        # Only force-exit a LOSING position (price below avg entry).
+        if current_price >= avg_entry:
+            return None
+        position_value = owned_qty * current_price
+        cap_value = equity * config.MAX_TICKER_ALLOCATION_PCT
+        threshold = cap_value * float(getattr(config, "FORCE_EXIT_AT_CAP_FRACTION", 1.0))
+        if position_value < threshold:
+            return None
+        drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0
+        return (f"Force-exit: {symbol} is an oversized losing position "
+                f"(${position_value:,.2f} >= {config.FORCE_EXIT_AT_CAP_FRACTION*100:.0f}% of "
+                f"the {config.MAX_TICKER_ALLOCATION_PCT*100:.0f}% per-ticker cap) and trading "
+                f"{drawdown_pct:.1f}% below its ${avg_entry:.2f} avg entry. "
+                f"De-risking with a full exit instead of scaling into a falling position.")
+
     def _circuit_breaker_reason(self, symbol: str) -> str | None:
         """Return a rejection reason if a BUY to ``symbol`` should be blocked.
 
@@ -478,6 +518,25 @@ class RiskGuardrails:
         # Cycle-level limits: enforce MAX_TRADES_PER_CYCLE + cumulative budget.
         # cycle_context is shared across all decisions in this cycle.
         cycle_context = cycle_context if isinstance(cycle_context, dict) else {}
+
+        # 0. Oversized-losing-position force-exit (2026-09-12). Checked FIRST so
+        # it overrides even a HOLD/NO_ACTION decision. If a held position is
+        # at/above the per-ticker cap AND trading below its average entry, force
+        # a full-exit SELL. This prevents the DOT/USD trap: a position scaled in
+        # to ~29% of equity while price fell below entry, where the brain kept
+        # emitting BUY-the-dip signals (blocked by the cap) and never generated a
+        # SELL to de-risk.
+        _fx_price = float(decision.get("current_price", 0.0) or 0.0)
+        _fx_equity = float(account_state.get("equity", 0.0) or 0.0)
+        force_exit_reason = self._oversized_losing_position_reason(
+            symbol, _fx_price, current_positions, _fx_equity
+        )
+        if force_exit_reason:
+            held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+            owned_qty = float(held.get("qty", 0.0) or 0.0) if isinstance(held, dict) else 0.0
+            adjusted_decision["action"] = "SELL"
+            adjusted_decision["quantity"] = owned_qty
+            return True, f"Approved: {force_exit_reason}", adjusted_decision
 
         # 1. HOLD/NO_ACTION requires no guardrail checks
         if action in ("HOLD", "NO_ACTION"):
@@ -878,7 +937,20 @@ class RiskGuardrails:
                 
             max_ticker_value = equity * config.MAX_TICKER_ALLOCATION_PCT
             total_proposed_value = existing_position_value + proposed_trade_value
-            
+
+            # If the position is ALREADY at/above the per-ticker cap, reject the
+            # BUY outright with a clear message (instead of scaling to 0). The
+            # brain keeps re-emitting BUY-the-dip signals on an oversized position
+            # (e.g. DOT/USD at ~29% of equity); a hard rejection makes it obvious
+            # the position is maxed out and should be managed (SELL/HOLD), not added to.
+            if existing_position_value >= max_ticker_value:
+                adjusted_decision["quantity"] = 0.0
+                return False, (f"Rejected: {symbol} position (${existing_position_value:,.2f}) "
+                               f"is already at/above the per-ticker limit of "
+                               f"{config.MAX_TICKER_ALLOCATION_PCT*100:.0f}% of equity "
+                               f"(${max_ticker_value:,.2f}). No further BUYs allowed; "
+                               f"manage the position with SELL/HOLD."), adjusted_decision
+
             if total_proposed_value > max_ticker_value:
                 max_allowed_value = max(0, max_ticker_value - existing_position_value)
                 # Fractional quantities preserved for both crypto and equities (see note above).

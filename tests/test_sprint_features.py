@@ -220,7 +220,7 @@ class TestSprintFeatures(unittest.TestCase):
         )
         self.assertFalse(approved)
         self.assertEqual(adj_dec["quantity"], 0.0)
-        self.assertIn("would exceed the per-ticker limit of 30.0% of equity", msg)
+        self.assertIn("already at/above the per-ticker limit", msg)
 
     def test_daily_cadence_flag_persists_successfully_via_db(self):
         # Use the module-level DB functions (which respect DATABASE_PATH) rather
