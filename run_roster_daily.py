@@ -22,6 +22,14 @@ sys.path.insert(0, PROJECT_ROOT)
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=True)
 
+# Wire error -> Jira ticket creation (same as runner.py). Any logger.error() /
+# logger.critical() in the roster pipeline files a Jira bug ticket.
+try:
+    from core import logger_setup
+    logger_setup.setup_logging(app_name="agent-trade-roster", env="production")
+except Exception as _e:
+    print(f"[run_roster_daily] Jira logging setup failed: {_e}", file=sys.stderr)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Daily ticker roster update")

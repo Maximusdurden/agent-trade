@@ -122,6 +122,20 @@ Get-Content $EnvPath | ForEach-Object {
         }
     }
 }
+# Jira credentials so the blog job's error->Jira logging (run_blog.py ->
+# logger_setup.setup_logging) can file bug tickets. config.py reads JIRA_URL.
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+Get-Content $EnvPath | ForEach-Object {
+    $Line = $_.Trim()
+    if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
+        $Parts = $Line.Split("=", 2)
+        $Key = $Parts[0].Trim()
+        $Val = $Parts[1].Trim().Trim("'`"")
+        if ($JiraKeys -contains $Key -and $Val -and -not $Val.StartsWith("your_")) {
+            $EnvVariablesList += "$Key=$Val"
+        }
+    }
+}
 $SecretReferences = @(
     "WP_USER=WP_USER:latest",
     "WP_APP_PASSWORD=WP_APP_PASSWORD:latest",

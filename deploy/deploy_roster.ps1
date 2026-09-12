@@ -102,8 +102,9 @@ $EnvVariablesList = @(
     "GCS_BUCKET_NAME=$GcsBucket",
     "DATABASE_FILENAME=/tmp/trading_agent.db"
 )
-# Jira credentials (for the weekly audit ticket) from .env if present.
-$JiraKeys = @("JIRA_PROJECT_KEY", "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# Jira credentials (for error->Jira logging + the weekly audit ticket) from .env.
+# NOTE: config.py reads JIRA_URL (not JIRA_SITE), so we must pass JIRA_URL.
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {

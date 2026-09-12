@@ -19,4 +19,11 @@ from tools.blog_update import main
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    # Wire error -> Jira ticket creation (same as runner.py). Any logger.error()
+    # / logger.critical() in the blog pipeline files a Jira bug ticket.
+    try:
+        from core import logger_setup
+        logger_setup.setup_logging(app_name="agent-trade-blog", env="production")
+    except Exception as e:
+        print(f"[run_blog] Jira logging setup failed: {e}", file=sys.stderr)
     raise SystemExit(main())
