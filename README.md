@@ -15,6 +15,8 @@ It includes a native, zero-setup **Mock Mode** fallback so you can try out the t
 - **SQLite Audit DB**: Automatically records every market condition, LLM reasoning thought process, final decision, and filled order details for retro-analysis.
 - **Flexible Execution**: Command-line arguments supporting single-cycle dry runs, live single executions, or continuous loop operations.
 - **Automated Daily Blog (Treat Motivated Capital)**: Ported from `dexter-trader`, the blog publisher turns each day's round-trips into a polished WordPress post (market intro, per-ticker blurbs, a Dexter performance card, and a yearly calendar). The voice is **persona-swappable** — change `BLOG_PERSONA` and the next post is written in a completely different voice with no code edits. See [docs/blog_and_personas.md](docs/blog_and_personas.md).
+- **Ticker Promotion/Relegation**: Measures per-ticker performance from the cloud DB and automatically promotes/relegates tickers in `screener_pool.json` (daily recommendations + weekly pool edits). Includes a "what the agent is learning" report. See [Cloud Jobs & Scheduling](#cloud-jobs--scheduling-production).
+- **Cloud-Native Scheduling**: All jobs run on Google Cloud (Cloud Run + Cloud Scheduler) — trading agent, daily blog, and daily/weekly ticker roster. See [Cloud Jobs & Scheduling](#cloud-jobs--scheduling-production).
 
 ---
 
@@ -44,10 +46,11 @@ agent-trade/
 │                         #   + broker-side executed orders (dexter cutover)
 │
 ├── deploy/               # Deployment Automation
-│   ├── deploy_cloud.ps1  # Cloud Run job + Cloud Scheduler deploy
+│   ├── deploy_cloud.ps1  # Cloud Run job + Cloud Scheduler deploy (trading agent)
 │   ├── deploy_blog.ps1   # Blog Cloud Run job + scheduler deploy
+│   ├── deploy_roster.ps1 # Ticker roster (daily + weekly) Cloud Run jobs + schedulers
 │   ├── deploy_dashboard.ps1 # Cloud Run dashboard deploy (reads dexter creds from .env)
-│   ├── create_task.ps1   # PowerShell Windows Scheduled Task registrar
+│   ├── create_task.ps1   # PowerShell Windows Scheduled Task registrar (LEGACY, retired)
 │   ├── Dockerfile.blog   # Blog image (entrypoint run_blog.py)
 │   ├── cloudbuild_blog.yaml # Blog cloud build config
 │   └── _create_blog_secrets.py # Creates WP/LLM Secret Manager secrets
@@ -74,7 +77,10 @@ agent-trade/
 │   ├── get_correct_balances.py    # Alpaca cash ledger & balance backfill tool
 │   ├── validate_db.py             # DB integrity validation (schema, orphans, data)
 │   ├── snapshot_compare.py        # pre/post-change snapshot capture & comparison
-│   └── run_validation.py          # validation runner (lint + dry-run + pytest + DB)
+│   ├── run_validation.py          # validation runner (lint + dry-run + pytest + DB)
+│   ├── ticker_promotion_relegation.py # tiering engine (PROMOTE/KEEP/WATCH/RELEGATE)
+│   ├── ticker_learning_report.py     # "what the agent is learning" per-ticker digest
+│   └── refresh_performance_reports.py # one-shot refresh of all performance reports
 │
 ├── core/                 # (blog support lives alongside the trading engine)
 │   ├── personas.py       # swappable blog voices (dexter/oracle/rookie/pirate/derrick)
@@ -86,6 +92,8 @@ agent-trade/
 │   └── seo.py            # per-post SEO audit + metadata generation
 │
 ├── run_blog.py           # Blog Cloud Run job entrypoint (publishes daily post)
+├── run_roster_daily.py   # Roster daily Cloud Run job entrypoint (recommendations + learning)
+├── run_roster_weekly.py  # Roster weekly Cloud Run job entrypoint (applies pool edits)
 │
 └── tests/                # Code Quality and Sanity Verification Tests
     ├── test_universe_guardrail.py # strict-universe guardrail tests
@@ -258,7 +266,63 @@ pirate, derrick), the branding rule, and the Cloud Run deployment
 
 ---
 
-## Windows Scheduled Task Deployment (Production)
+## ☁️ Cloud Jobs & Scheduling (Production)
+
+The live system runs entirely on **Google Cloud** as Cloud Run Jobs triggered by
+Cloud Schedulers. There are **four** jobs, each deployed by its own PowerShell
+script in `deploy/`:
+
+| Job | Entrypoint | Scheduler | Schedule (UTC) | Purpose | Deploy script |
+|-----|-----------|-----------|----------------|---------|---------------|
+| `agent-trade-job` | `runner.py` | `agent-trade-scheduler` | `*/15 * * * *` | Trading agent cycle (every 15 min, 24/7) | `deploy_cloud.ps1` |
+| `dexter-blog-update` | `run_blog.py` | `dexter-blog-scheduler` | `30 20 * * 1-5` | Daily WordPress blog post (8:30pm ET weekdays) | `deploy_blog.ps1` |
+| `ticker-roster-daily` | `run_roster_daily.py` | `ticker-roster-daily-scheduler` | `0 1 * * *` | Daily roster recommendations + learning report + Discord | `deploy_roster.ps1` |
+| `ticker-roster-weekly` | `run_roster_weekly.py` | `ticker-roster-weekly-scheduler` | `0 1 * * 6` | Weekly pool edits (promote/relegate) + upload to GCS | `deploy_roster.ps1` |
+
+> **Note on cron timezone:** Scheduler cron is expressed in **UTC**. The roster
+> jobs run at `0 1 * * *` / `0 1 * * 6` = **9:00pm ET** during EDT (Mar–Nov).
+> During EST (Nov–Mar) flip to `0 2 * * *` / `0 2 * * 6`.
+
+### Ticker Roster (Promotion / Relegation)
+
+The roster system measures per-ticker performance from the authoritative cloud DB
+and promotes/relegates tickers in `screener_pool.json`:
+
+- **Daily** (`ticker-roster-daily`): computes decay-weighted per-ticker stats,
+  classifies each ticker into **PROMOTE / KEEP / WATCH / RELEGATE**, generates the
+  "what the agent is learning" report (`reports/ticker_learning_report.md`), and
+  sends a Discord summary. It does **not** edit the pool.
+- **Weekly** (`ticker-roster-weekly`): applies the pool changes (removes chronic
+  losers, adds proven winners) and **uploads the edited pool to GCS** so the
+  runtime pool updates without an image rebuild.
+
+**Policy (Balanced):**
+- **RELEGATE** if `>=5` closed round-trips AND (`win rate < 25%` OR `expectancy < −$50`).
+- **PROMOTE** if not in pool, `>=5` RTs, `win rate >= 60%`, positive expectancy.
+- **WATCH** if high win rate but net-negative PnL (asymmetry) or marginal.
+- Safety: a ticker with an **open/held position is never relegated**.
+
+**Manual usage:**
+```powershell
+> python tools/ticker_promotion_relegation.py            # dry-run (default)
+> python tools/ticker_promotion_relegation.py --apply    # write screener_pool.json
+> python tools/ticker_promotion_relegation.py --apply --upload-gcs --discord
+> python tools/ticker_learning_report.py --db cloud_downloaded_trading_agent.db
+> python tools/refresh_performance_reports.py            # refresh all reports
+```
+
+The roster engine reads from `cloud_downloaded_trading_agent.db` (the GCS
+snapshot), **not** the local `trading_agent.db` which is stale. Run
+`tools/pull_cloud_db.py` first to refresh the snapshot.
+
+---
+
+## ⚠️ Windows Scheduled Task Deployment (LEGACY — retired)
+
+> **Deprecated.** The production system now runs on Google Cloud (see
+> [Cloud Jobs & Scheduling](#cloud-jobs--scheduling-production) above). The local
+> Windows Scheduled Task `AgentTradeRunner` was retired. This section is kept for
+> historical reference only.
 
 To run the agent-trade system continuously in production without keeping a terminal open, you can deploy it as a Windows Scheduled Task. 
 
