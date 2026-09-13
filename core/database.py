@@ -180,6 +180,10 @@ def init_db():
         # decisions: optional authoring model for the brain A/B experiment, so
         # per-tick outcomes can be attributed to the model that produced them.
         add_column_if_missing("decisions", "model", "TEXT")
+        # decisions: optional active equity entry-gate value (e.g. "rsi_max=50")
+        # for the entry-gate A/B experiment, so round-trips can be attributed to
+        # the gate threshold that opened them.
+        add_column_if_missing("decisions", "entry_gate", "TEXT")
         add_column_if_missing("trades", "option_type", "TEXT")
         add_column_if_missing("trades", "option_dte", "INTEGER")
         add_column_if_missing("trades", "strike", "REAL")
@@ -200,7 +204,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
                  is_approved: bool, rejection_reason: str | None = None,
                  direction: str | None = None, conviction: float | None = None,
                  instrument: str | None = None, cycle_id: str | None = None,
-                 reasoning: str | None = None, model: str | None = None) -> int:
+                 reasoning: str | None = None, model: str | None = None,
+                 entry_gate: str | None = None) -> int:
     """Logs the LLM decision to the SQLite database and returns the decision ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -208,8 +213,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             INSERT INTO decisions (
                 timestamp, ticker_indicators, portfolio_state, thought_process,
                 proposed_action, proposed_symbol, proposed_qty, is_approved, rejection_reason,
-                direction, conviction, instrument, cycle_id, reasoning, model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                direction, conviction, instrument, cycle_id, reasoning, model, entry_gate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             json.dumps(ticker_indicators),
@@ -225,7 +230,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             instrument,
             cycle_id,
             reasoning,
-            model
+            model,
+            entry_gate
         ))
         conn.commit()
         return get_last_insert_id(cursor)

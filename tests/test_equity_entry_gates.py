@@ -153,5 +153,65 @@ class TestEquityOpenBuyCap(unittest.TestCase):
         self.assertTrue(ok, f"Crypto should be exempt from open-buy cap: {msg}")
 
 
+class TestEquityRsiEntryGateAB(unittest.TestCase):
+    """Entry-gate A/B: alternates the RSI threshold per day and stamps it."""
+
+    def setUp(self):
+        init_db()
+        _clean()
+        _set_watchlist(["MSFT", "NVDA", "KO"])
+        import core.feedback as fb
+        fb._memo.clear()
+        self._orig_ab = getattr(config, "EQUITY_RSI_ENTRY_AB_VALUES", "")
+        self._orig_max = getattr(config, "EQUITY_RSI_ENTRY_MAX", 50)
+
+    def tearDown(self):
+        config.EQUITY_RSI_ENTRY_AB_VALUES = self._orig_ab
+        config.EQUITY_RSI_ENTRY_MAX = self._orig_max
+
+    def _buy(self, symbol, rsi=None, qty=1.0, price=100.0):
+        indicators = {}
+        if rsi is not None:
+            indicators["rsi_14"] = rsi
+        decision = {"action": "BUY", "symbol": symbol, "quantity": qty,
+                    "current_price": price, "conviction": 0.8,
+                    "direction": "bullish", "instrument": "stock",
+                    "indicators": indicators}
+        guardrails = RiskGuardrails()
+        guardrails.is_market_open_check = lambda: (True, "open")
+        return guardrails.validate_and_adjust_decision(
+            decision,
+            {"equity": 100000.0, "cash": 50000.0, "unrealized_pnl": 0.0},
+            {},
+        )
+
+    def test_ab_alternates_and_stamps(self):
+        """With A/B values set, the gate alternates per day and stamps the value."""
+        config.EQUITY_RSI_ENTRY_AB_VALUES = "50,45"
+        g = RiskGuardrails()
+        # The active value is deterministic per UTC date; just verify it's one of
+        # the two configured values and that it's stamped on the decision.
+        active = g._active_rsi_entry_max()
+        self.assertIn(active, (50.0, 45.0))
+        ok, msg, adj = self._buy("MSFT", rsi=40.0)
+        self.assertTrue(ok, f"RSI 40 should be allowed: {msg}")
+        self.assertIn("entry_gate", adj)
+        self.assertTrue(adj["entry_gate"].startswith("rsi_max="))
+
+    def test_ab_no_values_uses_default(self):
+        """Without A/B values, the gate uses EQUITY_RSI_ENTRY_MAX."""
+        config.EQUITY_RSI_ENTRY_AB_VALUES = ""
+        config.EQUITY_RSI_ENTRY_MAX = 50
+        g = RiskGuardrails()
+        self.assertEqual(g._active_rsi_entry_max(), 50.0)
+
+    def test_ab_single_value_uses_default(self):
+        """A single A/B value (not two) falls back to EQUITY_RSI_ENTRY_MAX."""
+        config.EQUITY_RSI_ENTRY_AB_VALUES = "50"
+        config.EQUITY_RSI_ENTRY_MAX = 50
+        g = RiskGuardrails()
+        self.assertEqual(g._active_rsi_entry_max(), 50.0)
+
+
 if __name__ == "__main__":
     unittest.main()

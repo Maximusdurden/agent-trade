@@ -205,6 +205,16 @@ MIN_EDGE_SIGMA = float(os.getenv("MIN_EDGE_SIGMA", "0.5"))
 #    where the chronic losers (KO 0%, PG 0%) live. Crypto is exempt (24/7, no
 #    RSI mean-reversion edge). 0 disables the gate.
 EQUITY_RSI_ENTRY_MAX = float(os.getenv("EQUITY_RSI_ENTRY_MAX", "50"))
+# Entry-gate A/B experiment (Phase 5): when EQUITY_RSI_ENTRY_AB_VALUES is a
+# non-empty, comma-separated list of TWO RSI thresholds, the RSI entry gate
+# alternates between them per UTC date (round-robin), and each decision is
+# stamped with the active threshold so round-trips can be attributed to the
+# gate that opened them (via the decisions table). This directly tests the
+# equity edge: does a tighter gate (e.g. 45) beat the current 50? If unset,
+# the gate uses EQUITY_RSI_ENTRY_MAX (current behavior).
+EQUITY_RSI_ENTRY_AB_VALUES = os.getenv("EQUITY_RSI_ENTRY_AB_VALUES", "")
+# Optional experiment label so harness reports can name the trial.
+EQUITY_RSI_ENTRY_AB_LABEL = os.getenv("EQUITY_RSI_ENTRY_AB_LABEL", "rsi50-vs-rsi45")
 #
 # 7. Open-position churn cap (Phase 5): cap the number of OPEN (unclosed) BUYs
 #    per symbol per day. The closed-RT circuit breaker and round-trip budget are

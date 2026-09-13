@@ -719,6 +719,7 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                 cycle_id=cycle_id,
                 reasoning=reasoning,
                 model=adjusted_decision.get("model"),
+                entry_gate=adjusted_decision.get("entry_gate"),
             )
         except Exception as e:
             logger.error(f"Failed to log decision to DB: {e}")

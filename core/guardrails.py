@@ -487,6 +487,24 @@ class RiskGuardrails:
                     f"HOLD to avoid trading noise.")
         return None
 
+    def _active_rsi_entry_max(self) -> float:
+        """Return the active RSI entry-max threshold for today.
+
+        If EQUITY_RSI_ENTRY_AB_VALUES is a comma-separated list of thresholds,
+        alternate between them per UTC date (round-robin) so the equity edge can
+        be A/B tested. Otherwise return EQUITY_RSI_ENTRY_MAX (current behavior).
+        """
+        ab = str(getattr(config, "EQUITY_RSI_ENTRY_AB_VALUES", "") or "").strip()
+        if ab:
+            values = [v.strip() for v in ab.split(",") if v.strip()]
+            if len(values) >= 2:
+                try:
+                    day_index = datetime.utcnow().date().toordinal() % len(values)
+                    return float(values[day_index])
+                except (ValueError, TypeError):
+                    pass
+        return float(getattr(config, "EQUITY_RSI_ENTRY_MAX", 50))
+
     def _equity_rsi_entry_reason(self, symbol: str, action: str,
                                  indicators: dict | None) -> str | None:
         """Return a rejection reason if an equity BUY chases momentum (high RSI).
@@ -495,12 +513,16 @@ class RiskGuardrails:
         lives at RSI ~37-44 (pullback to support): RSI 40-50 = +$751 / 83% win,
         while RSI>=50 momentum entries are where the chronic losers (KO 0%, PG
         0%) live. This deterministic gate blocks a NEW equity BUY when the
-        14-period RSI is at or above EQUITY_RSI_ENTRY_MAX. Crypto is exempt
+        14-period RSI is at or above the active RSI entry max. Crypto is exempt
         (24/7, no RSI mean-reversion edge). 0 disables.
+
+        When EQUITY_RSI_ENTRY_AB_VALUES is set (comma-separated thresholds), the
+        gate alternates between them per UTC date (round-robin) so the equity
+        edge can be A/B tested (e.g. does a tighter 45 beat 50?).
         """
         if action != "BUY":
             return None
-        max_rsi = float(getattr(config, "EQUITY_RSI_ENTRY_MAX", 50))
+        max_rsi = self._active_rsi_entry_max()
         if max_rsi <= 0:
             return None
         # Crypto exempt: 24/7 market, no RSI mean-reversion edge.
@@ -1087,8 +1109,11 @@ class RiskGuardrails:
                 return False, scale_in_reason, adjusted_decision
 
             # Equity RSI entry gate (Phase 5): block a NEW equity BUY that chases
-            # momentum (RSI >= EQUITY_RSI_ENTRY_MAX). The real-data edge lives at
+            # momentum (RSI >= active RSI entry max). The real-data edge lives at
             # RSI ~37-44; RSI>=50 is where KO/PG (0% win) live. Crypto exempt.
+            # Stamp the active gate value so the A/B harness can attribute
+            # round-trips to the gate that opened them.
+            adjusted_decision["entry_gate"] = f"rsi_max={self._active_rsi_entry_max():g}"
             rsi_entry_reason = self._equity_rsi_entry_reason(symbol, action, indicators)
             if rsi_entry_reason:
                 adjusted_decision["quantity"] = 0.0
