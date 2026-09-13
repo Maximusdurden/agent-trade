@@ -472,6 +472,88 @@ class RiskGuardrails:
                     f"HOLD to avoid trading noise.")
         return None
 
+    def _equity_rsi_entry_reason(self, symbol: str, action: str,
+                                 indicators: dict | None) -> str | None:
+        """Return a rejection reason if an equity BUY chases momentum (high RSI).
+
+        Phase 5: real-data backtest (2026-09-13, 434 RTs) showed the equity edge
+        lives at RSI ~37-44 (pullback to support): RSI 40-50 = +$751 / 83% win,
+        while RSI>=50 momentum entries are where the chronic losers (KO 0%, PG
+        0%) live. This deterministic gate blocks a NEW equity BUY when the
+        14-period RSI is at or above EQUITY_RSI_ENTRY_MAX. Crypto is exempt
+        (24/7, no RSI mean-reversion edge). 0 disables.
+        """
+        if action != "BUY":
+            return None
+        max_rsi = float(getattr(config, "EQUITY_RSI_ENTRY_MAX", 50))
+        if max_rsi <= 0:
+            return None
+        # Crypto exempt: 24/7 market, no RSI mean-reversion edge.
+        if "/" in normalize_symbol(symbol):
+            return None
+        if not indicators:
+            return None
+        rsi = indicators.get("rsi_14")
+        if rsi is None:
+            return None  # RSI gated -> no entry gate
+        if rsi >= max_rsi:
+            return (f"Rejected: Equity RSI entry gate. {symbol} RSI {rsi:.0f} >= "
+                    f"EQUITY_RSI_ENTRY_MAX {max_rsi:.0f}. Buying momentum (RSI>=50) "
+                    f"is where the chronic losers live (KO/PG 0% win). Wait for "
+                    f"pullback to support (RSI ~37-44) instead.")
+        return None
+
+    def _equity_open_buy_cap_reason(self, symbol: str, action: str) -> str | None:
+        """Return a rejection reason if a symbol has too many OPEN buys today.
+
+        Phase 5: the closed-RT circuit breaker and round-trip budget are
+        REACTIVE (they only fire after RTs close), so a cold-start churn — PG
+        bought 18x in 2 days before any RT closed (9/03-9/04, all 15 sells on
+        9/08) — slips through. This counts today's OPEN buys (no matching sell
+        yet) and blocks new BUYs once EQUITY_OPEN_BUY_CAP_PER_DAY is hit.
+        Crypto exempt. 0 disables.
+        """
+        if action != "BUY":
+            return None
+        cap = int(getattr(config, "EQUITY_OPEN_BUY_CAP_PER_DAY", 3))
+        if cap <= 0:
+            return None
+        if "/" in normalize_symbol(symbol):
+            return None
+        try:
+            from core import database
+            recent = database.get_recent_trades(limit=200)
+            sym = normalize_symbol(symbol)
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            # Count buys and sells separately (order-independent) so the result
+            # doesn't depend on get_recent_trades' sort order. Open buys = buys
+            # minus sells (floored at 0).
+            buys = 0
+            sells = 0
+            for t in recent:
+                if normalize_symbol(t.get("symbol", "")) != sym:
+                    continue
+                ts = str(t.get("timestamp", ""))
+                if not ts.startswith(today):
+                    continue
+                side = str(t.get("side", "")).lower()
+                status = str(t.get("status", ""))
+                if status not in ("filled", "partially_filled"):
+                    continue
+                if side == "buy":
+                    buys += 1
+                elif side == "sell":
+                    sells += 1
+            open_buys = max(0, buys - sells)
+            if open_buys >= cap:
+                return (f"Rejected: Open-buy churn cap. {symbol} has {open_buys} "
+                        f"open BUY(s) today >= EQUITY_OPEN_BUY_CAP_PER_DAY {cap}. "
+                        f"Cold-start churn guard: stop adding to a position before "
+                        f"any round-trip closes (PG failure mode).")
+        except Exception as err:
+            logger.error(f"Error checking open-buy cap for {symbol}: {err}")
+        return None
+
     def _round_trip_budget_reason(self, symbol: str, action: str) -> str | None:
         """Return a rejection reason if the symbol has hit its daily round-trip budget.
 
@@ -988,6 +1070,23 @@ class RiskGuardrails:
             if scale_in_reason:
                 adjusted_decision["quantity"] = 0.0
                 return False, scale_in_reason, adjusted_decision
+
+            # Equity RSI entry gate (Phase 5): block a NEW equity BUY that chases
+            # momentum (RSI >= EQUITY_RSI_ENTRY_MAX). The real-data edge lives at
+            # RSI ~37-44; RSI>=50 is where KO/PG (0% win) live. Crypto exempt.
+            rsi_entry_reason = self._equity_rsi_entry_reason(symbol, action, indicators)
+            if rsi_entry_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, rsi_entry_reason, adjusted_decision
+
+            # Open-buy churn cap (Phase 5): block a NEW equity BUY when the symbol
+            # already has EQUITY_OPEN_BUY_CAP_PER_DAY open buys today. Closes the
+            # cold-start gap where the closed-RT breaker can't fire yet (PG bought
+            # 18x in 2 days before any RT closed). Crypto exempt.
+            open_buy_reason = self._equity_open_buy_cap_reason(symbol, action)
+            if open_buy_reason:
+                adjusted_decision["quantity"] = 0.0
+                return False, open_buy_reason, adjusted_decision
 
             # Per-ticker loss / whipsaw circuit breaker: block re-entering a
             # symbol that has repeatedly lost money or whipsaws, so the strategy

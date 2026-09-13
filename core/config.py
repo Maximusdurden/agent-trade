@@ -197,6 +197,22 @@ DAY_DIRECTION_LOCK_MOVE_PCT = float(os.getenv("DAY_DIRECTION_LOCK_MOVE_PCT", "0.
 #    Only applies when the normalized edge (edge_sigma) is available (VWAP
 #    valid). 0 disables the gate.
 MIN_EDGE_SIGMA = float(os.getenv("MIN_EDGE_SIGMA", "0.5"))
+#
+# 6. Equity RSI entry gate (Phase 5): block a NEW equity BUY when the 14-period
+#    RSI is at or above EQUITY_RSI_ENTRY_MAX (momentum chase). Real-data backtest
+#    (2026-09-13, 434 RTs) showed the equity edge lives at RSI ~37-44 (pullback
+#    to support): RSI 40-50 = +$751 / 83% win, while RSI>=50 momentum entries are
+#    where the chronic losers (KO 0%, PG 0%) live. Crypto is exempt (24/7, no
+#    RSI mean-reversion edge). 0 disables the gate.
+EQUITY_RSI_ENTRY_MAX = float(os.getenv("EQUITY_RSI_ENTRY_MAX", "50"))
+#
+# 7. Open-position churn cap (Phase 5): cap the number of OPEN (unclosed) BUYs
+#    per symbol per day. The closed-RT circuit breaker and round-trip budget are
+#    REACTIVE (they only fire after RTs close), so a cold-start churn — PG bought
+#    18x in 2 days before any RT closed (9/03-9/04, all 15 sells on 9/08) — slips
+#    through. This counts today's OPEN buys (no matching sell yet) and blocks new
+#    BUYs once the cap is hit. 0 disables.
+EQUITY_OPEN_BUY_CAP_PER_DAY = int(os.getenv("EQUITY_OPEN_BUY_CAP_PER_DAY", "3"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 

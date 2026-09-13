@@ -70,7 +70,9 @@ class TestCryptoMinNotionalGuardrail(unittest.TestCase):
             "action": "BUY", "symbol": symbol, "quantity": qty,
             "current_price": price, "conviction": 0.9,
             "direction": "bullish", "instrument": "stock",
-            "indicators": {"rsi_14": 50.0},
+            # RSI 40 (below EQUITY_RSI_ENTRY_MAX=50) so the equity RSI entry gate
+            # doesn't fire and mask the whole-share floor this test targets.
+            "indicators": {"rsi_14": 40.0},
         }
         return self.g.validate_and_adjust_decision(decision, self.account, {}, {})
 
