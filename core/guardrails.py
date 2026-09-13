@@ -350,6 +350,31 @@ class RiskGuardrails:
                     f"around VWAP.")
         return None
 
+    def _min_edge_sigma_reason(self, symbol: str, action: str,
+                               indicators: dict | None) -> str | None:
+        """Return a rejection reason if a BUY/SELL lacks volatility-normalized edge.
+
+        Phase 2: the brain is told to "buy below VWAP / sell above VWAP", but a
+        raw VWAP distance can be noise (the KO failure mode: +0.1-0.8% VWAP on a
+        low-vol name). This deterministic gate requires the price to be at least
+        MIN_EDGE_SIGMA ATRs from VWAP (|vwap_dist| / ATR). Only applies when the
+        normalized edge (edge_sigma) is present (VWAP valid). 0 disables.
+        """
+        if action not in ("BUY", "SELL"):
+            return None
+        min_edge = float(getattr(config, "MIN_EDGE_SIGMA", 0.5))
+        if min_edge <= 0 or not indicators:
+            return None
+        edge = indicators.get("edge_sigma")
+        if edge is None:
+            return None  # VWAP gated -> no edge floor
+        if edge < min_edge:
+            return (f"Rejected: Insufficient normalized edge. {symbol} is only "
+                    f"{edge:.2f} ATRs from VWAP (MIN_EDGE_SIGMA {min_edge:.2f}). "
+                    f"That distance is inside the noise band — not a real signal. "
+                    f"HOLD to avoid trading noise.")
+        return None
+
     def _round_trip_budget_reason(self, symbol: str, action: str) -> str | None:
         """Return a rejection reason if the symbol has hit its daily round-trip budget.
 
@@ -726,6 +751,14 @@ class RiskGuardrails:
         if vwap_reason:
             adjusted_decision["quantity"] = 0.0
             return False, vwap_reason, adjusted_decision
+
+        # 3d-1b. Normalized-edge floor (Phase 2): block BUY/SELL when the price
+        # is inside the noise band (too few ATRs from VWAP). Makes the KO lesson
+        # a computed gate instead of prose.
+        edge_sigma_reason = self._min_edge_sigma_reason(symbol, action, indicators)
+        if edge_sigma_reason:
+            adjusted_decision["quantity"] = 0.0
+            return False, edge_sigma_reason, adjusted_decision
 
         # 3d-2. Minimum-edge gate for reversals (Fix 5).
         edge_reason = self._min_edge_reason(symbol, action, current_price)

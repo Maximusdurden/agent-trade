@@ -238,6 +238,36 @@ class MetaStrategist:
             if instrument_hint:
                 logger.info(f"Instrument Hint: {instrument_hint}\n")
 
+    @staticmethod
+    def _classify_daily_regime(df) -> str:
+        """Estimate a daily-granularity market regime from OHLC bars.
+
+        The intraday classifier (data_provider.classify_regime) needs SMA-20/ATR/
+        VWAP which the strategist's daily bars don't carry, so this is a lighter
+        daily proxy: a sustained 20-day SMA slope => trend; otherwise range.
+        Returns TRENDING_UP / TRENDING_DOWN / RANGING.
+        """
+        try:
+            if df is None or len(df) < 20:
+                return "RANGING"
+            closes = df["close"]
+            sma20 = closes.rolling(window=20).mean().dropna()
+            if len(sma20) < 5:
+                return "RANGING"
+            price = float(closes.iloc[-1])
+            if price <= 0:
+                return "RANGING"
+            recent = sma20.tail(5)
+            slope_per_day = (float(recent.iloc[-1]) - float(recent.iloc[0])) / (len(recent) - 1)
+            slope_pct = slope_per_day / price * 100.0
+            if slope_pct >= 0.15:
+                return "TRENDING_UP"
+            if slope_pct <= -0.15:
+                return "TRENDING_DOWN"
+            return "RANGING"
+        except Exception:
+            return "RANGING"
+
     def _summarize_bars(self, df) -> str:
         """Utility to convert recent candles into a dense textual representation."""
         if df.empty:
@@ -254,8 +284,10 @@ class MetaStrategist:
         closes = df["close"]
         price_change_pct = (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100
         volatility = closes.pct_change().std() * 100
+        regime = self._classify_daily_regime(df)
         
         summary += f"\n30-Day Technical Overview:\n"
+        summary += f"- MARKET REGIME (daily proxy): {regime}\n"
         summary += f"- 30-Day Price Change: {price_change_pct:.2f}%\n"
         summary += f"- 30-Day Volatility (std dev of daily returns): {volatility:.2f}%\n"
         summary += f"- 30-Day Max High: ${df['high'].max():.2f} | 30-Day Min Low: ${df['low'].min():.2f}\n"
@@ -333,7 +365,11 @@ You are the Lead Quantitative Portfolio Strategist for an elite AI trading desk.
 "{yesterdays_rules}"
 
 DIRECTIONS:
-1. Review the daily price candles, 30-day volatility, and trends. Is the ticker trending, range-bound, overbought, or oversold?
+1. Review the daily price candles, 30-day volatility, and trends. Is the ticker trending, range-bound, overbought, or oversold? The MARKET REGIME line gives a daily proxy (TRENDING_UP / TRENDING_DOWN / RANGING). Write the rule to match ONE coherent edge for that regime:
+   - TRENDING_UP: momentum rule — buy strength, do NOT write a dip-buy/scale-in rule.
+   - TRENDING_DOWN: do NOT write a "buy the falling knife" rule; prefer a high-conviction bearish view or a conservative hold/exit.
+   - RANGING: mean-reversion rule — buy the lower band, sell the upper band, with a strong entry threshold (NOT a sub-1% VWAP blip, which is noise).
+   Your rule MUST include a concrete, guardrail-adjustable knob (VWAP threshold, RSI band, allocation %, or holding-time exit) and MUST NOT restate yesterday's rule verbatim.
 2. Audit the trade outcomes. Were our recent trades profitable? Did we experience whipsaws or losses?
 3. Decide if yesterday's rules are working, or if they need adjustment to match the current market regime. 
 4. Review the STRUCTURED PERFORMANCE FEEDBACK section carefully. Your rules MUST adapt based on these concrete, decay-weighted outcomes:

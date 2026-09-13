@@ -5,6 +5,104 @@ from core.alpaca_client import AlpacaClient
 
 logger = logging.getLogger("DataProvider")
 
+# Regime classification constants. These define a deterministic, volatility-
+# aware market-regime classifier so the brain and strategist get ONE coherent
+# instruction per ticker instead of contradictory momentum-vs-reversion signals.
+# - REGIME_TREND_SLOPE_LOOKBACK: bars used to estimate the SMA-20 slope (trend
+#   strength). A longer window distinguishes a SUSTAINED trend from a sharp blip.
+# - REGIME_TREND_MIN_SLOPE_PCT: min |slope| (as % of price per bar) to call a trend.
+# - REGIME_RANGE_BAND_SIGMA: Bollinger width (in ATR units) below which = ranging.
+# - REGIME_BREAKOUT_MOVE_SIGMA: recent 3-bar move / ATR above which = breakout
+#   (a SHARP move, distinct from a sustained trend).
+REGIME_TREND_SLOPE_LOOKBACK = 10
+REGIME_TREND_MIN_SLOPE_PCT = 0.10   # ~0.10% of price per bar sustained
+REGIME_RANGE_BAND_SIGMA = 2.5       # Bollinger width in ATR units
+REGIME_BREAKOUT_MOVE_SIGMA = 2.0    # recent 3-bar move / ATR
+REGIME_BREAKOUT_MOVE_BARS = 3
+
+
+def classify_regime(df: pd.DataFrame) -> str:
+    """Classify a symbol's current market regime from its indicator frame.
+
+    Returns one of: ``TRENDING_UP``, ``TRENDING_DOWN``, ``RANGING``, ``BREAKOUT``.
+
+    Logic (deterministic, volatility-normalized):
+      1. BREAKOUT: a SHARP recent move — the close moved >= REGIME_BREAKOUT_MOVE_SIGMA
+         ATRs over the last REGIME_BREAKOUT_MOVE_BARS bars. This is a strong,
+         overextended move (mean-reversion setup), distinct from a sustained trend.
+      2. Else TRENDING_UP / TRENDING_DOWN: a SUSTAINED SMA-20 slope over a longer
+         window (>= REGIME_TREND_MIN_SLOPE_PCT per bar).
+      3. Else RANGING: no strong signal (or a narrow Bollinger band relative to ATR).
+      4. Fallback: RANGING.
+
+    ``df`` must already have SMA-20, ATR-14, VWAP and Bollinger columns (i.e. it
+    has been through ``_add_technical_indicators``). Returns "RANGING" on any
+    missing/insufficient data so callers fail safe.
+    """
+    if df is None or len(df) < 20:
+        return "RANGING"
+    try:
+        close = df["close"]
+        sma20 = df["sma_20"]
+        atr = df["atr_14"]
+        b_upper = df["bollinger_upper"]
+        b_lower = df["bollinger_lower"]
+    except KeyError:
+        return "RANGING"
+
+    latest = df.iloc[-1]
+    price = float(latest["close"])
+    atr_v = float(latest["atr_14"]) if not pd.isna(latest["atr_14"]) else 0.0
+
+    # 1. Breakout: a SHARP recent move relative to volatility.
+    if atr_v > 0 and len(close) > REGIME_BREAKOUT_MOVE_BARS:
+        recent_move = abs(float(close.iloc[-1]) - float(close.iloc[-1 - REGIME_BREAKOUT_MOVE_BARS]))
+        if (recent_move / atr_v) >= REGIME_BREAKOUT_MOVE_SIGMA:
+            return "BREAKOUT"
+
+    # 2. Trend: SUSTAINED SMA-20 slope over a longer window.
+    lookback = min(REGIME_TREND_SLOPE_LOOKBACK, len(sma20.dropna()))
+    if lookback >= 3:
+        recent = sma20.dropna().tail(lookback)
+        if len(recent) >= 3 and price > 0:
+            slope_per_bar = (float(recent.iloc[-1]) - float(recent.iloc[0])) / (len(recent) - 1)
+            slope_pct = slope_per_bar / price * 100.0
+            if slope_pct >= REGIME_TREND_MIN_SLOPE_PCT:
+                return "TRENDING_UP"
+            if slope_pct <= -REGIME_TREND_MIN_SLOPE_PCT:
+                return "TRENDING_DOWN"
+
+    # 3. Range: narrow Bollinger band relative to ATR.
+    if atr_v > 0 and not pd.isna(latest["bollinger_upper"]) and not pd.isna(latest["bollinger_lower"]):
+        band_width = float(latest["bollinger_upper"]) - float(latest["bollinger_lower"])
+        if band_width > 0 and (band_width / atr_v) < REGIME_RANGE_BAND_SIGMA:
+            return "RANGING"
+
+    return "RANGING"
+
+
+def normalized_edge_sigma(df: pd.DataFrame) -> float | None:
+    """Return the volatility-normalized distance from VWAP: |vwap_dist| / ATR.
+
+    This is the "how much edge exists relative to noise" metric. A value >= 1.0
+    means the price is a full ATR away from VWAP (a real move); a value < 0.5 is
+    inside the noise band (the KO failure mode). Returns None when VWAP/ATR are
+    not yet valid (early session) so callers can treat it as "no signal".
+    """
+    if df is None or len(df) < 20:
+        return None
+    try:
+        latest = df.iloc[-1]
+        price = float(latest["close"])
+        atr = float(latest["atr_14"]) if not pd.isna(latest["atr_14"]) else 0.0
+        vwap = float(latest["vwap"]) if not pd.isna(latest["vwap"]) else 0.0
+    except (KeyError, IndexError):
+        return None
+    if atr <= 0 or vwap <= 0:
+        return None
+    return abs(price - vwap) / atr
+
+
 class DataProvider:
     """Class responsible for fetching market data and calculating technical indicators."""
     
@@ -83,12 +181,24 @@ class DataProvider:
             except Exception as news_err:
                 logger.warning(f"Could not retrieve news for {symbol}: {news_err}")
 
+            # Regime classification + volatility-normalized edge (Phase 1/2).
+            # These give the brain/strategist ONE coherent instruction per ticker
+            # and a "how much edge vs noise" metric, instead of contradictory
+            # momentum-vs-reversion signals.
+            regime = classify_regime(df)
+            edge_sigma = normalized_edge_sigma(df)
+            # Only expose the normalized edge when VWAP is valid (same gating as
+            # the VWAP fields) so early-session "no signal" isn't misread as 0.
+            edge_sigma = edge_sigma if (vwap_valid and edge_sigma is not None) else None
+
             market_state = {
                 "symbol": symbol,
                 "current_price": float(latest["close"]),
                 "prev_close": prev_close_val,
                 "daily_return_pct": daily_return_pct,
                 "volume": int(latest["volume"]),
+                "regime": regime,
+                "edge_sigma": edge_sigma,
                 "indicators": {
                     "rsi_14": float(latest["rsi_14"]) if not pd.isna(latest["rsi_14"]) else None,
                     "sma_20": float(latest["sma_20"]) if not pd.isna(latest["sma_20"]) else None,
@@ -106,6 +216,8 @@ class DataProvider:
                     "vwap_dist_pct": float(latest["vwap_dist_pct"]) if (vwap_valid and not pd.isna(latest["vwap_dist_pct"])) else None,
                     "atr_14": float(latest["atr_14"]) if not pd.isna(latest["atr_14"]) else None,
                     "atr_pct": float(latest["atr_pct"]) if not pd.isna(latest["atr_pct"]) else None,
+                    "regime": regime,
+                    "edge_sigma": edge_sigma,
                 },
                 "advanced_pivots": pivots,
                 "news": news_data

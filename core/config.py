@@ -152,6 +152,14 @@ MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.3"))
 #    from the last fill — a real regime change, not noise.
 DAY_DIRECTION_LOCK_SIGMA = float(os.getenv("DAY_DIRECTION_LOCK_SIGMA", "1.0"))
 DAY_DIRECTION_LOCK_MOVE_PCT = float(os.getenv("DAY_DIRECTION_LOCK_MOVE_PCT", "0.5"))
+#
+# 5. Normalized-edge floor (Phase 2): a BUY/SELL requires the price to be at
+#    least MIN_EDGE_SIGMA ATRs away from VWAP (|vwap_dist| / ATR). This makes
+#    the KO lesson ("a sub-1% VWAP blip is noise") a COMPUTED gate instead of
+#    prose: a price inside the noise band (edge < floor) is not a real signal.
+#    Only applies when the normalized edge (edge_sigma) is available (VWAP
+#    valid). 0 disables the gate.
+MIN_EDGE_SIGMA = float(os.getenv("MIN_EDGE_SIGMA", "0.5"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 

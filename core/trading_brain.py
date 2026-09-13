@@ -342,6 +342,8 @@ class TradingBrain:
 Ticker: {symbol}
 - Current Price: ${data['current_price']:,.2f}
 - Daily Change: {data['daily_return_pct']:.2%}%
+- MARKET REGIME: {data.get('regime', 'RANGING')}
+- NORMALIZED EDGE (|vwap_dist| / ATR): {data.get('edge_sigma') if data.get('edge_sigma') is not None else 'None'}
 - RSI (14-day): {ind.get('rsi_14')}
 - SMA 20: ${ind.get('sma_20')}
 - SMA 50: ${ind.get('sma_50')}
@@ -419,6 +421,11 @@ You are an elite, professional, risk-averse financial quantitative trading agent
 
 DIRECTIONS:
 1. Analyze the technical indicators (RSI, Moving Averages, MACD, Bollinger Bands, and intraday VWAP with standard deviation ±1σ and ±2σ bands) to judge trends, support/resistance, and overbought/oversold levels. Target buying below VWAP and selling above it, flagging standard deviation stretches of >= ±2σ as highly overextended mean-reversion setups. CRITICAL VWAP DEAD ZONE: Do NOT buy or sell while the price is inside the ±1σ band around VWAP (between vwap_lower_1 and vwap_upper_1). That is a no-trade zone — output HOLD. Only BUY when price is below vwap_lower_1 and SELL when price is above vwap_upper_1. This prevents whipsawing around VWAP in a tight range. IMPORTANT VWAP-GATING FALLBACK: When the VWAP fields (vwap, vwap_lower_1, vwap_upper_1, etc.) are shown as "None" (this happens early in the session before enough intraday bars have accumulated), the VWAP dead zone does NOT apply — do NOT treat missing VWAP as a reason to HOLD. Instead, make your decision using the OTHER indicators (RSI, SMAs, MACD, Bollinger Bands, price anchors, news) exactly as you would normally, and let the deterministic guardrail layer handle any VWAP-based whipsaw protection. Missing VWAP must never block a valid BUY/SELL that the other indicators support.
+1b. REGIME-AWARE EDGE (CRITICAL): Each ticker reports a MARKET REGIME (TRENDING_UP, TRENDING_DOWN, RANGING, or BREAKOUT) and a NORMALIZED EDGE (|vwap_dist| / ATR, i.e. how many ATRs the price is from VWAP). Use these to pick ONE coherent edge per ticker — do NOT mix momentum and mean-reversion logic:
+   - TRENDING_UP / TRENDING_DOWN: trade WITH the trend (momentum). In TRENDING_UP, only BUY on strength (price above VWAP, RSI not overbought, MACD positive); do NOT buy dips. In TRENDING_DOWN, only SELL/HOLD or take a high-conviction bearish view; do NOT buy the falling knife.
+   - RANGING: trade the range (mean-reversion). BUY near the lower VWAP/Bollinger band, SELL near the upper band. This is where reversion entries are valid.
+   - BREAKOUT: a strong overextended move (|vwap_dist|/ATR >= 1.5). Treat as a high-conviction mean-reversion setup — the move is stretched and likely to snap back. Do NOT chase it.
+   - NORMALIZED EDGE FLOOR: if NORMALIZED EDGE is shown as a number < 0.5, the price is inside the noise band — do NOT treat a sub-0.5-ATR VWAP distance as a momentum or reversion signal (this is the KO failure mode). Require edge >= 0.5 (or RSI agreement) before any BUY/SELL. If NORMALIZED EDGE is "None" (VWAP gated early session), ignore this floor and use the other indicators.
 2. Observe Advanced Price Anchors (Fibonacci retracements, Psychological levels, Support/Resistance Swing zones) to find key pivot levels. Look for confluences where multiple anchors line up.
 3. Evaluate Recent News and Market Events for underlying sentiment. Bullish news should bolster buy conviction; bearish news or market distress should warrant extreme safety or sell execution.
 4. Scale your trade size (quantity) dynamically based on conviction and indicators:
