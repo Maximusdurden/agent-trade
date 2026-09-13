@@ -368,6 +368,40 @@ def status_cache_worker():
                 if not history:
                     history = get_portfolio_history()
 
+                # FIX (2026-09-13): Alpaca's portfolio-history endpoint can lag
+                # 1-2 days behind (no intraday points for today), which makes the
+                # 1D/5D Equity Valuation Curve render as a flat $100K dummy (the
+                # frontend falls back to a fake flat line when the filtered window
+                # is empty). The live account equity IS current, so append a real
+                # "now" point so today's window has data. This keeps the curve
+                # honest (real current equity) instead of a flat placeholder.
+                try:
+                    live_equity = float(account.get("equity", 0.0) or 0.0)
+                    if live_equity > 0:
+                        from datetime import datetime, timezone
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        # Only append if the newest history point is older than ~1h
+                        # (avoid stacking duplicate points when history is fresh).
+                        newest_ts = history[-1].get("timestamp", "") if history else ""
+                        stale = True
+                        if newest_ts:
+                            try:
+                                newest_dt = datetime.fromisoformat(str(newest_ts).replace("Z", "+00:00"))
+                                if newest_dt.tzinfo is None:
+                                    newest_dt = newest_dt.replace(tzinfo=timezone.utc)
+                                stale = (datetime.now(timezone.utc) - newest_dt).total_seconds() > 3600
+                            except Exception:
+                                stale = True
+                        if stale:
+                            history.append({
+                                "timestamp": now_iso,
+                                "equity": live_equity,
+                                "profit_loss": float(account.get("unrealized_pnl", 0.0) or 0.0),
+                                "profit_loss_pct": None,
+                            })
+                except Exception as live_err:
+                    print(f"[Dashboard Server] Failed to append live equity point: {live_err}", file=sys.stderr)
+
                 ticker_history = get_ticker_history()
 
                 try:
