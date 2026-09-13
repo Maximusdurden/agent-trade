@@ -1,22 +1,30 @@
-# Strategist Model A/B Experiment (deepseek-r1 vs Claude Sonnet)
+# Strategist Model A/B Experiment (gemini-2.5-flash vs Claude Sonnet)
 
-**Date:** 2026-09-02
-**Status:** Implemented (code), ready to observe. Re-deploy + let it run ~2-4 weeks.
+**Date:** 2026-09-02 (updated 2026-09-12)
+**Status:** Active. Re-deploy + let it run ~2-4 weeks.
 
 ## Why
-The MetaStrategist (the model that *writes* the per-ticker trading rules) runs on
-`deepseek/deepseek-r1`. Forensics showed the recent bad equity rules (MS dip-add, KO
-noise-momentum) were **agent-authored rule-design errors**, not market noise. Since the
-weak link is strategy-writing, we want to A/B the strategist model against a strong,
-more conservative candidate (Claude Sonnet) and measure which one writes rules that
-actually perform — instead of swapping blind.
+The MetaStrategist (the model that *writes* the per-ticker trading rules) is the
+weak link in strategy quality. Forensics showed the recent bad equity rules (MS
+dip-add, KO noise-momentum) were **agent-authored rule-design errors**, not market
+noise. We A/B the strategist model against a strong, more conservative candidate
+(Claude Sonnet) and measure which one writes rules that actually perform — instead
+of swapping blind.
+
+> **2026-09-12 change:** the original control `deepseek/deepseek-r1` was removed
+> because it is slow/503-prone on OpenRouter (TMCL-896..902), which exhausted the
+> LLM budget and produced "empty rule" failures. The control is now the reliable
+> `google/gemini-2.5-flash` (the daily-driver model the strategist already ran on).
+> Also fixed a bug where `explicit_model` was never forwarded to the underlying
+> completion call, so **both arms were silently running the same tier-default
+> model** — the experiment was non-functional until this fix.
 
 ## How it works
 
 1. `core/config.py` defines the experiment:
    ```python
-   STRATEGIST_AB_MODELS = "deepseek/deepseek-r1,anthropic/claude-sonnet-5"  # default
-   STRATEGIST_AB_LABEL  = "r1-vs-sonnet"
+   STRATEGIST_AB_MODELS = "google/gemini-2.5-flash,anthropic/claude-sonnet-5"  # default
+   STRATEGIST_AB_LABEL  = "flash-vs-sonnet"
    ```
    A comma-separated list of **two** OpenRouter model ids.
 
@@ -25,7 +33,7 @@ actually perform — instead of swapping blind.
    `generate_structured(..., explicit_model=...)`, bypassing the tier→model map.
 
 3. Every logged rule carries the authoring model in `strategy_history.strategy_version`:
-   `v<timestamp>|model=anthropic-claude-sonnet-5` (or `deepseek-deepseek-r1`).
+   `v<timestamp>|model=anthropic-claude-sonnet-5` (or `google-gemini-2.5-flash`).
 
 4. `tools/strategist_ab_report.py` re-attributes each closed round-trip to the model
    that authored the **active rule at entry time**, and reports win rate / PnL /
@@ -33,7 +41,7 @@ actually perform — instead of swapping blind.
 
 ## Toggling
 - **Default:** the two-model experiment is ON if `STRATEGIST_AB_MODELS` is unset
-  (falls back to the hardcoded `deepseek/deepseek-r1,anthropic/claude-sonnet-5`).
+  (falls back to the hardcoded `google/gemini-2.5-flash,anthropic/claude-sonnet-5`).
 - **Disable / single model:** set `STRATEGIST_AB_MODELS` to a single id, or the
   existing `STRATEGIST_MODEL_TIER` flow resumes (no `explicit_model`).
 - **Swap the variant:** edit the env var (e.g. `anthropic/claude-sonnet-5` → another id)
@@ -58,10 +66,8 @@ The strict-universe / anti-scale-in / low-win-rate guardrails apply **to both ar
 equally**, so any measured difference reflects the *model's* rule-quality, not risk
 control.
 
-## Other model levers worth considering (not yet implemented)
-- **Brain model** (currently `gemini-2.5-flash` `daily_driver`) is your high-frequency
-  decision-maker. A `gemini-2.5-pro` brain is a separate A/B worth doing after the
-  strategist one, since it changes per-tick actions, not just daily rules.
-- **Reasoning vs speed:** `deepseek-r1` is a reasoning model (slower, more "confident").
-  Claude Sonnet and Gemini Pro are typically more conservative on risk prose. The A/B
-  directly tests whether "more conservative strategist" beats "more confident strategist."
+## Brain (executor) A/B — separate experiment
+The TradingBrain (high-frequency per-tick decision-maker) has its own A/B, since it
+changes per-tick actions, not daily rules, and must be measured independently. See
+`docs/brain_model_ab.md`. It uses `BRAIN_AB_MODELS` and stamps each decision with the
+authoring model in the `decisions.model` column.

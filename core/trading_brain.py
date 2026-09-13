@@ -53,6 +53,9 @@ class TradingBrain:
     def __init__(self):
         self.provider = config.LLM_PROVIDER
         self.is_mock = False
+        # Selected OpenRouter model id for THIS run (None => tier_mapping default).
+        # Drives the brain A/B experiment (BRAIN_AB_MODELS).
+        self.ab_model = None
         
         if self.provider == "openrouter":
             try:
@@ -96,6 +99,27 @@ class TradingBrain:
         else:
             logger.warning(f"Unsupported provider '{self.provider}'. Falling back to rule-based brain.")
             self.is_mock = True
+
+        # Pick this run's model from the brain A/B list, if configured.
+        if not self.is_mock and self.provider == "openrouter":
+            self.ab_model = self._pick_ab_model()
+
+    @staticmethod
+    def _pick_ab_model() -> str | None:
+        """Round-robin select an OpenRouter model for this brain run.
+
+        If BRAIN_AB_MODELS is a comma-separated list of models, alternate
+        between them day-to-day (based on UTC date) and return the chosen model
+        id. Returns None to use the configured tier default (no experiment).
+        """
+        raw = getattr(config, "BRAIN_AB_MODELS", "") or ""
+        models = [m.strip() for m in raw.split(",") if m.strip()]
+        if len(models) < 2:
+            return None
+        # Deterministic day-alternation: even/odd UTC date -> first/second model.
+        from datetime import datetime
+        day_index = datetime.utcnow().date().toordinal() % len(models)
+        return models[day_index]
 
     @staticmethod
     def _normalize_decision(decision: dict) -> dict:
@@ -141,6 +165,18 @@ class TradingBrain:
             decision[f] = float(v) if v is not None else None
         return decision
 
+    def _stamp_model(self, decisions: list[dict]) -> list[dict]:
+        """Attach the authoring model id to each decision for A/B attribution.
+
+        Uses the A/B-selected model when present, else the resolved tier default
+        (so even non-experiment runs are attributable). The runner reads this
+        back and persists it to the decisions table.
+        """
+        model = self.ab_model or getattr(config, "BRAIN_MODEL_TIER", "daily_driver")
+        for d in decisions:
+            d["model"] = model
+        return decisions
+
     def make_decision(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict]) -> list[dict]:
         """
         Formulates the prompt, calls the LLM (or mock fallback), and returns a
@@ -159,10 +195,12 @@ class TradingBrain:
                     prompt=prompt,
                     response_model=TradingDecisionSet,
                     tier=config.BRAIN_MODEL_TIER,
-                    max_output_tokens=config.BRAIN_MAX_OUTPUT_TOKENS
+                    max_output_tokens=config.BRAIN_MAX_OUTPUT_TOKENS,
+                    explicit_model=self.ab_model
                 )
                 raw_decisions = result.get("decisions", []) if isinstance(result, dict) else []
                 decisions = [self._normalize_decision(d) for d in raw_decisions if isinstance(d, dict)]
+                decisions = self._stamp_model(decisions)
                 logger.info(f"Brain generated {len(decisions)} per-ticker decision(s).")
                 for d in decisions:
                     logger.info(f"  -> {d['action']} {d['quantity']} {d['symbol']} | dir={d['direction']} conv={d['conviction']}")
@@ -204,6 +242,7 @@ class TradingBrain:
             else:
                 raw_decisions = []
             decisions = [self._normalize_decision(d) for d in raw_decisions if isinstance(d, dict)]
+            decisions = self._stamp_model(decisions)
             logger.info(f"Brain generated {len(decisions)} per-ticker decision(s).")
             for d in decisions:
                 logger.info(f"  -> {d['action']} {d['quantity']} {d['symbol']} | dir={d['direction']} conv={d['conviction']}")

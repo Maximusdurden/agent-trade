@@ -130,6 +130,7 @@ $AllowedRuntimeKeys = @(
     "MODEL_HEAVYWEIGHT", "MODEL_DAILY_DRIVER", "MODEL_UTILITY",
     "ACTIVE_MODEL_TIER", "BRAIN_MODEL_TIER", "STRATEGIST_MODEL_TIER",
     "STRATEGIST_AB_MODELS", "STRATEGIST_AB_LABEL",
+    "BRAIN_AB_MODELS", "BRAIN_AB_LABEL",
     "BRAIN_MAX_OUTPUT_TOKENS",
     "LLM_MAX_TOTAL_SECONDS",
     "TRADING_INTERVAL_MINUTES", "JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN",
@@ -164,7 +165,28 @@ Get-Content $EnvPath | ForEach-Object {
     }
 }
 
-$EnvString = [string]::Join(",", $EnvVariablesList)
+# Write env vars to a YAML file for --env-vars-file. This is REQUIRED because
+# --set-env-vars uses commas as the KEY=VALUE separator, which breaks any value
+# that itself contains a comma (e.g. STRATEGIST_AB_MODELS="a/b,c/d"). YAML
+# handles commas and special characters correctly.
+$EnvFile = Join-Path $StagingDir "env_vars.yaml"
+$EnvYamlLines = @()
+foreach ($Entry in $EnvVariablesList) {
+    $EqIdx = $Entry.IndexOf("=")
+    if ($EqIdx -lt 0) { continue }
+    $K = $Entry.Substring(0, $EqIdx)
+    $V = $Entry.Substring($EqIdx + 1)
+    # Quote values that contain characters YAML would interpret (commas, colons,
+    # #, leading/trailing spaces, etc.) to keep them literal strings.
+    if ($V -match '[:,:#{}\[\]&*!|>'"'"'%@`"\\]' -or $V -match '^\s|\s$') {
+        $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
+        $EnvYamlLines += "$K: `"$Escaped`""
+    } else {
+        $EnvYamlLines += "$K: $V"
+    }
+}
+$EnvYamlContent = [string]::Join("`n", $EnvYamlLines)
+[System.IO.File]::WriteAllText($EnvFile, $EnvYamlContent, [System.Text.Encoding]::UTF8)
 
 if ($JobExists) {
     Write-Host "Updating existing Cloud Run Job..."
@@ -178,7 +200,7 @@ if ($JobExists) {
         --task-timeout 10m `
         --memory 1Gi `
         --cpu 1 `
-        --set-env-vars $EnvString
+        --env-vars-file $EnvFile
 } else {
     Write-Host "Creating new Cloud Run Job..."
     gcloud run jobs create $JobName `
@@ -191,7 +213,7 @@ if ($JobExists) {
         --task-timeout 10m `
         --memory 1Gi `
         --cpu 1 `
-        --set-env-vars $EnvString
+        --env-vars-file $EnvFile
 }
 
 # 7. Create/Update Cloud Scheduler Job (Run every 15 minutes weekdays)

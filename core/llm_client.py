@@ -382,7 +382,8 @@ class SharedLLMClient:
                             prompt=prompt,
                             system_prompt=actual_system_prompt,
                             tier=tier,
-                            max_output_tokens=max_output_tokens
+                            max_output_tokens=max_output_tokens,
+                            explicit_model=explicit_model
                         )
                         logger.info(f"Attempt {retry_count + 1} with timeout: {attempt_timeout}s")
                         response_text = future.result(timeout=attempt_timeout)
@@ -461,7 +462,8 @@ class SharedLLMClient:
                             prompt=prompt,
                             system_prompt=actual_system_prompt,
                             tier=tier,
-                            max_output_tokens=max_output_tokens
+                            max_output_tokens=max_output_tokens,
+                            explicit_model=explicit_model
                         )
                         response_text = future.result(timeout=attempt_timeout)
                         logger.debug(f"Retry {retry_count} using timeout: {attempt_timeout}s")

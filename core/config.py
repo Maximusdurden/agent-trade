@@ -169,6 +169,21 @@ STRATEGIST_AB_MODELS = os.getenv("STRATEGIST_AB_MODELS", _ab_default)
 # Optional experiment label so harness reports can name the trial.
 STRATEGIST_AB_LABEL = os.getenv("STRATEGIST_AB_LABEL", "r1-vs-sonnet")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
+
+# Brain (executor) model A/B experiment.
+# The TradingBrain (the high-frequency per-tick decision-maker) normally runs on
+# BRAIN_MODEL_TIER (daily_driver -> gemini-2.5-flash). When BRAIN_AB_MODELS is a
+# non-empty, comma-separated list of TWO OpenRouter model ids, the brain
+# alternates between them per UTC date (round-robin), and each logged decision
+# carries the authoring model in the `decisions.model` column so outcomes can be
+# attributed per model. This is a SEPARATE experiment from the strategist A/B:
+# the brain changes per-tick actions, not daily rules, so it must be measured
+# independently. If unset, the brain uses BRAIN_MODEL_TIER (current behavior).
+# Default here: gemini-2.5-flash (control) vs gemini-2.5-pro (variant).
+_brain_ab_default = "google/gemini-2.5-flash,google/gemini-2.5-pro"
+BRAIN_AB_MODELS = os.getenv("BRAIN_AB_MODELS", _brain_ab_default)
+# Optional experiment label so harness reports can name the trial.
+BRAIN_AB_LABEL = os.getenv("BRAIN_AB_LABEL", "flash-vs-pro")
 # Max output tokens for the brain's per-ticker decision JSON. The brain emits one
 # verbose decision (with a long thought_process) per appraised ticker, so the
 # default 2048-token cap truncates the JSON mid-response and forces a rule-based

@@ -57,6 +57,9 @@ scratch/
 deploy/temp_staging_*/
 deploy/temp_staging_blog/
 
+# Generated env-vars YAML for Cloud Run (contains secrets from .env)
+deploy/env_vars.yaml
+
 # Cache & Temp files
 daily_cash_reconstructed.json
 detailed_search_results.json

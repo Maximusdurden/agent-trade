@@ -76,6 +76,30 @@ class TestTransientErrorRetry(unittest.TestCase):
                 client.generate_structured(prompt="test", response_model=dict, tier="daily_driver")
         self.assertEqual(calls["n"], 1, "non-transient error should not be retried")
 
+    def test_explicit_model_is_forwarded_to_execute_completion(self):
+        """Regression: the A/B override (explicit_model) must reach
+        _execute_completion. Previously generate_structured computed model_id
+        from explicit_model but never passed it to the executor.submit calls,
+        so _execute_completion re-resolved the tier default and silently ran
+        BOTH A/B arms on the same model."""
+        client = _make_client()
+        seen = {}
+
+        def capture(*a, **k):
+            seen["explicit_model"] = k.get("explicit_model")
+            return '{"key": "value"}'
+
+        client._execute_completion = capture
+        with patch.dict(os.environ, {"LLM_MAX_TOTAL_SECONDS": "30"}):
+            client.generate_structured(
+                prompt="test",
+                response_model=dict,
+                tier="daily_driver",
+                explicit_model="anthropic/claude-sonnet-5",
+            )
+        self.assertEqual(seen.get("explicit_model"), "anthropic/claude-sonnet-5",
+                         "explicit_model must be forwarded to _execute_completion")
+
 
 if __name__ == "__main__":
     unittest.main()

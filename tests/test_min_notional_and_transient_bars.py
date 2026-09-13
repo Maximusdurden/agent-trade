@@ -89,7 +89,13 @@ class TestCryptoMinNotionalGuardrail(unittest.TestCase):
 
     def test_equity_whole_share_floor_still_applies(self):
         # Equities keep the whole-share floor (not the crypto notional floor).
-        approved, reason, adjusted = self._buy("AAPL", 0.4, 200.0)
+        # The market-hours guardrail fires BEFORE the whole-share check on
+        # weekends / outside 9:30-16:00 ET, which would mask this assertion.
+        # Patch it to "market open" so the whole-share floor is what's tested.
+        from unittest.mock import patch
+        with patch("core.guardrails.RiskGuardrails.is_market_open_check",
+                   return_value=(True, "Market is open.")):
+            approved, reason, adjusted = self._buy("AAPL", 0.4, 200.0)
         self.assertFalse(approved)
         self.assertIn("whole share", reason)
 

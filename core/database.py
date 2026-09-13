@@ -177,6 +177,9 @@ def init_db():
         add_column_if_missing("decisions", "instrument", "TEXT")
         add_column_if_missing("decisions", "cycle_id", "TEXT")
         add_column_if_missing("decisions", "reasoning", "TEXT")
+        # decisions: optional authoring model for the brain A/B experiment, so
+        # per-tick outcomes can be attributed to the model that produced them.
+        add_column_if_missing("decisions", "model", "TEXT")
         add_column_if_missing("trades", "option_type", "TEXT")
         add_column_if_missing("trades", "option_dte", "INTEGER")
         add_column_if_missing("trades", "strike", "REAL")
@@ -197,7 +200,7 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
                  is_approved: bool, rejection_reason: str | None = None,
                  direction: str | None = None, conviction: float | None = None,
                  instrument: str | None = None, cycle_id: str | None = None,
-                 reasoning: str | None = None) -> int:
+                 reasoning: str | None = None, model: str | None = None) -> int:
     """Logs the LLM decision to the SQLite database and returns the decision ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -205,8 +208,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             INSERT INTO decisions (
                 timestamp, ticker_indicators, portfolio_state, thought_process,
                 proposed_action, proposed_symbol, proposed_qty, is_approved, rejection_reason,
-                direction, conviction, instrument, cycle_id, reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                direction, conviction, instrument, cycle_id, reasoning, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             json.dumps(ticker_indicators),
@@ -221,7 +224,8 @@ def log_decision(ticker_indicators: dict, portfolio_state: dict, thought_process
             conviction,
             instrument,
             cycle_id,
-            reasoning
+            reasoning,
+            model
         ))
         conn.commit()
         return get_last_insert_id(cursor)
