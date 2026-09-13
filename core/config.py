@@ -213,6 +213,16 @@ EQUITY_RSI_ENTRY_MAX = float(os.getenv("EQUITY_RSI_ENTRY_MAX", "50"))
 #    through. This counts today's OPEN buys (no matching sell yet) and blocks new
 #    BUYs once the cap is hit. 0 disables.
 EQUITY_OPEN_BUY_CAP_PER_DAY = int(os.getenv("EQUITY_OPEN_BUY_CAP_PER_DAY", "3"))
+#
+# 8. Equity per-position drawdown exit (Phase 5): force-exit a held equity
+#    position when it is down more than EQUITY_DRAWDOWN_EXIT_PCT from its average
+#    entry, regardless of position size. Catches the GOOG failure mode (9/03:
+#    ~$27k position, -$475, held 119h, not watchlisted) where a large position
+#    bleeds slowly and the brain never emits a SELL. The existing
+#    oversized-losing-position guardrail only fires at the per-ticker cap; this
+#    catches drawdown at any size. Crypto exempt (24/7, bracket TP/SL already
+#    handles it). 0 disables.
+EQUITY_DRAWDOWN_EXIT_PCT = float(os.getenv("EQUITY_DRAWDOWN_EXIT_PCT", "0.05"))
 BRAIN_MODEL_TIER = os.getenv("BRAIN_MODEL_TIER", "daily_driver")
 STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 

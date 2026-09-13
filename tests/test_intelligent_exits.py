@@ -49,6 +49,7 @@ class TestIntelligentExits(unittest.TestCase):
             "min_gain": getattr(config, "TRAIL_STOP_MIN_GAIN_PCT", 0),
             "rsi": getattr(config, "RSI_EXIT_OVERBOUGHT", 0),
             "scope": getattr(config, "EXIT_RULE_SCOPE", "equity_only"),
+            "drawdown": getattr(config, "EQUITY_DRAWDOWN_EXIT_PCT", 0),
         }
 
     def tearDown(self):
@@ -57,6 +58,7 @@ class TestIntelligentExits(unittest.TestCase):
         config.TRAIL_STOP_MIN_GAIN_PCT = self._orig["min_gain"]
         config.RSI_EXIT_OVERBOUGHT = self._orig["rsi"]
         config.EXIT_RULE_SCOPE = self._orig["scope"]
+        config.EQUITY_DRAWDOWN_EXIT_PCT = self._orig["drawdown"]
 
     def test_max_hold_exits_stale_position(self):
         """A position held past MAX_HOLD_HOURS is force-exited even on HOLD."""
@@ -76,6 +78,7 @@ class TestIntelligentExits(unittest.TestCase):
 
     def test_max_hold_not_exited_when_fresh(self):
         config.MAX_HOLD_HOURS = 168
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0  # isolate max-hold behavior
         fresh_ts = (datetime.utcnow() - timedelta(hours=10)).isoformat()
         with patch("core.database.get_recent_trades_by_symbol",
                    return_value=[{"side": "buy", "status": "filled",
@@ -133,6 +136,7 @@ class TestIntelligentExits(unittest.TestCase):
 
     def test_rsi_overbought_not_exited_when_losing(self):
         config.RSI_EXIT_OVERBOUGHT = 70
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0  # isolate RSI-exit behavior
         # Below entry -> not profitable, no RSI exit.
         approved, msg, adj = self.g.validate_and_adjust_decision(
             _decision("XOM", action="HOLD", qty=0.0, price=0.95,
@@ -146,12 +150,67 @@ class TestIntelligentExits(unittest.TestCase):
         config.MAX_HOLD_HOURS = 0
         config.TRAIL_STOP_GIVEBACK_PCT = 0
         config.RSI_EXIT_OVERBOUGHT = 0
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0
         approved, msg, adj = self.g.validate_and_adjust_decision(
             _decision("AAPL", action="HOLD", qty=0.0, price=1.04),
             _account(), _positions("AAPL", 100.0, 1.10)
         )
         self.assertTrue(approved)
         self.assertEqual(adj["action"], "HOLD")
+
+    def test_drawdown_exits_losing_position(self):
+        """A held equity down >5% from entry is force-exited (GOOG failure mode)."""
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        # Avg entry 1.00, now 0.93 -> 7% drawdown >= 5% -> force-exit.
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("GOOG", action="HOLD", qty=0.0, price=0.93),
+            _account(), _positions("GOOG", 80.0, 1.00)
+        )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "SELL")
+        self.assertEqual(adj["quantity"], 80.0)
+        self.assertIn("EQUITY_DRAWDOWN_EXIT_PCT", msg)
+
+    def test_drawdown_not_exited_when_small_loss(self):
+        """A small drawdown below the threshold is NOT force-exited."""
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        # Avg entry 1.00, now 0.98 -> 2% drawdown < 5% -> hold.
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("GOOG", action="HOLD", qty=0.0, price=0.98),
+            _account(), _positions("GOOG", 80.0, 1.00)
+        )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "HOLD")
+
+    def test_drawdown_not_exited_when_profitable(self):
+        """A position above entry is never drawdown-exited."""
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("GOOG", action="HOLD", qty=0.0, price=1.05),
+            _account(), _positions("GOOG", 80.0, 1.00)
+        )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "HOLD")
+
+    def test_drawdown_exit_disabled_by_default(self):
+        """EQUITY_DRAWDOWN_EXIT_PCT defaults to 0 (disabled) so no surprise exits."""
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("GOOG", action="HOLD", qty=0.0, price=0.90),
+            _account(), _positions("GOOG", 80.0, 1.00)
+        )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "HOLD")
+
+    def test_drawdown_exit_exempts_crypto(self):
+        """Crypto is exempt from the drawdown exit (bracket TP/SL handles it)."""
+        config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("SOL/USD", action="HOLD", qty=0.0, price=0.90),
+            _account(), _positions("SOL/USD", 100.0, 1.00)
+        )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "HOLD")  # crypto not drawdown-exited
 
     def test_equity_only_scope_exempts_crypto(self):
         """Backtest finding: crypto must be exempt from exit rules by default."""

@@ -288,6 +288,21 @@ class RiskGuardrails:
                         f"RSI_EXIT_OVERBOUGHT {rsi_exit:.0f}. Taking profit before "
                         f"mean-reversion.")
 
+        # 4. Equity per-position drawdown exit (Phase 5): force-exit a held
+        #    equity position down more than EQUITY_DRAWDOWN_EXIT_PCT from entry,
+        #    regardless of size. Catches the GOOG failure mode (9/03: ~$27k
+        #    position, -$475, held 119h, not watchlisted) where a large position
+        #    bleeds slowly and the brain never emits a SELL. Crypto exempt (24/7,
+        #    bracket TP/SL already handles it).
+        drawdown_exit = float(getattr(config, "EQUITY_DRAWDOWN_EXIT_PCT", 0))
+        if drawdown_exit > 0 and current_price < avg_entry:
+            drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0
+            if drawdown_pct >= drawdown_exit * 100.0:
+                return (f"Force-exit: {symbol} is down {drawdown_pct:.1f}% from its "
+                        f"${avg_entry:.2f} avg entry (>= EQUITY_DRAWDOWN_EXIT_PCT "
+                        f"{drawdown_exit*100:.0f}%). Cutting the loss before it "
+                        f"bleeds further (GOOG failure mode).")
+
         return None
 
     def _circuit_breaker_reason(self, symbol: str) -> str | None:
