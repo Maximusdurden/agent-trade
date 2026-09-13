@@ -160,6 +160,7 @@ class AlpacaClient:
                 "is_mock": True
             }
         
+        unrealized_pnl = 0.0
         try:
             account = self.trading_client.get_account()
             # Fetch active positions to calculate actual total unrealized profit/loss
@@ -182,6 +183,31 @@ class AlpacaClient:
                 "is_mock": False
             }
         except Exception as e:
+            # Retry transient timeouts (TMCL-937/938, 2026-09-13): a single Alpaca
+            # request timeout (code 50410000) used to abort the whole trading cycle
+            # because get_account_state() made one call and raised. Transient
+            # timeouts clear on their own, so retry a few times with backoff before
+            # giving up. Only retry genuinely transient errors; a real auth/account
+            # error should fail fast.
+            if _is_transient_data_error(e):
+                for attempt in range(3):
+                    logger.warning(
+                        f"Transient account-state fetch error (attempt {attempt+1}/3): {e}. Retrying..."
+                    )
+                    time.sleep(1 * (attempt + 1))
+                    try:
+                        account = self.trading_client.get_account()
+                        return {
+                            "cash": float(account.cash),
+                            "equity": float(account.equity),
+                            "buying_power": float(account.buying_power),
+                            "unrealized_pnl": unrealized_pnl,
+                            "is_mock": False
+                        }
+                    except Exception as retry_err:
+                        if attempt == 2:
+                            logger.error(f"Error fetching account info after retries: {retry_err}")
+                            raise retry_err
             logger.error(f"Error fetching account info: {e}")
             raise
 
