@@ -129,6 +129,20 @@ class MetaStrategist:
         day_index = datetime.utcnow().date().toordinal() % len(models)
         return models[day_index]
 
+    @staticmethod
+    def _norm_model_tag(model_id: str | None) -> str:
+        """Normalize a model id into a stable A/B attribution tag.
+
+        Both the daily and emergency strategist paths must stamp the SAME tag so
+        the A/B harness can group outcomes by model. The daily path historically
+        replaced '/' and '_' with '-' (deepseek/deepseek-r1 -> deepseek-deepseek-r1)
+        but the emergency path stored the raw id, splitting one model across two
+        buckets in the report. Centralize the normalization here.
+        """
+        if not model_id:
+            return "unknown"
+        return str(model_id).replace("/", "-").replace("_", "-")
+
     def run_daily_strategy_refinement(self, alpaca_client: AlpacaClient):
         """Runs the strategist routine for all relevant tickers (universe, holdings, and watchlist)."""
         logger.info("Executing daily strategy review and rule refinement...")
@@ -199,7 +213,7 @@ class MetaStrategist:
             # D. Log the new strategy into history. Embed the authoring model in
             # the version tag so the A/B harness can split outcomes by model.
             authored_by = result.get("ab_model") or (getattr(config, "STRATEGIST_MODEL_TIER", "heavyweight"))
-            model_tag = authored_by.replace("/", "-").replace("_", "-") if authored_by else "unknown"
+            model_tag = self._norm_model_tag(authored_by)
             instrument_hint = result.get("instrument_hint")
             # Normalize the hint to a safe value; only "option" is meaningful for
             # the brain's routing, everything else is treated as no authorization.
@@ -370,6 +384,11 @@ DIRECTIONS:
    - TRENDING_DOWN: do NOT write a "buy the falling knife" rule; prefer a high-conviction bearish view or a conservative hold/exit.
    - RANGING: mean-reversion rule — buy the lower band, sell the upper band, with a strong entry threshold (NOT a sub-1% VWAP blip, which is noise).
    Your rule MUST include a concrete, guardrail-adjustable knob (VWAP threshold, RSI band, allocation %, or holding-time exit) and MUST NOT restate yesterday's rule verbatim.
+1b. SELECTIVITY (critical — the PG failure mode): your entry thresholds MUST be tight enough that the rule fires only on a real setup, NOT on noise. A rule that is true "almost always" (e.g. "IF vwap_dist < +0.5% AND RSI < 65 THEN buy") makes the brain churn — it re-enters constantly and bleeds before any round-trip closes. Concretely:
+   - A VWAP-distance entry threshold must be at least ~1% (a sub-1% VWAP blip is noise, not a signal).
+   - An RSI entry cap must be tight (e.g. RSI below 40-50), NOT a loose "RSI below 65" that is true most of the time.
+   - Prefer a bounded RSI BAND (e.g. "buy when RSI is between 35 and 45") over a one-sided cap.
+   - If you cannot write a genuinely selective entry condition for this ticker, say so and recommend HOLD / no new BUY rather than a loose buy-always rule.
 2. Audit the trade outcomes. Were our recent trades profitable? Did we experience whipsaws or losses?
 3. Decide if yesterday's rules are working, or if they need adjustment to match the current market regime. 
 4. Review the STRUCTURED PERFORMANCE FEEDBACK section carefully. Your rules MUST adapt based on these concrete, decay-weighted outcomes:
@@ -512,7 +531,7 @@ Schema:
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
                 meta_reasoning=f"[EMERGENCY INTRADAY RE-EVALUATION] {result['meta_reasoning']}",
-                strategy_version=f"{next_strategy_version()}|model={result.get('ab_model') or 'default'}"
+                strategy_version=f"{next_strategy_version()}|model={self._norm_model_tag(result.get('ab_model'))}"
             )
             logger.info(f"Emergency rules updated for {ticker}. DB ID: {db_id}")
             logger.info(f"Emergency Rules: {todays_rules}\n")

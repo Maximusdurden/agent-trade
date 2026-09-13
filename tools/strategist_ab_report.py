@@ -33,6 +33,20 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 MODEL_RE = re.compile(r"\|\s*model=([^|]+)\s*$")
 
 
+def norm_model(model):
+    """Normalize a model id to a stable attribution key.
+
+    The strategist stamps model tags with '/' and '_' replaced by '-' (e.g.
+    deepseek/deepseek-r1 -> deepseek-deepseek-r1). Older/emergency rows may store
+    the raw id with '/', so normalize here so one model isn't split across two
+    buckets in the report.
+    """
+    m = (model or "").strip()
+    if not m or m == "unknown":
+        return "unknown"
+    return m.replace("/", "-").replace("_", "-")
+
+
 def norm(s):
     s = (s or "").strip().upper().replace("-", "/")
     return s
@@ -64,7 +78,7 @@ def load_strategy_models(db_path=None):
     by_ticker = defaultdict(list)
     for ts, ticker, rules, ver in rows:
         m = MODEL_RE.search(ver or "")
-        model = m.group(1) if m else "unknown"
+        model = norm_model(m.group(1) if m else "unknown")
         by_ticker[ticker.upper()].append((parse_dt(ts), model, rules))
     return by_ticker
 
