@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block commits that would persist a HALTED kill switch.
+#
+# kill_switch.json is a LOCAL CACHE that check_kill_switch() overwrites by
+# syncing from GCS, and that tests sometimes flip to "HALTED". Committing a
+# HALTED cache is almost always an accident (a test artifact), and if it lands
+# in the repo it can halt trading on any environment that falls back to the
+# local file. This hook refuses such commits unless the author explicitly
+# opts in with --no-verify (or sets ALLOW_HALTED_KILL_SWITCH=1).
+#
+# Install:  git config core.hooksPath .githooks
+# (or copy to .git/hooks/pre-commit)
+
+set -u
+
+KS_FILE="kill_switch.json"
+
+# Only care if the file is staged for commit.
+if ! git diff --cached --name-only --quiet -- "$KS_FILE"; then
+    # Read the STAGED (index) version, not the working copy.
+    STAGED_STATUS=$(git show :"$KS_FILE" 2>/dev/null | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | grep -o '"[^"]*"$' | tr -d '"')
+    if [ "$STAGED_STATUS" = "HALTED" ]; then
+        if [ "${ALLOW_HALTED_KILL_SWITCH:-0}" = "1" ]; then
+            echo "pre-commit: kill_switch.json is HALTED but ALLOW_HALTED_KILL_SWITCH=1, allowing commit."
+            exit 0
+        fi
+        echo "ERROR: Refusing to commit kill_switch.json with status=HALTED."
+        echo ""
+        echo "This file is a local cache that tests / GCS syncs can flip to HALTED."
+        echo "Committing it can halt trading. If this is intentional, re-run with:"
+        echo "    ALLOW_HALTED_KILL_SWITCH=1 git commit ..."
+        echo "or restore it first:"
+        echo "    git checkout -- $KS_FILE"
+        exit 1
+    fi
+fi
+
+exit 0
