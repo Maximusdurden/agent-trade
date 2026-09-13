@@ -48,6 +48,7 @@ class TestIntelligentExits(unittest.TestCase):
             "giveback": getattr(config, "TRAIL_STOP_GIVEBACK_PCT", 0),
             "min_gain": getattr(config, "TRAIL_STOP_MIN_GAIN_PCT", 0),
             "rsi": getattr(config, "RSI_EXIT_OVERBOUGHT", 0),
+            "scope": getattr(config, "EXIT_RULE_SCOPE", "equity_only"),
         }
 
     def tearDown(self):
@@ -55,6 +56,7 @@ class TestIntelligentExits(unittest.TestCase):
         config.TRAIL_STOP_GIVEBACK_PCT = self._orig["giveback"]
         config.TRAIL_STOP_MIN_GAIN_PCT = self._orig["min_gain"]
         config.RSI_EXIT_OVERBOUGHT = self._orig["rsi"]
+        config.EXIT_RULE_SCOPE = self._orig["scope"]
 
     def test_max_hold_exits_stale_position(self):
         """A position held past MAX_HOLD_HOURS is force-exited even on HOLD."""
@@ -150,6 +152,37 @@ class TestIntelligentExits(unittest.TestCase):
         )
         self.assertTrue(approved)
         self.assertEqual(adj["action"], "HOLD")
+
+    def test_equity_only_scope_exempts_crypto(self):
+        """Backtest finding: crypto must be exempt from exit rules by default."""
+        config.EXIT_RULE_SCOPE = "equity_only"
+        config.MAX_HOLD_HOURS = 168
+        old_ts = (datetime.utcnow() - timedelta(hours=200)).isoformat()
+        # A crypto position held past the max-hold is NOT force-exited when scoped
+        # to equity_only (the profitable crypto book keeps its long holds).
+        with patch("core.database.get_recent_trades_by_symbol",
+                   return_value=[{"side": "buy", "status": "filled",
+                                  "timestamp": old_ts, "filled_avg_price": 1.10}]):
+            approved, msg, adj = self.g.validate_and_adjust_decision(
+                _decision("SOL/USD", action="HOLD", qty=0.0, price=1.04),
+                _account(), _positions("SOL/USD", 100.0, 1.10)
+            )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "HOLD")  # crypto not force-exited
+
+    def test_all_scope_applies_to_crypto(self):
+        config.EXIT_RULE_SCOPE = "all"
+        config.MAX_HOLD_HOURS = 168
+        old_ts = (datetime.utcnow() - timedelta(hours=200)).isoformat()
+        with patch("core.database.get_recent_trades_by_symbol",
+                   return_value=[{"side": "buy", "status": "filled",
+                                  "timestamp": old_ts, "filled_avg_price": 1.10}]):
+            approved, msg, adj = self.g.validate_and_adjust_decision(
+                _decision("SOL/USD", action="HOLD", qty=0.0, price=1.04),
+                _account(), _positions("SOL/USD", 100.0, 1.10)
+            )
+        self.assertTrue(approved)
+        self.assertEqual(adj["action"], "SELL")  # crypto force-exited when scope=all
 
 
 if __name__ == "__main__":

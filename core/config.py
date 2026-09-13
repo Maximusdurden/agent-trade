@@ -79,20 +79,32 @@ CRYPTO_STOP_LOSS_PCT = float(os.getenv("CRYPTO_STOP_LOSS_PCT", "0.03"))
 # 1. Max-hold-time exit: force a full-exit SELL when a held position has been
 #    open longer than MAX_HOLD_HOURS. Prevents stale positions bleeding out
 #    (INTC held 16 days). 0 disables.
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "168"))  # 7 days
+#    BACKTEST (2026-09-13, real data): applying this to ALL symbols is NET
+#    HARMFUL — crypto (SOL/BTC/DOT) holds 200-400h profitably, and a 168h cap
+#    cost ~-$12k over the 2-month window. Even equity-only it's ~neutral.
+#    Therefore it defaults to DISABLED (0) until explicitly tuned + scoped.
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "0"))  # default disabled (see backtest)
 #
 # 2. Trailing-stop exit: if a position is in profit (price above avg entry) and
 #    has given back more than TRAIL_STOP_GIVEBACK_PCT of its peak gain, force a
 #    full-exit SELL to lock in remaining profit. Requires the position to have
 #    reached at least TRAIL_STOP_MIN_GAIN_PCT first (so we don't exit tiny
 #    winners). 0 disables.
-TRAIL_STOP_GIVEBACK_PCT = float(os.getenv("TRAIL_STOP_GIVEBACK_PCT", "0.50"))
+#    BACKTEST: net-negative when applied to all (cuts DOT/LTC winners); only a
+#    tiny positive edge when equity-only. Default DISABLED.
+TRAIL_STOP_GIVEBACK_PCT = float(os.getenv("TRAIL_STOP_GIVEBACK_PCT", "0"))
 TRAIL_STOP_MIN_GAIN_PCT = float(os.getenv("TRAIL_STOP_MIN_GAIN_PCT", "0.03"))
 #
 # 3. RSI-overbought exit: if a held position is in profit AND RSI is overbought
 #    (>= RSI_EXIT_OVERBOUGHT), force a full-exit SELL to take profit before the
 #    mean-reversion. 0 disables.
 RSI_EXIT_OVERBOUGHT = float(os.getenv("RSI_EXIT_OVERBOUGHT", "0"))  # disabled by default
+#
+# 4. Exit-rule scope: when "equity_only", the intelligent-exit guardrails only
+#    apply to non-crypto symbols. This keeps the profitable crypto book (which
+#    benefits from long holds) from being cut by these rules. "all" applies to
+#    everything. "equity_only" is the safe default.
+EXIT_RULE_SCOPE = os.getenv("EXIT_RULE_SCOPE", "equity_only").lower()
 
 # Minimum crypto order notional (USD). Alpaca rejects crypto orders whose cost
 # basis is below its per-pair minimum with

@@ -215,6 +215,13 @@ class RiskGuardrails:
         if owned_qty <= 0 or avg_entry <= 0:
             return None
 
+        # Scope: default "equity_only" so the profitable crypto book (long holds)
+        # is never cut by these rules. The backtest showed applying them to all
+        # symbols is net-harmful.
+        scope = str(getattr(config, "EXIT_RULE_SCOPE", "equity_only")).lower()
+        if scope == "equity_only" and "/" in normalize_symbol(symbol):
+            return None  # skip crypto when scoped to equity only
+
         # 1. Max-hold-time exit: stale position bleeding out.
         max_hold = float(getattr(config, "MAX_HOLD_HOURS", 0))
         if max_hold > 0:
