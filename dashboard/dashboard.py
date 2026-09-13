@@ -355,13 +355,27 @@ def status_cache_worker():
                 # timestamps for today), then append any daily points that fall
                 # OUTSIDE the intraday window so the long-term curve is preserved.
                 # Dedupe by timestamp, keep chronological order.
+                #
+                # FIX (2026-09-13): Alpaca's portfolio-history endpoint LAGS 1-2
+                # days behind (no intraday points for today), so the 1D/5D curve
+                # was blank/flat. The LOCAL portfolio_history table (logged by the
+                # runner every ~15 min) HAS today's intraday points. Merge those
+                # in too so today's curve shows real movement (esp. for crypto,
+                # which trades 24/7). Prefer local intraday for the recent window,
+                # Alpaca for the long-term curve.
+                local_history = get_portfolio_history()
                 history = []
                 seen = set()
-                for item in (intraday_history + daily_history):
+                for item in (intraday_history + daily_history + local_history):
                     ts = item.get("timestamp")
                     if ts in seen:
                         continue
                     seen.add(ts)
+                    # Normalize: local rows use 'unrealized_pnl', Alpaca uses
+                    # 'profit_loss'. Expose both so the frontend pnl metric works.
+                    if "unrealized_pnl" in item and "profit_loss" not in item:
+                        item = dict(item)
+                        item["profit_loss"] = item.get("unrealized_pnl")
                     history.append(item)
                 history.sort(key=lambda it: it.get("timestamp", ""))
 
