@@ -193,6 +193,96 @@ class RiskGuardrails:
                 f"{drawdown_pct:.1f}% below its ${avg_entry:.2f} avg entry. "
                 f"De-risking with a full exit instead of scaling into a falling position.")
 
+    def _intelligent_exit_reason(self, symbol: str, current_price: float,
+                                 current_positions: dict, indicators: dict | None) -> str | None:
+        """Return a reason if a held position should be force-exited (Phase 4).
+
+        Deterministic exit guardrails that complement the broker TP/SL brackets
+        and the brain's re-decisions. Targets the two documented equity failures:
+          - INTC (464h hold, exited at lows): MAX_HOLD_HOURS stale-position exit.
+          - NVDA (77.8% win but -$511): trailing-stop / RSI-overbought exit so
+            winners don't give back their gains.
+
+        Returns a reason string when a full-exit SELL is warranted, else None.
+        """
+        if current_price <= 0:
+            return None
+        pos = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+        if not isinstance(pos, dict):
+            return None
+        owned_qty = float(pos.get("qty", 0.0) or 0.0)
+        avg_entry = float(pos.get("avg_entry_price", 0.0) or 0.0)
+        if owned_qty <= 0 or avg_entry <= 0:
+            return None
+
+        # 1. Max-hold-time exit: stale position bleeding out.
+        max_hold = float(getattr(config, "MAX_HOLD_HOURS", 0))
+        if max_hold > 0:
+            try:
+                from core import database
+                recent = database.get_recent_trades_by_symbol(symbol, limit=50)
+                # Find the most recent BUY that opened this position.
+                open_ts = None
+                for t in recent:
+                    if str(t.get("side", "")).lower() == "buy" and t.get("status") in ("filled", "partially_filled"):
+                        open_ts = t.get("timestamp")
+                        break
+                if open_ts:
+                    ts = str(open_ts)
+                    if ts.endswith("Z"):
+                        ts = ts[:-1] + "+00:00"
+                    open_dt = datetime.fromisoformat(ts)
+                    if open_dt.tzinfo is not None:
+                        open_dt = open_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    hold_hours = (datetime.utcnow() - open_dt).total_seconds() / 3600.0
+                    if hold_hours >= max_hold:
+                        return (f"Force-exit: {symbol} held {hold_hours:.0f}h >= "
+                                f"MAX_HOLD_HOURS {max_hold:.0f}h. Stale position "
+                                f"bleeding out (INTC failure mode). Exiting to stop "
+                                f"indefinite holds.")
+            except Exception as err:
+                logger.error(f"Error checking max-hold exit for {symbol}: {err}")
+
+        # 2. Trailing-stop exit: in profit but gave back too much of the peak gain.
+        trail_giveback = float(getattr(config, "TRAIL_STOP_GIVEBACK_PCT", 0))
+        trail_min_gain = float(getattr(config, "TRAIL_STOP_MIN_GAIN_PCT", 0))
+        if trail_giveback > 0 and current_price > avg_entry:
+            gain_pct = (current_price - avg_entry) / avg_entry * 100.0
+            if gain_pct >= trail_min_gain * 100.0:
+                # Peak gain = highest close since entry. Approximate with the
+                # position's high-water mark from recent trades if available,
+                # else use current price (no giveback detected).
+                peak = current_price
+                try:
+                    from core import database
+                    recent = database.get_recent_trades_by_symbol(symbol, limit=50)
+                    for t in recent:
+                        p = t.get("filled_avg_price")
+                        if p and float(p) > peak:
+                            peak = float(p)
+                except Exception:
+                    pass
+                if peak > avg_entry:
+                    peak_gain_pct = (peak - avg_entry) / avg_entry * 100.0
+                    giveback_pct = (peak - current_price) / (peak - avg_entry) * 100.0
+                    if giveback_pct >= trail_giveback * 100.0:
+                        return (f"Force-exit: {symbol} gave back {giveback_pct:.0f}% "
+                                f"of its peak gain (peak ${peak:.2f} -> now "
+                                f"${current_price:.2f}, >= TRAIL_STOP_GIVEBACK_PCT "
+                                f"{trail_giveback*100:.0f}%). Locking in remaining "
+                                f"profit (NVDA failure mode).")
+
+        # 3. RSI-overbought exit: in profit and overbought -> take profit.
+        rsi_exit = float(getattr(config, "RSI_EXIT_OVERBOUGHT", 0))
+        if rsi_exit > 0 and current_price > avg_entry and indicators:
+            rsi = indicators.get("rsi_14")
+            if rsi is not None and rsi >= rsi_exit:
+                return (f"Force-exit: {symbol} is in profit and RSI {rsi:.0f} >= "
+                        f"RSI_EXIT_OVERBOUGHT {rsi_exit:.0f}. Taking profit before "
+                        f"mean-reversion.")
+
+        return None
+
     def _circuit_breaker_reason(self, symbol: str) -> str | None:
         """Return a rejection reason if a BUY to ``symbol`` should be blocked.
 
@@ -562,6 +652,21 @@ class RiskGuardrails:
             adjusted_decision["action"] = "SELL"
             adjusted_decision["quantity"] = owned_qty
             return True, f"Approved: {force_exit_reason}", adjusted_decision
+
+        # 0b. Intelligent exits (Phase 4): max-hold-time, trailing-stop, and
+        # RSI-overbought exits. Checked early (like the oversized-losing-position
+        # force-exit) so they override even a HOLD/NO_ACTION decision — a stale or
+        # give-back position must be exited regardless of what the brain says.
+        _ix_indicators = decision.get("indicators") if isinstance(decision.get("indicators"), dict) else {}
+        intelligent_exit_reason = self._intelligent_exit_reason(
+            symbol, _fx_price, current_positions, _ix_indicators
+        )
+        if intelligent_exit_reason:
+            held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
+            owned_qty = float(held.get("qty", 0.0) or 0.0) if isinstance(held, dict) else 0.0
+            adjusted_decision["action"] = "SELL"
+            adjusted_decision["quantity"] = owned_qty
+            return True, f"Approved: {intelligent_exit_reason}", adjusted_decision
 
         # 1. HOLD/NO_ACTION requires no guardrail checks
         if action in ("HOLD", "NO_ACTION"):

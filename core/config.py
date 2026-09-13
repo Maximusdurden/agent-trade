@@ -69,6 +69,31 @@ CRYPTO_BRACKET_ENABLED = os.getenv("CRYPTO_BRACKET_ENABLED", "true").lower() == 
 CRYPTO_TAKE_PROFIT_PCT = float(os.getenv("CRYPTO_TAKE_PROFIT_PCT", "0.05"))
 CRYPTO_STOP_LOSS_PCT = float(os.getenv("CRYPTO_STOP_LOSS_PCT", "0.03"))
 
+# Intelligent Exits (Phase 4). These are deterministic exit guardrails that
+# complement the broker TP/SL brackets and the brain's re-decisions. They target
+# the two documented equity failures:
+#   - INTC (464h avg hold, exited at lows): no max-hold-time exit.
+#   - NVDA (77.8% win but -$511): wins often but gives back gains — no trailing
+#     stop / overbought exit.
+#
+# 1. Max-hold-time exit: force a full-exit SELL when a held position has been
+#    open longer than MAX_HOLD_HOURS. Prevents stale positions bleeding out
+#    (INTC held 16 days). 0 disables.
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "168"))  # 7 days
+#
+# 2. Trailing-stop exit: if a position is in profit (price above avg entry) and
+#    has given back more than TRAIL_STOP_GIVEBACK_PCT of its peak gain, force a
+#    full-exit SELL to lock in remaining profit. Requires the position to have
+#    reached at least TRAIL_STOP_MIN_GAIN_PCT first (so we don't exit tiny
+#    winners). 0 disables.
+TRAIL_STOP_GIVEBACK_PCT = float(os.getenv("TRAIL_STOP_GIVEBACK_PCT", "0.50"))
+TRAIL_STOP_MIN_GAIN_PCT = float(os.getenv("TRAIL_STOP_MIN_GAIN_PCT", "0.03"))
+#
+# 3. RSI-overbought exit: if a held position is in profit AND RSI is overbought
+#    (>= RSI_EXIT_OVERBOUGHT), force a full-exit SELL to take profit before the
+#    mean-reversion. 0 disables.
+RSI_EXIT_OVERBOUGHT = float(os.getenv("RSI_EXIT_OVERBOUGHT", "0"))  # disabled by default
+
 # Minimum crypto order notional (USD). Alpaca rejects crypto orders whose cost
 # basis is below its per-pair minimum with
 # "cost basis must be >= minimal amount of order 10" (seen on DOT/USD
