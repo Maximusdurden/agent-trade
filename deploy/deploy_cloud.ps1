@@ -187,15 +187,14 @@ foreach ($Entry in $EnvVariablesList) {
     if ($EqIdx -lt 0) { continue }
     $K = $Entry.Substring(0, $EqIdx)
     $V = $Entry.Substring($EqIdx + 1)
-    # Quote values that contain characters YAML would interpret (commas, colons,
-    # #, leading/trailing spaces, etc.) to keep them literal strings.
-    $SpecialChars = '[:,:#{}[]&*!|>%@`"\]'
-    if ($V -match $SpecialChars -or $V -match '^\s|\s$') {
-        $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
-        $EnvYamlLines += "${K}: `"$Escaped`""
-    } else {
-        $EnvYamlLines += "${K}: $V"
-    }
+    # Quote EVERY value. gcloud's --env-vars-file requires env var values to be
+    # STRINGS, but its YAML parser interprets unquoted scalars (True/False
+    # booleans, integers like 8192, floats like 0.05) as native YAML types,
+    # which makes the whole update fail with a usage error (silently keeping the
+    # old image). Quoting everything is safe because env var values are always
+    # strings, and it eliminates the entire class of YAML-type bugs.
+    $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
+    $EnvYamlLines += "${K}: `"$Escaped`""
 }
 $EnvYamlContent = [string]::Join("`n", $EnvYamlLines)
 [System.IO.File]::WriteAllText($EnvFile, $EnvYamlContent, [System.Text.Encoding]::UTF8)
@@ -213,6 +212,9 @@ if ($JobExists) {
         --memory 1Gi `
         --cpu 1 `
         --env-vars-file $EnvFile
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARNING: gcloud run jobs update exited $LASTEXITCODE. The job may still point to the old image. Run manually: gcloud run jobs update $JobName --image $ImageTag --region $Region"
+    }
 } else {
     Write-Host "Creating new Cloud Run Job..."
     gcloud run jobs create $JobName `
