@@ -1,7 +1,11 @@
 # filename: deploy_cloud.ps1
 # Automated Deployment Script for Option 1: Ephemeral Cloud Run Job & Cloud Scheduler
 
-$ErrorActionPreference = "Stop"
+# Use "Continue" (not "Stop") because the gcloud.ps1 PowerShell wrapper converts
+# benign stderr output (e.g. "property overridden" warnings) into a
+# NativeCommandError that would abort the whole deploy. Real failures are caught
+# by explicit $LASTEXITCODE checks after each critical gcloud step below.
+$ErrorActionPreference = "Continue"
 
 # 1. Load Configurations from .env
 $EnvPath = "Z:\python\projects\agent-trade\.env"
@@ -50,7 +54,14 @@ if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
 }
 Write-Host "Enabling necessary Google Cloud APIs (Cloud Scheduler, Cloud Run, Cloud Build)..."
 gcloud config set project $GcpProject
+# The gcloud.ps1 PowerShell wrapper returns non-zero when gcloud writes to
+# stderr (e.g. benign "property overridden" warnings), which would abort this
+# script under $ErrorActionPreference="Stop". This is one-time setup that is
+# idempotent, so tolerate a non-zero exit here and continue.
+$OldPref = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
 gcloud services enable cloudscheduler.googleapis.com run.googleapis.com cloudbuild.googleapis.com
+$ErrorActionPreference = $OldPref
 
 # 3. Create Clean Build Context Staging Directory
 $StagingDir = "Z:\python\projects\agent-trade\deploy\temp_staging"
@@ -178,11 +189,12 @@ foreach ($Entry in $EnvVariablesList) {
     $V = $Entry.Substring($EqIdx + 1)
     # Quote values that contain characters YAML would interpret (commas, colons,
     # #, leading/trailing spaces, etc.) to keep them literal strings.
-    if ($V -match '[:,:#{}\[\]&*!|>'"'"'%@`"\\]' -or $V -match '^\s|\s$') {
+    $SpecialChars = '[:,:#{}[]&*!|>%@`"\]'
+    if ($V -match $SpecialChars -or $V -match '^\s|\s$') {
         $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
-        $EnvYamlLines += "$K: `"$Escaped`""
+        $EnvYamlLines += "${K}: `"$Escaped`""
     } else {
-        $EnvYamlLines += "$K: $V"
+        $EnvYamlLines += "${K}: $V"
     }
 }
 $EnvYamlContent = [string]::Join("`n", $EnvYamlLines)
