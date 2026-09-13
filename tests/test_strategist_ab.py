@@ -35,6 +35,35 @@ class TestStrategistAB(unittest.TestCase):
         self.assertTrue(ver.startswith("v"))
         self.assertIn("|model=anthropic-claude-sonnet-5", ver)
 
+    def test_report_norm_model_merges_all_tag_formats(self):
+        """The report must merge raw, normalized, and options-track tags into one bucket."""
+        from tools.strategist_ab_report import norm_model, MODEL_RE
+
+        def norm_version(ver):
+            m = MODEL_RE.search(ver)
+            return norm_model(m.group(1) if m else "unknown")
+
+        # Same model, different historical formats -> all normalize to one key.
+        self.assertEqual(
+            norm_version("v1|model=deepseek/deepseek-r1"),
+            "deepseek-deepseek-r1",
+        )
+        self.assertEqual(
+            norm_version("v2|model=deepseek-deepseek-r1|track=options"),
+            "deepseek-deepseek-r1",
+        )
+        self.assertEqual(
+            norm_version("v3|model=anthropic/claude-sonnet-5"),
+            "anthropic-claude-sonnet-5",
+        )
+        self.assertEqual(
+            norm_version("v4|model=anthropic-claude-sonnet-5|track=options"),
+            "anthropic-claude-sonnet-5",
+        )
+        # Unknown / empty -> unknown.
+        self.assertEqual(norm_model(""), "unknown")
+        self.assertEqual(norm_model("unknown"), "unknown")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

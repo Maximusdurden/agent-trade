@@ -30,7 +30,7 @@ CLOUD_DB = os.path.join(PROJECT_ROOT, "cloud_downloaded_trading_agent.db")
 REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-MODEL_RE = re.compile(r"\|\s*model=([^|]+)\s*$")
+MODEL_RE = re.compile(r"\|\s*model=([^|]+)")
 
 
 def norm_model(model):
@@ -38,12 +38,14 @@ def norm_model(model):
 
     The strategist stamps model tags with '/' and '_' replaced by '-' (e.g.
     deepseek/deepseek-r1 -> deepseek-deepseek-r1). Older/emergency rows may store
-    the raw id with '/', so normalize here so one model isn't split across two
-    buckets in the report.
+    the raw id with '/', and options-track rows carry a '|track=options' suffix.
+    Normalize here so one model isn't split across multiple buckets in the report.
     """
     m = (model or "").strip()
     if not m or m == "unknown":
         return "unknown"
+    # Strip any trailing '|track=...' suffix (options-track rows).
+    m = m.split("|")[0].strip()
     return m.replace("/", "-").replace("_", "-")
 
 
