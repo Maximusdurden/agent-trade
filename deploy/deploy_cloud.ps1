@@ -143,6 +143,7 @@ $AllowedRuntimeKeys = @(
     "STRATEGIST_AB_MODELS", "STRATEGIST_AB_LABEL",
     "BRAIN_AB_MODELS", "BRAIN_AB_LABEL",
     "BRAIN_MAX_OUTPUT_TOKENS",
+    "STRATEGIST_MAX_OUTPUT_TOKENS",
     "LLM_MAX_TOTAL_SECONDS",
     "TRADING_INTERVAL_MINUTES", "JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN",
     "OPTIONS_ENABLED", "OPTIONS_DTE_MIN", "OPTIONS_DTE_MAX",
@@ -210,7 +211,7 @@ if ($JobExists) {
         --args "runner.py,--once" `
         --tasks 1 `
         --max-retries 1 `
-        --task-timeout 10m `
+        --task-timeout 20m `
         --memory 1Gi `
         --cpu 1 `
         --env-vars-file $EnvFile
@@ -226,7 +227,7 @@ if ($JobExists) {
         --args "runner.py,--once" `
         --tasks 1 `
         --max-retries 1 `
-        --task-timeout 10m `
+        --task-timeout 20m `
         --memory 1Gi `
         --cpu 1 `
         --env-vars-file $EnvFile

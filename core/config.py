@@ -260,8 +260,23 @@ STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 # attributed per model. This is a SEPARATE experiment from the strategist A/B:
 # the brain changes per-tick actions, not daily rules, so it must be measured
 # independently. If unset, the brain uses BRAIN_MODEL_TIER (current behavior).
-# Default here: gemini-2.5-flash (control) vs gemini-2.5-pro (variant).
-_brain_ab_default = "google/gemini-2.5-flash,google/gemini-2.5-pro"
+# Default here: gemini-2.5-flash (control) vs gemini-3.1-pro-preview (variant).
+# FIX (2026-09-14): gemini-2.5-pro was deprecated on OpenRouter (404 "no longer
+# available to new users"); replaced with gemini-3.1-pro-preview per OpenRouter's
+# migration notice. Without this, the brain A/B variant 404s, times out, and the
+# whole cycle degrades to rule-based fallback.
+#
+# FIX (2026-09-14, later): gemini-3.1-pro-preview is ALSO slow/unresponsive on
+# OpenRouter (20s timeouts x retries on every per-ticker call), which made the
+# cycle exceed the task timeout and fall back to rule-based. The brain A/B is
+# DISABLED (single model) so the brain uses the fast, reliable gemini-2.5-flash
+# daily driver. Re-enable only with a verified-fast variant model.
+#
+# FIX (2026-09-14, final): Re-enabled brain A/B with a VERIFIED-FAST variant:
+# deepseek/deepseek-v4-flash-0731 (1.4s response on OpenRouter, vs gemini-2.5-flash
+# at 0.7s). Both models are fast enough that the cycle stays well within the 20m
+# task timeout. Control = gemini-2.5-flash, variant = deepseek-v4-flash-0731.
+_brain_ab_default = "google/gemini-2.5-flash,deepseek/deepseek-v4-flash-0731"
 BRAIN_AB_MODELS = os.getenv("BRAIN_AB_MODELS", _brain_ab_default)
 # Optional experiment label so harness reports can name the trial.
 BRAIN_AB_LABEL = os.getenv("BRAIN_AB_LABEL", "flash-vs-pro")
@@ -270,6 +285,13 @@ BRAIN_AB_LABEL = os.getenv("BRAIN_AB_LABEL", "flash-vs-pro")
 # default 2048-token cap truncates the JSON mid-response and forces a rule-based
 # fallback. Bump this well above the expected response size.
 BRAIN_MAX_OUTPUT_TOKENS = int(os.getenv("BRAIN_MAX_OUTPUT_TOKENS", "8192"))
+# Max output tokens for the strategist's daily rule JSON. The strategist emits a
+# verbose meta_reasoning + todays_rules per ticker; the default 2048-token cap
+# truncates the JSON mid-response, which surfaces as "Expecting ',' delimiter"
+# / "Invalid JSON structure" and forces a fallback to yesterday's rules (the
+# TMCL-946..962 failure mode). Bump well above the expected response size, same
+# rationale as BRAIN_MAX_OUTPUT_TOKENS.
+STRATEGIST_MAX_OUTPUT_TOKENS = int(os.getenv("STRATEGIST_MAX_OUTPUT_TOKENS", "8192"))
 
 # Options Trading Configuration
 # Kill-switch: when False, the brain never outputs option decisions and guardrails reject them.

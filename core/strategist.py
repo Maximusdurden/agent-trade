@@ -424,7 +424,8 @@ Schema:
                     prompt=prompt,
                     response_model=StrategistResponse,
                     tier=config.STRATEGIST_MODEL_TIER,
-                    explicit_model=self.ab_model
+                    explicit_model=self.ab_model,
+                    max_output_tokens=config.STRATEGIST_MAX_OUTPUT_TOKENS,
                 )
                 return {
                     "meta_reasoning": result.get("meta_reasoning", "Maintained previous rule set due to matching market trend."),
@@ -704,6 +705,7 @@ Schema:
                     response_model=OptionStrategistResponse,
                     tier=config.STRATEGIST_MODEL_TIER,
                     explicit_model=self.ab_model,
+                    max_output_tokens=config.STRATEGIST_MAX_OUTPUT_TOKENS,
                 )
                 return {
                     "meta_reasoning": result.get("meta_reasoning", "Maintained prior options rule."),

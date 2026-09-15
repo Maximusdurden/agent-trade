@@ -71,6 +71,53 @@ def _repair_truncated_json(text: str):
         return None
 
 
+def _repair_literal_whitespace_in_strings(text: str):
+    """Escape literal newlines/tabs/carriage-returns that appear INSIDE JSON
+    string values.
+
+    The sanitize step strips most control chars but deliberately keeps ``\\n``
+    (0x0a) and ``\\r`` (0x0d). When a model emits a *literal* newline inside a
+    quoted string value (e.g. a multi-line ``meta_reasoning``), ``json.loads``
+    fails with ``Expecting ',' delimiter: line 2 column NNN`` — the exact
+    failure signature of the TMCL-946..962 strategist tickets. This walks the
+    text string-aware and replaces any raw ``\\n``/``\\r``/``\\t`` found inside a
+    quoted value with its escaped form.
+
+    Returns the repaired string, or the original if nothing needed fixing.
+    """
+    if not text:
+        return text
+    out = []
+    in_string = False
+    escaped = False
+    changed = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                continue
+            if ch in "\n\r\t":
+                # Literal whitespace inside a string value -> escape it.
+                out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[ch])
+                changed = True
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out) if changed else text
+
+
 class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
@@ -182,6 +229,8 @@ class SharedLLMClient:
                     gemini_model_name = "gemini-2.5-flash"
                 elif "gemini-2.5-pro" in model_id:
                     gemini_model_name = "gemini-2.5-pro"
+                elif "gemini-3.1-pro" in model_id:
+                    gemini_model_name = "gemini-3.1-pro-preview"
                 elif "gemini-3.5-flash" in model_id:
                     gemini_model_name = "gemini-2.5-flash" # fallback to 2.5-flash if 3.5-flash is not supported yet
                 
@@ -266,6 +315,8 @@ class SharedLLMClient:
             gemini_model_name = "gemini-2.5-flash"
         elif "gemini-2.5-pro" in model_id:
             gemini_model_name = "gemini-2.5-pro"
+        elif "gemini-3.1-pro" in model_id:
+            gemini_model_name = "gemini-3.1-pro-preview"
         elif "gemini-3.5-flash" in model_id:
             gemini_model_name = "gemini-2.5-flash"  # fallback if 3.5-flash unsupported
         logger.info(f"Executing cross-provider fallback completion using Gemini model: {gemini_model_name}")
@@ -568,24 +619,33 @@ class SharedLLMClient:
                 json_str = cleaned_text[start_idx:end_idx+1]
 
         # Parse JSON with multiple recovery attempts
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 result_dict = json.loads(json_str)
                 return result_dict
             except json.JSONDecodeError as e:
-                if attempt < 2:  # Try recovery on first two attempts
+                if attempt < 3:  # Try recovery on first three attempts
                     logger.warning(f"JSON parse attempt {attempt + 1} failed: {e}")
-                    
+
+                    if attempt == 0:
+                        # Root cause of "Expecting ',' delimiter: line 2 column NNN":
+                        # a LITERAL newline/tab inside a quoted string value. Escape
+                        # them string-aware before any other heuristic.
+                        repaired = _repair_literal_whitespace_in_strings(json_str)
+                        if repaired != json_str:
+                            json_str = repaired
+                            continue
+
                     # Attempt to fix common issues
                     if "\"" in json_str:
                         # Try balancing quotes
                         json_str = re.sub(r'(?<!\\)"(?![:,\}\]])', '\"', json_str)
-                    
+
                     # Try removing trailing commas
                     json_str = re.sub(r',\s*([\}\]])(?!\s*[\"\d\{\[])', r'\1', json_str)
-                    
+
                     # Try extracting again if we modified
-                    if attempt == 1:
+                    if attempt == 2:
                         json_str = json_str[json_str.find('{'):json_str.rfind('}')+1]
                 else:
                     logger.critical(f"Final JSON parse failed. Error: {e}")
