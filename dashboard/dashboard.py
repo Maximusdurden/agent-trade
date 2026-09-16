@@ -4580,6 +4580,21 @@ def _build_ticker_grounding_context(client, symbols, db_read):
         return ""
     dp = DataProvider(client)
     lines = []
+
+    # Fetch open orders ONCE (not once per symbol) so we don't hammer Alpaca.
+    open_orders_by_sym = {}
+    try:
+        if not client.is_mock:
+            for o in client.trading_client.get_orders():
+                o_sym = (o.symbol or "").upper().replace("/", "")
+                side = getattr(o.side, "value", None) or str(o.side)
+                otype = getattr(o.type, "value", None) or str(o.type)
+                ostatus = getattr(o.status, "value", None) or str(o.status)
+                desc = f"{side} {o.qty} {o.symbol} ({otype}, {ostatus}, limit_price={getattr(o, 'limit_price', None)})"
+                open_orders_by_sym.setdefault(o_sym, []).append(desc)
+    except Exception:
+        pass
+
     for sym in symbols:
         sym = sym.upper()
         try:
@@ -4603,20 +4618,7 @@ def _build_ticker_grounding_context(client, symbols, db_read):
             pass
 
         # Open orders on the broker for this symbol (so no invented stops).
-        open_orders = []
-        try:
-            if not client.is_mock:
-                for o in client.trading_client.get_orders():
-                    o_sym = (o.symbol or "").upper().replace("/", "")
-                    if o_sym == sym.replace("/", ""):
-                        side = getattr(o.side, "value", None) or str(o.side)
-                        otype = getattr(o.type, "value", None) or str(o.type)
-                        ostatus = getattr(o.status, "value", None) or str(o.status)
-                        open_orders.append(
-                            f"{side} {o.qty} {sym} ({otype}, {ostatus}, limit_price={getattr(o, 'limit_price', None)})"
-                        )
-        except Exception:
-            pass
+        open_orders = open_orders_by_sym.get(sym.replace("/", ""), [])
 
         lines.append(
             f"- {sym}: price=${ms.get('current_price')}, "
@@ -4845,14 +4847,21 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
                 # Ground the LLM in the SAME data the trading system uses, so it
                 # cannot hallucinate regime labels, guardrail thresholds,
-                # stop-losses, or cash figures. We ground on every held position
-                # plus any ticker the user explicitly mentions in their message.
-                grounded_symbols = set()
-                for sym in positions.keys():
-                    grounded_symbols.add(sym.upper())
-                for token in re.findall(r"\b[A-Z]{2,5}\b", user_msg.upper()):
-                    if token in {"USD", "USDT", "USDC", "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "PEP", "AMGN", "SPY", "QQQ", "DIA", "IWM", "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "AVGO", "INTC", "QCOM", "TXN", "JPM", "BAC", "GS", "MS", "WFC"}:
-                        grounded_symbols.add(token)
+                # stop-losses, or cash figures.
+                #
+                # PERFORMANCE: each grounded symbol triggers a DataProvider
+                # market-state fetch (100 bars + daily bars from Alpaca), which
+                # measured ~15s/symbol. Grounding on ALL held positions made a
+                # simple chat request take 60s+ and time out. So we only ground
+                # on the ticker(s) the user explicitly names; if they ask a
+                # general/portfolio question (no ticker named), we fall back to
+                # the held positions.
+                KNOWN_TICKERS = {"USD", "USDT", "USDC", "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "PEP", "AMGN", "SPY", "QQQ", "DIA", "IWM", "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "AVGO", "INTC", "QCOM", "TXN", "JPM", "BAC", "GS", "MS", "WFC"}
+                mentioned = {t for t in re.findall(r"\b[A-Z]{2,5}\b", user_msg.upper()) if t in KNOWN_TICKERS}
+                if mentioned:
+                    grounded_symbols = mentioned
+                else:
+                    grounded_symbols = {sym.upper() for sym in positions.keys()}
                 # Normalize crypto symbols to slash form for the data provider.
                 crypto_map = {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD",
                               "XRP": "XRP/USD", "ADA": "ADA/USD", "DOGE": "DOGE/USD"}
