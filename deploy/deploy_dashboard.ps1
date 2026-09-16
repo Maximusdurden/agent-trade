@@ -123,10 +123,16 @@ gcloud builds submit $StagingDir --tag $ImageTag --region $Region
 
 # 6. Deploy Cloud Run Service using the built Image
 Write-Host "`n--- Deploying Cloud Run Service: $ServiceName ---"
+# --memory 1Gi: the dashboard OOM'd at the default 512Mi (measured ~554Mi used,
+# partly from pandas/numpy + DataProvider market-state fetches in the chat
+# handler). Pin 1Gi/1cpu here so the memory bump is reproducible, not a manual
+# one-off `gcloud run services update`.
 gcloud run deploy $ServiceName `
     --image $ImageTag `
     --region $Region `
     --project $GcpProject `
+    --memory 1Gi `
+    --cpu 1 `
     --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper,GEMINI_API_KEY=$GeminiApiKey,GEMINI_MODEL=$GeminiModel" `
     --quiet
 
