@@ -204,7 +204,14 @@ class MetaStrategist:
             todays_rules = result.get("todays_rules", "").strip()
             is_valid, validation_reason = validate_strategy_rule(ticker, todays_rules)
             if not is_valid:
-                logger.error(
+                # The selectivity gate is working as intended here: it rejected a
+                # loose/churn-prone rule and we safely keep yesterday's rules.
+                # This is EXPECTED behavior, not a bug, so log at WARNING (not
+                # ERROR) to avoid filing a Jira ticket for every rejected rule
+                # (the TMCL-963/967/970 noise). The prompt direction 1b already
+                # tells the model to write selective rules; a rejection just
+                # means it didn't comply this time.
+                logger.warning(
                     f"Strategist generated an invalid rule for {ticker} "
                     f"({validation_reason}); leaving the active history unchanged."
                 )
@@ -386,8 +393,7 @@ DIRECTIONS:
    Your rule MUST include a concrete, guardrail-adjustable knob (VWAP threshold, RSI band, allocation %, or holding-time exit) and MUST NOT restate yesterday's rule verbatim.
 1b. SELECTIVITY (critical — the PG failure mode): your entry thresholds MUST be tight enough that the rule fires only on a real setup, NOT on noise. A rule that is true "almost always" (e.g. "IF vwap_dist < +0.5% AND RSI < 65 THEN buy") makes the brain churn — it re-enters constantly and bleeds before any round-trip closes. Concretely:
    - A VWAP-distance entry threshold must be at least ~1% (a sub-1% VWAP blip is noise, not a signal).
-   - An RSI entry cap must be tight (e.g. RSI below 40-50), NOT a loose "RSI below 65" that is true most of the time.
-   - Prefer a bounded RSI BAND (e.g. "buy when RSI is between 35 and 45") over a one-sided cap.
+   - An RSI entry cap MUST be 55 or LOWER. Any RSI entry cap above 55 (e.g. "RSI < 65", "RSI < 72") is REJECTED by the system's selectivity guardrail and the whole rule is discarded — the trade never happens. A one-sided "RSI < 55" is still too loose; prefer a bounded RSI BAND (e.g. "buy when RSI is between 35 and 45").
    - If you cannot write a genuinely selective entry condition for this ticker, say so and recommend HOLD / no new BUY rather than a loose buy-always rule.
 2. Audit the trade outcomes. Were our recent trades profitable? Did we experience whipsaws or losses?
 3. Decide if yesterday's rules are working, or if they need adjustment to match the current market regime. 

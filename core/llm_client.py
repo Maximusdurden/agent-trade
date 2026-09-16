@@ -118,6 +118,64 @@ def _repair_literal_whitespace_in_strings(text: str):
     return "".join(out) if changed else text
 
 
+def _repair_unescaped_quotes_in_strings(text: str):
+    """Escape unescaped double-quotes that appear INSIDE JSON string values.
+
+    The strategist LLM (OpenRouter) intermittently emits a string value that
+    itself contains a literal double-quote (e.g. ``"He said "buy now" and hold"``).
+    ``json.loads`` then terminates the string at the inner quote and fails with
+    ``Expecting ',' delimiter: line N column M`` — the exact failure signature of
+    the TMCL-963..974 strategist tickets. The whitespace repair only handles
+    ``\\n``/``\\t``/``\\r``, so this walks the text string-aware and escapes any
+    quote that appears *inside* a quoted value (i.e. not the structural quote
+    that opens/closes the value).
+
+    The heuristic: a quote is structural if it is the FIRST non-whitespace char
+    after ``{``, ``,``, ``:``, or ``[`` (a key or value opener), or if it is
+    followed by ``:``, ``,``, ``}``, ``]``, or whitespace-then-one-of-those (a
+    value closer). Any other quote inside a string is treated as literal and
+    escaped. Returns the repaired string, or the original if nothing changed.
+    """
+    if not text:
+        return text
+    out = []
+    in_string = False
+    escaped = False
+    changed = False
+    n = len(text)
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                # Peek ahead: if this quote is followed by a value-closer
+                # (:, ,, }, ], or whitespace then one of those), treat it as the
+                # structural closing quote. Otherwise it is a literal quote
+                # inside the value and must be escaped.
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                if j < n and text[j] in ":,}]":
+                    in_string = False
+                    out.append(ch)
+                else:
+                    out.append("\\\"")
+                    changed = True
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out) if changed else text
+
+
 class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
@@ -213,6 +271,12 @@ class SharedLLMClient:
                     messages=messages,
                     max_tokens=final_max_tokens,
                     temperature=0.2,
+                    # Constrain the model to emit a valid JSON object. This is the
+                    # strongest defense against the malformed-JSON failures
+                    # (TMCL-963..974): OpenRouter's json_object mode makes the
+                    # model produce well-formed JSON, so the string-value quote
+                    # and whitespace issues largely disappear at the source.
+                    response_format={"type": "json_object"},
                     extra_headers=extra_headers
                 )
                 
@@ -632,6 +696,17 @@ class SharedLLMClient:
                         # a LITERAL newline/tab inside a quoted string value. Escape
                         # them string-aware before any other heuristic.
                         repaired = _repair_literal_whitespace_in_strings(json_str)
+                        if repaired != json_str:
+                            json_str = repaired
+                            continue
+
+                    if attempt == 1:
+                        # Root cause of the TMCL-963..974 strategist tickets: the
+                        # model emits a string value containing an UNESCAPED
+                        # double-quote (e.g. "He said "buy now""). The whitespace
+                        # repair above doesn't touch quotes, so escape them
+                        # string-aware here before the fragile regex heuristics.
+                        repaired = _repair_unescaped_quotes_in_strings(json_str)
                         if repaired != json_str:
                             json_str = repaired
                             continue

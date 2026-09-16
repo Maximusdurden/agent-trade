@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from core.llm_client import (
     _repair_literal_whitespace_in_strings,
     _repair_truncated_json,
+    _repair_unescaped_quotes_in_strings,
 )
 
 
@@ -79,6 +80,50 @@ class TestTruncatedRepair(unittest.TestCase):
 
     def test_not_json_returns_none(self):
         self.assertIsNone(_repair_truncated_json("not json at all"))
+
+
+class TestUnescapedQuoteRepair(unittest.TestCase):
+    """Regression for TMCL-963..974: the strategist LLM emits a string value
+    containing an UNESCAPED double-quote (e.g. "He said "buy now""), which
+    json.loads rejects as 'Expecting ',' delimiter'. The whitespace repair only
+    handles \\n/\\t/\\r, so this escapes quotes inside string values."""
+
+    def test_escapes_quote_inside_string_value(self):
+        raw = '{"a": "He said "buy now" and hold", "b": 1}'
+        repaired = _repair_unescaped_quotes_in_strings(raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed["a"], 'He said "buy now" and hold')
+        self.assertEqual(parsed["b"], 1)
+
+    def test_escapes_quote_mid_meta_reasoning(self):
+        raw = '{"meta_reasoning": "The "market" is ranging", "todays_rules": "hold"}'
+        repaired = _repair_unescaped_quotes_in_strings(raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed["meta_reasoning"], 'The "market" is ranging')
+        self.assertEqual(parsed["todays_rules"], "hold")
+
+    def test_does_not_touch_structural_quotes(self):
+        # Structural quotes (keys, value openers/closers) must be preserved.
+        raw = '{"a": "value", "b": [1, 2], "c": {"d": "e"}}'
+        repaired = _repair_unescaped_quotes_in_strings(raw)
+        self.assertEqual(repaired, raw)
+        json.loads(repaired)  # must still parse
+
+    def test_does_not_touch_escaped_quote(self):
+        # A properly escaped \\" must be left alone.
+        raw = '{"a": "He said \\"buy now\\"", "b": 1}'
+        repaired = _repair_unescaped_quotes_in_strings(raw)
+        self.assertEqual(repaired, raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed["a"], 'He said "buy now"')
+
+    def test_no_change_returns_original_identity(self):
+        raw = '{"a": "clean", "b": 2}'
+        self.assertIs(_repair_unescaped_quotes_in_strings(raw), raw)
+
+    def test_empty_and_none(self):
+        self.assertEqual(_repair_unescaped_quotes_in_strings(""), "")
+        self.assertIsNone(_repair_unescaped_quotes_in_strings(None))
 
 
 if __name__ == "__main__":
