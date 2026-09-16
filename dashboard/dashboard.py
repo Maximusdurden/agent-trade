@@ -3,6 +3,7 @@ import socketserver
 import json
 import logging
 import os
+import re
 import sys
 import sqlite3
 import threading
@@ -22,6 +23,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from core import config
 from core import database
 from core.alpaca_client import AlpacaClient
+from core.data_provider import DataProvider
 from core.screener import load_screener_pool
 
 try:
@@ -42,6 +44,11 @@ GCS_SYNC_LOCK = threading.Lock()
 # Interval (seconds) between GCS DB downloads. Kept separate from the cache
 # worker's 10s loop so the download never blocks the cache refresh.
 GCS_SYNC_INTERVAL_SECONDS = 120
+# Set True after the FIRST successful GCS DB download. The status cache worker
+# gates its DB-dependent work on this so it never bakes in an empty-history
+# payload before the local /tmp DB exists (which caused a blank/flat equity
+# curve for the first ~2 min after boot).
+GCS_FIRST_SYNC_DONE = False
 
 def sync_database_from_gcs():
     """
@@ -115,6 +122,12 @@ def sync_database_from_gcs():
 
             with CACHE_LOCK:
                 LATEST_STATUS_CACHE[last_sync_key] = now
+
+            # Mark the first sync as complete so the status cache worker can
+            # start reading the local DB (it gates on this to avoid baking in an
+            # empty-history payload before the DB exists).
+            global GCS_FIRST_SYNC_DONE
+            GCS_FIRST_SYNC_DONE = True
         except Exception as e:
             print(f"[GCS Sync WARNING] Failed to sync files from GCS: {e}", file=sys.stderr)
 
@@ -155,10 +168,16 @@ def get_portfolio_history():
         # Chart.js timeline renders oldest -> newest.
         
         # Prevent co-mingling: if we have any active paper trading metrics (not exactly 100000.0),
-        # filter out the baseline fallback 100k data points.
+        # filter out the baseline fallback 100k data points. FIX (2026-09-13): only drop a row
+        # when it matches the FULL demo-fallback signature (equity==100000 AND cash==100000 AND
+        # unrealized_pnl==0). A real account that legitimately sits at exactly $100K (with real
+        # cash/pnl) must NOT be dropped, or it would punch a hole in the equity curve.
         has_real_data = any(h['equity'] != 100000.0 for h in history)
         if has_real_data:
-            history = [h for h in history if h['equity'] != 100000.0]
+            history = [
+                h for h in history
+                if not (h['equity'] == 100000.0 and h.get('cash') == 100000.0 and h.get('unrealized_pnl') == 0)
+            ]
             
         return history
     except Exception as e:
@@ -280,6 +299,37 @@ def status_cache_worker():
             # so a slow 79.5 MB download never blocks this cache refresh. The cache
             # always serves the last-good payload instantly.
 
+            # FIX (2026-09-13): Gate on the first GCS sync. On boot the local /tmp
+            # DB does not exist yet, so reading it would bake in an empty-history
+            # payload (blank/flat equity curve for the first ~2 min). Until the
+            # first download completes, hold the cache in an "initializing" state
+            # and retry quickly so real data appears as soon as the DB lands.
+            if os.getenv("GCS_BUCKET_NAME") and not GCS_FIRST_SYNC_DONE:
+                with CACHE_LOCK:
+                    LATEST_STATUS_CACHE = {
+                        "account": {},
+                        "positions": {},
+                        "decisions": [],
+                        "trades": [],
+                        "executions": [],
+                        "broker_orders": [],
+                        "history": [],
+                        "ticker_history": {},
+                        "logs": ["Dashboard server is initializing, please wait..."],
+                        "trading_universe": config.TRADING_UNIVERSE,
+                        "screener_pool": [],
+                        "latest_watchlist": [],
+                        "interval": config.TRADING_INTERVAL_MINUTES,
+                        "is_mock": True,
+                        "is_paper": config.ALPACA_PAPER,
+                        "initializing": True,
+                        "stale": False,
+                        "cache_built_at": 0.0,
+                        "error": None,
+                    }
+                time.sleep(5)
+                continue
+
             # Initialize default / fallback structures for Alpaca
             account = {}
             positions = {}
@@ -364,12 +414,53 @@ def status_cache_worker():
                 # which trades 24/7). Prefer local intraday for the recent window,
                 # Alpaca for the long-term curve.
                 local_history = get_portfolio_history()
+                # FIX (2026-09-14): The merge previously deduped by exact
+                # timestamp string, so Alpaca intraday points (at :00/:15/:30/:45)
+                # and local portfolio_history points (at :01/:18/:33/:47) BOTH
+                # survived and interleaved in time. Because the two sources carry
+                # different equity values for the same moment (Alpaca's 15Min bars
+                # are snapshots at bar boundaries; local rows are the runner's
+                # live reads), the interleaving produced a sawtooth oscillation on
+                # the Equity Valuation Curve even when the account held only two
+                # equities all day. Fix: prefer LOCAL intraday points for the
+                # recent window (they are the freshest, logged by the runner every
+                # ~15 min), and only keep Alpaca points that fall OUTSIDE the
+                # local history's time span. This keeps the long-term curve from
+                # Alpaca while eliminating the intraday double-source oscillation.
+                def _parse_utc(ts):
+                    """Parse a timestamp to an aware UTC datetime (naive => UTC)."""
+                    import datetime as _dt
+                    try:
+                        dt = _dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=_dt.timezone.utc)
+                        return dt
+                    except (ValueError, TypeError):
+                        return None
+
                 history = []
                 seen = set()
+                local_parsed = [_parse_utc(h.get("timestamp")) for h in local_history]
+                local_parsed = [d for d in local_parsed if d is not None]
+                local_min = min(local_parsed) if local_parsed else None
+                local_max = max(local_parsed) if local_parsed else None
                 for item in (intraday_history + daily_history + local_history):
                     ts = item.get("timestamp")
                     if ts in seen:
                         continue
+                    # Skip Alpaca points that fall inside the local history's time
+                    # span (the local runner data is authoritative for that window).
+                    # Only keep Alpaca points outside it (long-term curve).
+                    if local_min is not None and local_max is not None:
+                        item_dt = _parse_utc(ts)
+                        if item_dt is not None and local_min <= item_dt <= local_max:
+                            # Keep local points; drop Alpaca points in the overlap.
+                            if "unrealized_pnl" in item and "profit_loss" not in item:
+                                seen.add(ts)
+                                item = dict(item)
+                                item["profit_loss"] = item.get("unrealized_pnl")
+                                history.append(item)
+                            continue
                     seen.add(ts)
                     # Normalize: local rows use 'unrealized_pnl', Alpaca uses
                     # 'profit_loss'. Expose both so the frontend pnl metric works.
@@ -4468,6 +4559,83 @@ def is_authenticated(handler):
     expected = get_expected_session_token()
     return f"age_session={expected}" in cookie_header
 
+
+def _build_ticker_grounding_context(client, symbols, db_read):
+    """Build a factual, per-ticker context block for the chat LLM.
+
+    The chat agent previously received only a thin portfolio summary and
+    hallucinated regime labels, guardrail thresholds, stop-losses, and cash
+    figures (e.g. calling PEP a "BREAKOUT" when the deterministic classifier
+    returns RANGING, and inventing a $134.50 stop that doesn't exist). This
+    helper injects the SAME data the trading system actually uses so the LLM
+    cannot invent it:
+
+      - Live market state (price, daily return, regime, RSI, VWAP, edge_sigma)
+      - The actual persisted strategy rule for the ticker
+      - Any open orders on the broker (so it can't invent stop-losses)
+
+    Returns a markdown string, or "" if no symbols could be resolved.
+    """
+    if not symbols:
+        return ""
+    dp = DataProvider(client)
+    lines = []
+    for sym in symbols:
+        sym = sym.upper()
+        try:
+            ms = dp.get_market_state(sym, "15min")
+        except Exception as e:
+            ms = {}
+        if not ms:
+            lines.append(f"- {sym}: (no live market state available)")
+            continue
+
+        ind = ms.get("indicators", {})
+        regime = ms.get("regime") or ind.get("regime") or "RANGING"
+        edge = ms.get("edge_sigma")
+        edge_str = f"{edge:.2f}" if isinstance(edge, (int, float)) else "n/a"
+
+        # Actual persisted strategy rule (never synthesized).
+        rule = "No active strategy rules defined."
+        try:
+            rule = db_read(database.get_active_strategy, sym)
+        except Exception:
+            pass
+
+        # Open orders on the broker for this symbol (so no invented stops).
+        open_orders = []
+        try:
+            if not client.is_mock:
+                for o in client.trading_client.get_orders():
+                    o_sym = (o.symbol or "").upper().replace("/", "")
+                    if o_sym == sym.replace("/", ""):
+                        side = getattr(o.side, "value", None) or str(o.side)
+                        otype = getattr(o.type, "value", None) or str(o.type)
+                        ostatus = getattr(o.status, "value", None) or str(o.status)
+                        open_orders.append(
+                            f"{side} {o.qty} {sym} ({otype}, {ostatus}, limit_price={getattr(o, 'limit_price', None)})"
+                        )
+        except Exception:
+            pass
+
+        lines.append(
+            f"- {sym}: price=${ms.get('current_price')}, "
+            f"daily_return_pct={ms.get('daily_return_pct'):.2f}%, "
+            f"regime={regime}, edge_sigma={edge_str}, "
+            f"RSI={ind.get('rsi_14')}, VWAP={ind.get('vwap')}, "
+            f"vwap_dist_pct={ind.get('vwap_dist_pct')}%, "
+            f"SMA20={ind.get('sma_20')}, SMA50={ind.get('sma_50')}, "
+            f"ATR={ind.get('atr_14')}"
+        )
+        lines.append(f"  - Active strategy rule: {rule}")
+        if open_orders:
+            lines.append("  - Open broker orders: " + "; ".join(open_orders))
+        else:
+            lines.append("  - Open broker orders: none")
+
+    return "\n".join(lines)
+
+
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -4675,6 +4843,22 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 perf_summary_str = perf_summary.get("text_summary", "No performance history available.")
                 daily_performance_str = _db_read(database.get_daily_performance_breakdown, limit=15)
 
+                # Ground the LLM in the SAME data the trading system uses, so it
+                # cannot hallucinate regime labels, guardrail thresholds,
+                # stop-losses, or cash figures. We ground on every held position
+                # plus any ticker the user explicitly mentions in their message.
+                grounded_symbols = set()
+                for sym in positions.keys():
+                    grounded_symbols.add(sym.upper())
+                for token in re.findall(r"\b[A-Z]{2,5}\b", user_msg.upper()):
+                    if token in {"USD", "USDT", "USDC", "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "PEP", "AMGN", "SPY", "QQQ", "DIA", "IWM", "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "AVGO", "INTC", "QCOM", "TXN", "JPM", "BAC", "GS", "MS", "WFC"}:
+                        grounded_symbols.add(token)
+                # Normalize crypto symbols to slash form for the data provider.
+                crypto_map = {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD",
+                              "XRP": "XRP/USD", "ADA": "ADA/USD", "DOGE": "DOGE/USD"}
+                grounded_list = [crypto_map.get(s, s) for s in grounded_symbols]
+                ticker_grounding = _build_ticker_grounding_context(client, grounded_list, _db_read)
+
                 system_instruction = (
                     "You are the cognitive co-pilot, visual strategist, and expert portfolio analyst for the AGE Desk Autonomous Trading Agent.\n"
                     "The user is a highly particular quant investor who wants to analyze hypotheses, understand historical trends, and evaluate trading performance.\n\n"
@@ -4717,6 +4901,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     f"- Unrealized PnL: ${account.get('unrealized_pnl', 0.0):,.2f}\n\n"
                     "=== ACTIVE HOLDINGS ===\n"
                     f"{positions_summary}\n"
+                    "=== PER-TICKER LIVE MARKET STATE, STRATEGY RULES & OPEN ORDERS ===\n"
+                    f"{ticker_grounding}\n"
                     "=== RECENT STRATEGY DECISIONS & THOUGHT PROCESSES ===\n"
                     f"{dec_summary}\n"
                     "=== RECENT BROKER ORDER EXECUTIONS ===\n"
@@ -4729,6 +4915,12 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "3. Be educational. Explain concepts like RSI, Fibonacci retracements, Bollinger Bands, and support/resistance so the user can learn quantitative trading.\n"
                     "4. Keep your responses engaging, clear, and formatted in clean markdown. Keep paragraphs relatively concise so they look good in a small chat widget.\n"
                     "5. When the user asks for daily charts, performance summaries, or day-over-day trends, you MUST use the exact dates, ending equities, and trade metrics from the '=== REAL-TIME DAILY PERFORMANCE TELEMETRY ===' block above. NEVER make up or hallucinate any dates or data points under any circumstances. There is no trading on weekends, so do not include weekend dates (e.g. Saturdays, Sundays) in any daily charts or daily tables unless the database explicitly contains them.\n"
+                    "6. GROUNDING RULES (CRITICAL): The '=== PER-TICKER LIVE MARKET STATE, STRATEGY RULES & OPEN ORDERS ===' block contains the ONLY authoritative regime, indicator, strategy-rule, and open-order data. You MUST treat it as ground truth and NEVER invent any of the following:\n"
+                    "   a. REGIME: Only call a ticker a 'breakout' if its regime is literally 'BREAKOUT' in that block. If it says RANGING, TRENDING_UP, or TRENDING_DOWN, describe it exactly that way and do NOT call it a breakout.\n"
+                    "   b. GUARDRAILS/THRESHOLDS: Only cite VWAP-distance or RSI entry thresholds that appear in the ticker's 'Active strategy rule'. Never invent numbers like '-1.2% VWAP' or 'RSI 28-35'.\n"
+                    "   c. STOP-LOSSES: Only mention a stop-loss if it appears in the ticker's 'Open broker orders' or 'Active strategy rule'. If 'Open broker orders: none', state there is no active stop-loss order.\n"
+                    "   d. CASH: Use the exact cash figure from '=== CURRENT PORTFOLIO STATE ==='. Never round or invent a different number.\n"
+                    "   e. If a ticker is not in the per-ticker block, say you do not have live data for it rather than guessing.\n"
                 )
                 
                 response_text = ""
@@ -4799,13 +4991,24 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
 def run_server():
-    # Start the background status cache worker daemon thread
-    worker_thread = threading.Thread(target=status_cache_worker, daemon=True)
-    worker_thread.start()
+    # FIX (2026-09-13): Kick off the FIRST GCS DB download synchronously BEFORE
+    # starting the cache worker / HTTP server. This guarantees the local /tmp DB
+    # exists (or the failure is logged) before the first cache build, so the
+    # equity curve is not blank for the first ~2 min after boot. The download is
+    # wrapped in try/except so a failure never crashes startup — the background
+    # sync worker will keep retrying and the cache worker gates on the flag.
+    try:
+        sync_database_from_gcs()
+    except Exception as sync_err:
+        print(f"[Dashboard Server] Initial GCS sync failed (will retry in background): {sync_err}", file=sys.stderr)
 
     # Start the background GCS sync worker daemon thread (non-blocking DB download)
     gcs_thread = threading.Thread(target=gcs_sync_worker, daemon=True)
     gcs_thread.start()
+
+    # Start the background status cache worker daemon thread
+    worker_thread = threading.Thread(target=status_cache_worker, daemon=True)
+    worker_thread.start()
 
     # Attempt to start server on specified port, retry on 8081 if occupied
     global PORT
