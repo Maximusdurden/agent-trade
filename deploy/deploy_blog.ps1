@@ -146,11 +146,13 @@ $SecretReferences = @(
 if (-not $JobExists) {
     & $GCloud run jobs create $JobName --image $ImageTag --region $Region `
         --set-env-vars ($EnvVariablesList -join ",") `
-        --set-secrets ($SecretReferences -join ",")
+        --set-secrets ($SecretReferences -join ",") `
+        --memory 2Gi --cpu 1
 } else {
     & $GCloud run jobs update $JobName --image $ImageTag --region $Region `
         --set-env-vars ($EnvVariablesList -join ",") `
-        --set-secrets ($SecretReferences -join ",")
+        --set-secrets ($SecretReferences -join ",") `
+        --memory 2Gi --cpu 1
 }
 
 # 6. Cloud Scheduler after the strategy job's DB sync each trading day.

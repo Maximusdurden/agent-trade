@@ -320,8 +320,35 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
             group = day_rows[day_rows["ticker"] == ticker]
             group_pnl = float(group["pnl_dollar"].sum())
             gi = grade_map.get(ticker) or grade_map.get(_get_root_ticker(ticker))
-            raw = generate_trade_blurb(ticker, group_pnl,
-                                       "Entries/exits summarized for the day.", grade_info=gi)
+
+            # Build a concise, factual trade-metrics summary from the real round-trips
+            # so the LLM never hallucinates entry/exit prices or hold times.
+            metrics_lines = []
+            for _, row in group.iterrows():
+                hold_min = row.get("hold_time_minutes")
+                if pd.isna(hold_min) or hold_min is None:
+                    duration_str = "unknown duration"
+                elif hold_min >= 1440:
+                    duration_str = f"{hold_min / 1440:.1f} days"
+                elif hold_min >= 60:
+                    duration_str = f"{hold_min / 60:.1f} hours"
+                else:
+                    duration_str = f"{hold_min:.1f} minutes"
+                entry_p = row.get("entry_price")
+                exit_p = row.get("exit_price")
+                pnl_d = row.get("pnl_dollar")
+                pnl_p = row.get("pnl_percent")
+                entry_p_str = f"${entry_p:.2f}" if pd.notna(entry_p) else "unknown price"
+                exit_p_str = f"${exit_p:.2f}" if pd.notna(exit_p) else "unknown price"
+                pnl_d_str = f"${pnl_d:.2f}" if pd.notna(pnl_d) else "unknown"
+                pnl_p_str = f"{pnl_p:.2f}%" if pd.notna(pnl_p) else "unknown"
+                metrics_lines.append(
+                    f"- {row['ticker']}: Bought at {entry_p_str}, sold at {exit_p_str}, "
+                    f"held for {duration_str}. PnL: {pnl_d_str} ({pnl_p_str})"
+                )
+            metrics_str = "\n".join(metrics_lines) if metrics_lines else "No round-trips closed today."
+
+            raw = generate_trade_blurb(ticker, group_pnl, metrics_str, grade_info=gi)
             blurb = wp.autolink_tickers(raw, tickers)
             blurb = wp.autolink_financial_terms(blurb)
             color = "#4caf50" if group_pnl > 0 else "#f44336"

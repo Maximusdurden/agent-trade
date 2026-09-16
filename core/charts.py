@@ -347,7 +347,12 @@ def generate_trade_chart(ticker: str, round_trips: list[dict], out_dir: str = "r
     from core.alpaca_client import get_client_instance
     client = get_client_instance()
 
-    # Window covering all the day's round-trips for this ticker.
+    # Window covering ALL the round-trips for this ticker - from the earliest
+    # entry to the latest exit (with a small buffer on each side). This mirrors
+    # dexter-trader's chart_analyzer, which does NOT clamp to the exit day.
+    # Clamping to the exit day dropped the BUY markers for multi-day holds
+    # (e.g. WFC bought 9/11, sold 9/15) because the entry fell outside the
+    # window, so the chart showed the sell but never where we bought.
     open_ts_list = [_parse_ts(rt.get("open_ts")) for rt in round_trips]
     close_ts_list = [_parse_ts(rt.get("close_ts")) for rt in round_trips]
     valid_ts = [t for t in open_ts_list + close_ts_list if t is not None]
@@ -355,17 +360,6 @@ def generate_trade_chart(ticker: str, round_trips: list[dict], out_dir: str = "r
         return None
     start_dt = min(valid_ts) - timedelta(minutes=PRE_TRADE_BUFFER_MIN)
     end_dt = max(valid_ts) + timedelta(minutes=POST_TRADE_BUFFER_MIN)
-
-    # Clamp the window to the exit day (the day the trade closed) so overnight
-    # holds don't produce a confusing two-day chart with a gap. The chart should
-    # show the price action on the day the round-trip closed, with all fills
-    # that influenced the buy/sell marked.
-    exit_day = max(close_ts_list).normalize() if close_ts_list else None
-    if exit_day is not None:
-        day_start = exit_day
-        day_end = exit_day + timedelta(days=1)
-        start_dt = max(start_dt, day_start)
-        end_dt = min(end_dt, day_end)
 
     underlying, asset_type, _, folder_cat = _parse_ticker_details(ticker)
     api_symbol = underlying if asset_type in ("CALL", "PUT") else ticker
