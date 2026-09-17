@@ -177,16 +177,20 @@ class TradingBrain:
             d["model"] = model
         return decisions
 
-    def make_decision(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict]) -> list[dict]:
+    def make_decision(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict], expert_instruction: str | None = None) -> list[dict]:
         """
         Formulates the prompt, calls the LLM (or mock fallback), and returns a
         LIST of structured per-ticker decisions (one per appraised symbol).
+
+        ``expert_instruction`` (optional): an extra system-level instruction
+        block prepended to the prompt (e.g. the sideload lane's "AMD expert"
+        positioning). The normal lane passes None.
         """
         if self.is_mock:
             return self._make_mock_decision(market_data_list, account_state, positions)
 
         # Build prompt
-        prompt = self._build_prompt(market_data_list, account_state, positions, recent_decisions)
+        prompt = self._build_prompt(market_data_list, account_state, positions, recent_decisions, expert_instruction=expert_instruction)
         
         if self.provider == "openrouter":
             try:
@@ -252,9 +256,11 @@ class TradingBrain:
             logger.error(f"Error in LLM decision making: {e}. Falling back to safe rule-based decision.")
             return self._make_mock_decision(market_data_list, account_state, positions)
 
-    def _build_prompt(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict]) -> str:
+    def _build_prompt(self, market_data_list: list[dict], account_state: dict, positions: dict, recent_decisions: list[dict], expert_instruction: str | None = None) -> str:
         """Constructs a comprehensive system prompt and state description.
         Handles both equities and crypto assets with appropriate rules for each.
+        ``expert_instruction`` (optional) is prepended to the system instruction
+        (e.g. the sideload lane's AMD-expert positioning).
         """
         
         # Standardize state strings for prompt representation
@@ -416,6 +422,7 @@ Ticker: {symbol}
         system_instruction = f"""
 {crypto_instructions}
 {options_instructions}
+{expert_instruction or ''}
 ROLE:
 You are an elite, professional, risk-averse financial quantitative trading agent. Your objective is to formulate an independent high-conviction trade choice (BUY, SELL, or HOLD) for EVERY ticker in the provided market data. You output a "decisions" array with one decision object per appraised ticker.
 

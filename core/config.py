@@ -409,6 +409,15 @@ else:
 # Screener Configuration
 SCREENER_POOL_PATH = BASE_DIR / "screener_pool.json"
 
+# Sideload-reserved symbols: tickers owned exclusively by a sideload lane
+# (e.g. the AMD expert lane in sideload/). The NORMAL lane must never trade
+# these — they are excluded from the appraisal universe and the screener pool
+# so the two lanes never fight over them. The sideload lane adds them back to
+# its own universe at cycle time (see sideload/config_sideload.py).
+SIDELOAD_RESERVED_SYMBOLS = {
+    s.strip().upper() for s in os.getenv("SIDELOAD_RESERVED_SYMBOLS", "AMD").split(",") if s.strip()
+}
+
 # Watchlist size (number of symbols the screener monitors).
 # The runner reserves separate slots per asset class so crypto cannot crowd
 # equities out of the top-N during market hours:

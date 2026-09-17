@@ -67,6 +67,13 @@ def build_appraisal_universe(screened_symbols: list[str], positions: dict,
     from core.feedback import is_option_contract_symbol
     candidates = [*screened_symbols, *positions.keys()]
 
+    # Exclude sideload-reserved symbols (e.g. AMD owned by the sideload lane).
+    # The normal lane must never appraise/trade these; the sideload lane adds
+    # them back to its own universe at cycle time.
+    reserved = set(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set()))
+    if reserved:
+        candidates = [s for s in candidates if s.upper() not in reserved]
+
     # Include symbols the strategist has explicitly authorized for options, but ONLY
     # if they are also screener-endorsed or held. This prevents option-authorized
     # tickers that are neither watched nor held from cluttering the appraisal loop.

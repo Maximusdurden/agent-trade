@@ -134,6 +134,85 @@ def autolink_financial_terms(text: str) -> str:
     return text
 
 
+# External hotlink targets for the AMD fact-of-day posts.
+# Tickers -> Yahoo Finance quote page; financial terms -> Investopedia.
+_TICKER_EXTERNAL_LINKS = {
+    "AMD": "https://finance.yahoo.com/quote/AMD/",
+    "NVDA": "https://finance.yahoo.com/quote/NVDA/",
+    "INTC": "https://finance.yahoo.com/quote/INTC/",
+    "TSLA": "https://finance.yahoo.com/quote/TSLA/",
+    "SPY": "https://finance.yahoo.com/quote/SPY/",
+    "QQQ": "https://finance.yahoo.com/quote/QQQ/",
+}
+
+_TERM_EXTERNAL_LINKS = {
+    "RSI": "https://www.investopedia.com/terms/r/rsi.asp",
+    "Relative Strength Index": "https://www.investopedia.com/terms/r/rsi.asp",
+    "MACD": "https://www.investopedia.com/terms/m/macd.asp",
+    "Moving Average Convergence Divergence": "https://www.investopedia.com/terms/m/macd.asp",
+    "SMA": "https://www.investopedia.com/terms/s/sma.asp",
+    "Simple Moving Average": "https://www.investopedia.com/terms/s/sma.asp",
+    "EMA": "https://www.investopedia.com/terms/e/ema.asp",
+    "Exponential Moving Average": "https://www.investopedia.com/terms/e/ema.asp",
+    "VWAP": "https://www.investopedia.com/terms/v/vwap.asp",
+    "Volume Weighted Average Price": "https://www.investopedia.com/terms/v/vwap.asp",
+    "ATR": "https://www.investopedia.com/terms/a/averagetruerange.asp",
+    "Average True Range": "https://www.investopedia.com/terms/a/averagetruerange.asp",
+    "Bollinger Bands": "https://www.investopedia.com/terms/b/bollingerbands.asp",
+    "Support": "https://www.investopedia.com/terms/s/support.asp",
+    "Resistance": "https://www.investopedia.com/terms/r/resistance.asp",
+    "Volatility": "https://www.investopedia.com/terms/v/volatility.asp",
+    "Stop Loss": "https://www.investopedia.com/terms/s/stop-loss_order.asp",
+    "Take Profit": "https://www.investopedia.com/terms/t/take-profitorder.asp",
+    "Earnings": "https://www.investopedia.com/terms/e/earnings.asp",
+    "Trend": "https://www.investopedia.com/terms/t/trend.asp",
+    "Momentum": "https://www.investopedia.com/terms/m/momentum_investing.asp",
+    "Pullback": "https://www.investopedia.com/terms/p/pullback.asp",
+    "Support Level": "https://www.investopedia.com/terms/s/support.asp",
+    "Win Rate": "https://www.investopedia.com/terms/w/winning-percentage.asp",
+    "Expectancy": "https://www.investopedia.com/terms/e/expected-value.asp",
+    "Backtest": "https://www.investopedia.com/terms/b/backtesting.asp",
+    "Paper Trading": "https://www.investopedia.com/terms/p/papertrading.asp",
+}
+
+
+def autolink_external(text: str, tickers: list[str] | None = None) -> str:
+    """Add external hotlinks to a blog post body.
+
+    - Tickers (AMD, NVDA, ...) link to their Yahoo Finance quote page.
+    - Financial terms (RSI, MACD, VWAP, ...) link to Investopedia.
+
+    Only links the FIRST occurrence of each term (to avoid link spam), and
+    never links inside an existing <a> tag. Returns the text with links added.
+    """
+    if not text:
+        return text
+
+    # 1. Tickers -> Yahoo Finance (first occurrence only).
+    ticker_map = dict(_TICKER_EXTERNAL_LINKS)
+    if tickers:
+        for t in tickers:
+            up = t.upper()
+            if up not in ticker_map:
+                ticker_map[up] = f"https://finance.yahoo.com/quote/{up}/"
+    for ticker in sorted(ticker_map, key=len, reverse=True):
+        link = (f'<a href="{ticker_map[ticker]}" target="_blank" rel="noopener" '
+                f'style="font-weight:bold; color:#008080; text-decoration:underline;">'
+                f"{ticker}</a>")
+        pattern = re.compile(f"\\b{re.escape(ticker)}\\b(?![^<]*</a>)", re.IGNORECASE)
+        text = pattern.sub(link, text, count=1)
+
+    # 2. Financial terms -> Investopedia (first occurrence only).
+    for term in sorted(_TERM_EXTERNAL_LINKS, key=len, reverse=True):
+        link = (f'<a href="{_TERM_EXTERNAL_LINKS[term]}" target="_blank" rel="noopener" '
+                f'style="font-weight:bold; color:#008080; text-decoration:underline;">'
+                f"\\1</a>")
+        pattern = re.compile(f"\\b({re.escape(term)}s?)\\b(?![^<]*</a>)", re.IGNORECASE)
+        text = pattern.sub(link, text, count=1)
+
+    return text
+
+
 def get_disclaimer_html() -> str:
     return """
     <div class="wp-block-group" style="background-color:#fafafa; color:#777; padding:20px; font-size:13px; border-top:1px solid #eee; margin-top:40px; border-radius:8px; border:1px solid #eee;">

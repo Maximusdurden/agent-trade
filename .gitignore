@@ -57,6 +57,11 @@ scratch/
 deploy/temp_staging_*/
 deploy/temp_staging_blog/
 
+# Sideload backtest runtime outputs (regenerated each run, not source)
+sideload/backtest_coarse.json
+sideload/backtest_fine.json
+sideload/backtest_validated.json
+
 # Generated env-vars YAML for Cloud Run (contains secrets from .env)
 deploy/env_vars.yaml
 

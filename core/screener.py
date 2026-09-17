@@ -227,6 +227,11 @@ def run_screener(client: AlpacaClient, data_provider: DataProvider, watchlist_li
     # 1. Load candidates
     if candidates is None:
         candidates = load_screener_pool()
+    # Exclude sideload-reserved symbols (e.g. AMD owned by the sideload lane)
+    # so the normal lane's screener never endorses/trades them.
+    reserved = set(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set()))
+    if reserved:
+        candidates = [c for c in candidates if c.upper() not in reserved]
     logger.info(f"Loaded {len(candidates)} candidates from pool configuration.")
     
     # 2. Fetch daily bars in batch (requires 50 daily bars to calculate 50 SMA)
