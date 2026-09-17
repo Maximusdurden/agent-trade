@@ -370,14 +370,16 @@ def status_cache_worker():
             broker_orders = []
             ticker_convictions = []
             try:
-                # Fetch enough recent decisions that sideload-lane symbols (e.g.
-                # AMD) remain visible even when the normal lane logs a full cycle
-                # of per-ticker decisions on top of them. The decision stream
-                # dropdown is populated from this set, so AMD must be present.
-                decisions = database.get_recent_decisions(limit=40)
+                # Fetch decisions from the last 5 hours (time-based) so the
+                # decision stream shows a meaningful history per ticker instead
+                # of just the most recent N rows (which can be dominated by one
+                # ticker's cycle). The sideload-lane symbols (e.g. AMD) are
+                # ALWAYS merged in so they stay visible even if the normal lane
+                # logs a full cycle on top of them.
+                decisions = database.get_recent_decisions_since(hours=5.0, limit=500)
                 # ALWAYS include the sideload-reserved symbols (e.g. AMD) in the
                 # decision stream, even if the normal lane's frequent cycles have
-                # pushed them out of the top-N. The sideload lane runs on its own
+                # pushed them out of the window. The sideload lane runs on its own
                 # schedule, so without this its decisions would be buried and the
                 # user could never find them. Merge them in (deduped by id) and
                 # re-sort newest-first.

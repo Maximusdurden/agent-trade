@@ -433,6 +433,25 @@ def get_recent_decisions(limit: int = 5) -> list[dict]:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+def get_recent_decisions_since(hours: float = 5.0, limit: int = 500) -> list[dict]:
+    """Returns decisions from the last ``hours`` hours (newest first).
+
+    Time-based window so the dashboard decision stream shows a meaningful
+    history per ticker (e.g. all decisions in the last 5 hours) instead of just
+    the most recent N rows, which can be dominated by one ticker's cycle.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM decisions
+            WHERE timestamp >= ?
+            ORDER BY id DESC LIMIT ?
+        """, (cutoff, limit))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
 def get_recent_decisions_by_symbol(symbol: str, limit: int = 10) -> list[dict]:
     """Returns the most recent decisions for ONE symbol (newest first).
 

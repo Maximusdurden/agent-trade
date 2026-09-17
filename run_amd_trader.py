@@ -16,6 +16,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime
 
 PROJECT_ROOT = __file__.rsplit("\\", 2)[0] if "\\" in __file__ else __file__.rsplit("/", 2)[0]
 if PROJECT_ROOT not in sys.path:
@@ -26,16 +27,57 @@ from sideload.jira_logging import setup_jira_logging, log_exception_to_jira
 logger = logging.getLogger("RunAMDTrader")
 
 
+def _is_amd_market_hours() -> tuple[bool, str]:
+    """AMD is an equity (not crypto), so it only trades during US equity market
+    hours: Mon-Fri 09:30-16:00 America/New_York. Returns (is_open, reason).
+
+    This is a hard gate at the top of the trader job so the scheduler can keep
+    firing every 15 min but the job no-ops outside the window (handles DST
+    automatically via zoneinfo, unlike a fixed-UTC cron).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+        now = datetime.now(tz)
+    except Exception:
+        try:
+            import pytz
+            tz = pytz.timezone("America/New_York")
+            now = datetime.now(tz)
+        except Exception:
+            return True, "Could not determine NY time; running anyway."
+    weekday = now.weekday()
+    if weekday >= 5:
+        return False, f"AMD market closed: Weekend ({now.strftime('%A')})."
+    market_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_end = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now < market_start:
+        return False, f"AMD market closed: Pre-market (NY {now.strftime('%H:%M')})."
+    if now > market_end:
+        return False, f"AMD market closed: Post-market (NY {now.strftime('%H:%M')})."
+    return True, "AMD market open."
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="AMD sideload intraday trader")
     parser.add_argument("--cycles", type=int, default=1,
                         help="Number of trading cycles to run (default 1)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Log decisions but place no orders")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass the 09:30-16:00 NY market-hours gate (testing)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     setup_jira_logging(app_name="agent-trade-sideload-trader")
+
+    # AMD is an equity — only trade during US market hours (09:30-16:00 NY).
+    # Skip (no-op) outside the window unless --force is passed.
+    if not args.force:
+        is_open, reason = _is_amd_market_hours()
+        if not is_open:
+            logger.info(f"Skipping AMD trader cycle: {reason}")
+            return
 
     from sideload import config_sideload as sl_cfg
     sl_cfg.apply_sideload_overrides()
