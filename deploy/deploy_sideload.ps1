@@ -104,13 +104,26 @@ $EnvVariablesList = @(
 )
 # Jira credentials (for error->Jira logging) from .env.
 $JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# LLM + Alpaca + model config keys the sideload lane needs to run the real
+# TradingBrain (OpenRouter/Gemini) instead of falling back to the rule-based
+# brain. Without these the sideload trader logs "Neither OpenRouter nor Gemini
+# API keys are configured" and only emits [Rule Fallback] HOLDs.
+$ConfigKeys = @(
+    "LLM_PROVIDER", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL",
+    "GEMINI_API_KEY", "GEMINI_MODEL",
+    "BRAIN_MODEL_TIER", "BRAIN_MAX_OUTPUT_TOKENS", "BRAIN_AB_MODELS", "BRAIN_AB_LABEL",
+    "MODEL_DAILY_DRIVER", "MODEL_HEAVYWEIGHT", "MODEL_UTILITY",
+    "LLM_MAX_TOTAL_SECONDS",
+    "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER",
+    "BYPASS_MARKET_WINDOW"
+)
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
         $Parts = $Line.Split("=", 2)
         $Key = $Parts[0].Trim()
         $Val = $Parts[1].Trim().Trim("'`"")
-        if ($JiraKeys -contains $Key -and $Val -and -not $Val.StartsWith("your_")) {
+        if (($JiraKeys -contains $Key -or $ConfigKeys -contains $Key) -and $Val -and -not $Val.StartsWith("your_")) {
             $EnvVariablesList += "$Key=$Val"
         }
     }
@@ -171,7 +184,7 @@ function Register-Scheduler {
     $ErrorActionPreference = $OldPreference
     & $GCloud scheduler jobs create http $SchedulerName --schedule=$Schedule `
         --location $Region `
-        --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/$JobName:run" `
+        --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/${JobName}:run" `
         --http-method=POST `
         --oauth-service-account-email=$DefaultComputeSa `
         --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"

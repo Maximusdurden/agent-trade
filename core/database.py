@@ -433,6 +433,25 @@ def get_recent_decisions(limit: int = 5) -> list[dict]:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+def get_recent_decisions_by_symbol(symbol: str, limit: int = 10) -> list[dict]:
+    """Returns the most recent decisions for ONE symbol (newest first).
+
+    Used by the dashboard to keep sideload-lane symbols (e.g. AMD) visible in
+    the AI Strategy Decision Stream even when the normal lane logs a full cycle
+    of per-ticker decisions on top of them. The symbol match is case-insensitive
+    and also matches crypto pairs (e.g. "AMD" vs "AMD/USD").
+    """
+    sym = (symbol or "").upper()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM decisions
+            WHERE UPPER(proposed_symbol) = ? OR UPPER(proposed_symbol) = ?
+            ORDER BY id DESC LIMIT ?
+        """, (sym, f"{sym}/USD", limit))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
 def get_recent_trades(limit: int = 10) -> list[dict]:
     """Returns the most recent executed trades as a list of dicts."""
     with get_db_connection() as conn:

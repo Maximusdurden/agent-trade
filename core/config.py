@@ -418,6 +418,12 @@ SIDELOAD_RESERVED_SYMBOLS = {
     s.strip().upper() for s in os.getenv("SIDELOAD_RESERVED_SYMBOLS", "AMD").split(",") if s.strip()
 }
 
+# Display name for the sideload lane's screener universe. Generic (NOT a ticker)
+# so future sideload lanes (different tickers, same methodology) share one
+# universe with a single color on the dashboard. The dashboard uses this to
+# group sideload-reserved symbols under one labeled, color-coded universe.
+SIDELOAD_UNIVERSE_NAME = os.getenv("SIDELOAD_UNIVERSE_NAME", "Sideload Expert Lane")
+
 # Watchlist size (number of symbols the screener monitors).
 # The runner reserves separate slots per asset class so crypto cannot crowd
 # equities out of the top-N during market hours:

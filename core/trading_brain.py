@@ -347,7 +347,7 @@ class TradingBrain:
 ---
 Ticker: {symbol}
 - Current Price: ${data['current_price']:,.2f}
-- Daily Change: {data['daily_return_pct']:.2%}%
+- Daily Change: {data['daily_return_pct']:.2f}%
 - MARKET REGIME: {data.get('regime', 'RANGING')}
 - NORMALIZED EDGE (|vwap_dist| / ATR): {data.get('edge_sigma') if data.get('edge_sigma') is not None else 'None'}
 - RSI (14-day): {ind.get('rsi_14')}

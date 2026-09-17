@@ -318,6 +318,8 @@ def status_cache_worker():
                         "logs": ["Dashboard server is initializing, please wait..."],
                         "trading_universe": config.TRADING_UNIVERSE,
                         "screener_pool": [],
+                        "sideload_universe_name": getattr(config, "SIDELOAD_UNIVERSE_NAME", "Sideload Expert Lane"),
+                        "sideload_reserved_symbols": sorted(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set())),
                         "latest_watchlist": [],
                         "interval": config.TRADING_INTERVAL_MINUTES,
                         "is_mock": True,
@@ -368,7 +370,27 @@ def status_cache_worker():
             broker_orders = []
             ticker_convictions = []
             try:
-                decisions = database.get_recent_decisions(limit=15)
+                # Fetch enough recent decisions that sideload-lane symbols (e.g.
+                # AMD) remain visible even when the normal lane logs a full cycle
+                # of per-ticker decisions on top of them. The decision stream
+                # dropdown is populated from this set, so AMD must be present.
+                decisions = database.get_recent_decisions(limit=40)
+                # ALWAYS include the sideload-reserved symbols (e.g. AMD) in the
+                # decision stream, even if the normal lane's frequent cycles have
+                # pushed them out of the top-N. The sideload lane runs on its own
+                # schedule, so without this its decisions would be buried and the
+                # user could never find them. Merge them in (deduped by id) and
+                # re-sort newest-first.
+                sideload_symbols = sorted(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set()))
+                if sideload_symbols:
+                    try:
+                        by_id = {d["id"]: d for d in decisions}
+                        for sym in sideload_symbols:
+                            for d in database.get_recent_decisions_by_symbol(sym, limit=10):
+                                by_id[d["id"]] = d
+                        decisions = sorted(by_id.values(), key=lambda d: d.get("timestamp", ""), reverse=True)
+                    except Exception as sl_err:
+                        print(f"[Dashboard Server] Sideload decision merge failed (non-fatal): {sl_err}", file=sys.stderr)
                 trades = database.get_recent_trades(limit=15)
                 executions = database.get_executions(limit=50)
 
@@ -514,19 +536,15 @@ def status_cache_worker():
                 except Exception as tc_err:
                     print(f"[Dashboard Server] Ticker convictions fetch failed (non-fatal): {tc_err}", file=sys.stderr)
                     ticker_convictions = []
-                
-                # 2b. Fetch executed orders directly from Alpaca as the single
-                #     authoritative source for the Broker-Side Executed Orders
-                #     panel. After the dexter cutover, use the broker's order
-                #     ledger verbatim so stale demo-DB trades are not shown
-                #     alongside the live account's orders.
-                try:
-                    if not client.is_mock:
-                        broker_orders = client.get_executed_orders(limit=200)
-                        print(f"[Dashboard Server] Fetched {len(broker_orders)} broker orders (authoritative).", flush=True)
-                except Exception as broker_err:
-                    print(f"[Dashboard Server] Broker order fetch failed (non-fatal): {broker_err}", file=sys.stderr)
-                    broker_orders = []
+
+                # 2b. Broker-Side Executed Orders are now DEFERRED (lazy-loaded).
+                #     The Broker-Side Executed Orders panel is collapsed by default
+                #     and only fetches orders on-demand via /api/orders when the
+                #     user expands it. This avoids a slow Alpaca order-ledger
+                #     pagination call on EVERY cache cycle (which was wasteful and
+                #     could stall the dashboard). The cache worker no longer
+                #     fetches broker orders eagerly.
+                broker_orders = []
             except Exception as db_err:
                 print(f"[Dashboard Server] Database retrieval failed: {db_err}", file=sys.stderr)
 
@@ -623,6 +641,8 @@ def status_cache_worker():
                 "logs": log_lines,
                 "trading_universe": config.TRADING_UNIVERSE,
                 "screener_pool": load_screener_pool(),
+                "sideload_universe_name": getattr(config, "SIDELOAD_UNIVERSE_NAME", "Sideload Expert Lane"),
+                "sideload_reserved_symbols": sorted(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set())),
                 "latest_watchlist": get_latest_watchlist(),
                 "interval": config.TRADING_INTERVAL_MINUTES,
                 "is_mock": is_mock,
@@ -2126,6 +2146,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                         <i data-lucide="brain-circuit" style="color: var(--color-teal); width: 1.15rem; height: 1.15rem;"></i>
                         AI Strategy Decision Stream
                     </h2>
+                    <!-- Interactive Ticker Select for the Decision Stream -->
+                    <div id="decisions-filter-container" style="display: flex; align-items: center; gap: 0.5rem; margin-left: 1.5rem;">
+                        <span style="font-size: 0.7rem; text-transform: uppercase; color: var(--text-secondary); font-weight: 600; letter-spacing: 0.05em;">Ticker:</span>
+                        <select id="decisions-ticker-select" onchange="filterDecisionStream()" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-subtle); color: var(--text-primary); padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; outline: none; cursor: pointer; transition: border-color 0.2s;">
+                            <option value="ALL">ALL TICKERS</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="thought-stream" id="thought-stream">
                     <!-- Dynamic insert -->
@@ -2142,13 +2169,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                     </h2>
                     <div id="chart-timeframe-selector" style="display: flex; gap: 0.35rem; margin-left: 1.5rem;">
                         <button class="timeframe-btn" onclick="changeChartTimeframe('1D')">1D</button>
-                        <button class="timeframe-btn" onclick="changeChartTimeframe('5D')">5D</button>
+                        <button class="timeframe-btn active" onclick="changeChartTimeframe('5D')">5D</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('1W')">1W</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('2W')">2W</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('MTD')">MTD</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('1M')">1M</button>
                         <button class="timeframe-btn" onclick="changeChartTimeframe('LM')">Last Mo</button>
-                        <button class="timeframe-btn active" onclick="changeChartTimeframe('ALL')">ALL</button>
+                        <button class="timeframe-btn" onclick="changeChartTimeframe('ALL')">ALL</button>
                     </div>
                     <div id="chart-ticker-selector-container" style="display: flex; align-items: center; gap: 0.35rem; margin-left: 1.5rem;">
                         <span style="font-size: 0.7rem; text-transform: uppercase; color: var(--text-secondary); font-weight: 600; letter-spacing: 0.05em; font-family: var(--font-pixel);">Ticker:</span>
@@ -2251,8 +2278,19 @@ HTML_CONTENT = """<!DOCTYPE html>
                         <button id="orders-maximize-btn" onclick="toggleOrdersMaximize()" title="Maximize Orders" style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; justify-content: center; width: 1.85rem; height: 1.85rem; border-radius: 0.35rem; transition: background 0.2s, color 0.2s;">
                             <i data-lucide="maximize-2" id="orders-max-icon" style="width: 0.9rem; height: 0.9rem;"></i>
                         </button>
+                        <!-- Collapse/Expand toggle. Defaults to COLLAPSED so the
+                             panel doesn't hog vertical real estate. Expanding it
+                             triggers a lazy fetch of broker orders via /api/orders
+                             (last 1 month) instead of loading them on every cache
+                             cycle. -->
+                        <button id="orders-collapse-btn" onclick="toggleOrdersCollapse()" title="Expand / Collapse Orders" style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle); color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; justify-content: center; width: 1.85rem; height: 1.85rem; border-radius: 0.35rem; transition: background 0.2s, color 0.2s;">
+                            <i data-lucide="chevrons-down-up" id="orders-collapse-icon" style="width: 0.9rem; height: 0.9rem;"></i>
+                        </button>
                     </div>
                 </div>
+
+                <!-- Collapsible body: hidden by default (collapsed). -->
+                <div id="orders-collapsible-body" style="display: none;">
                 
                 <!-- Dynamic Transactional Stats Sub-Header (Only visible when maximized) -->
                 <div id="orders-stats-banner" style="display: none; grid-template-columns: repeat(4, 1fr); gap: 1rem; background: rgba(255,255,255,0.01); border: 1px solid var(--border-subtle); padding: 0.75rem 1rem; border-radius: 0.5rem; margin-bottom: 1rem;">
@@ -2281,6 +2319,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                                 <th>Filled (UTC)</th>
                                 <th>Created (UTC)</th>
                                 <th>Symbol</th>
+                                <th>Universe</th>
                                 <th>Action</th>
                                 <th>Qty</th>
                                 <th>Avg Fill Price</th>
@@ -2295,6 +2334,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                             </tr>
                         </tbody>
                     </table>
+                </div>
                 </div>
             </div>
         </div>
@@ -2397,6 +2437,10 @@ HTML_CONTENT = """<!DOCTYPE html>
                                 <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-gold); display: inline-block; box-shadow: 0 0 5px var(--color-gold);"></span>
                                 <span style="color: var(--color-gold); font-weight: bold;">Screener Pool: <span id="stat-pool">0</span></span>
                             </span>
+                            <span style="display: flex; align-items: center; gap: 0.25rem;">
+                                <span style="width: 8px; height: 8px; border-radius: 50%; background: #c084fc; display: inline-block; box-shadow: 0 0 5px #c084fc;"></span>
+                                <span style="color: #c084fc; font-weight: bold;" id="stat-sideload-label">Sideload Lane: <span id="stat-sideload">0</span></span>
+                            </span>
                         </div>
                         
                         <!-- Scrollable Grid -->
@@ -2454,7 +2498,9 @@ HTML_CONTENT = """<!DOCTYPE html>
 
         // Global state for chart visualization and KPI workspace (TMCL-405)
         let activeChartMetric = 'equity';
-        let activeChartTimeframe = 'ALL';
+        // Default the Equity Valuation Curve to the 5D filter (most useful
+        // intraday view) instead of ALL, which was the old default.
+        let activeChartTimeframe = '5D';
         let activeChartTicker = 'ALL';
         let latestHistoryCached = [];
         let latestTickerHistoryCached = {};
@@ -2888,6 +2934,11 @@ HTML_CONTENT = """<!DOCTYPE html>
                     throw new Error(data.error);
                 }
 
+                // Store the sideload universe metadata for the orders panel's
+                // Universe column (generic name + reserved symbols, color-coded).
+                window._sideloadUniverseName = (data && data.sideload_universe_name) || 'Sideload Expert Lane';
+                window._sideloadReservedSymbols = (data && data.sideload_reserved_symbols) || [];
+
                 // Update system status dynamically
                 const statusDot = document.getElementById('status-dot');
                 const statusText = document.getElementById('system-status-text');
@@ -3043,6 +3094,20 @@ HTML_CONTENT = """<!DOCTYPE html>
                     if (screenerPool.length === 0) {
                         screenerPoolContainer.innerHTML = '<span style="color: var(--text-muted); font-size: 0.75rem;">No screener pool loaded.</span>';
                     } else {
+                        // Sideload universe metadata (generic name + reserved symbols).
+                        const sideloadName = window._sideloadUniverseName || 'Sideload Expert Lane';
+                        const sideloadSymbols = (window._sideloadReservedSymbols || []).map(s => s.toUpperCase());
+
+                        // Update the Sideload Lane legend count.
+                        const statSideload = document.getElementById('stat-sideload');
+                        if (statSideload) {
+                            statSideload.innerText = sideloadSymbols.filter(s => screenerPool.map(x => x.toUpperCase()).includes(s)).length;
+                        }
+                        const statSideloadLabel = document.getElementById('stat-sideload-label');
+                        if (statSideloadLabel) {
+                            statSideloadLabel.innerText = sideloadName + ': ' + (statSideload ? statSideload.innerText : '0');
+                        }
+
                         // Sort pool so holdings and watchlisted show first, then alphabetical
                         const sortedPool = [...screenerPool].sort((a, b) => {
                             const aUpper = a.toUpperCase();
@@ -3065,9 +3130,15 @@ HTML_CONTENT = """<!DOCTYPE html>
                             const symUpper = symbol.toUpperCase();
                             const isHolding = holdings.some(h => h.replace('/', '') === symUpper.replace('/', ''));
                             const isWatching = latestWatchlist.some(w => w.toUpperCase().replace('/', '') === symUpper.replace('/', ''));
+                            // Sideload-reserved symbols (e.g. AMD) get their own
+                            // color-coded universe badge (generic name, NOT the
+                            // ticker) so future sideload lanes share one universe.
+                            const isSideload = sideloadSymbols.includes(symUpper);
 
                             let badgeStyle = "padding: 0.15rem 0.35rem; border-radius: 0.25rem; font-size: 0.7rem; font-weight: bold; border: 1px solid; transition: all 0.2s;";
-                            if (isHolding) {
+                            if (isSideload) {
+                                badgeStyle += " border-color: #c084fc; background: rgba(192, 132, 252, 0.12); color: #c084fc; box-shadow: 0 0 4px rgba(192, 132, 252, 0.15);";
+                            } else if (isHolding) {
                                 badgeStyle += " border-color: var(--color-green); background: rgba(51, 255, 51, 0.08); color: var(--color-green); box-shadow: 0 0 4px var(--crt-glow);";
                             } else if (isWatching) {
                                 badgeStyle += " border-color: var(--color-blue); background: rgba(0, 255, 255, 0.08); color: var(--color-blue); box-shadow: 0 0 4px rgba(0, 255, 255, 0.08);";
@@ -3075,7 +3146,8 @@ HTML_CONTENT = """<!DOCTYPE html>
                                 badgeStyle += " border-color: var(--color-gold); background: rgba(255, 176, 0, 0.02); color: var(--color-gold); opacity: 0.65;";
                             }
 
-                            screenerPoolContainer.innerHTML += `<span style="${badgeStyle}" title="${isHolding ? 'Holding' : (isWatching ? 'Watchlist' : 'Screener Pool')}">${symbol}</span>`;
+                            const badgeTitle = isSideload ? sideloadName : (isHolding ? 'Holding' : (isWatching ? 'Watchlist' : 'Screener Pool'));
+                            screenerPoolContainer.innerHTML += `<span style="${badgeStyle}" title="${badgeTitle}">${symbol}</span>`;
                         });
                     }
                 }
@@ -3248,7 +3320,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                             }
 
                             streamEl.innerHTML += `
-                                <div class="thought-card ${statusClass}">
+                                <div class="thought-card ${statusClass}" data-symbol="${(dec.proposed_symbol || 'PORTFOLIO HOLD').toUpperCase()}">
                                     <div class="thought-header">
                                         <div class="thought-meta">
                                             <div class="thought-ticker">
@@ -3266,87 +3338,68 @@ HTML_CONTENT = """<!DOCTYPE html>
                                 </div>
                             `;
                         });
+
+                        // Populate the Decision Stream ticker dropdown from the
+                        // symbols present in the current decisions.
+                        const decSelectEl = document.getElementById('decisions-ticker-select');
+                        if (decSelectEl) {
+                            const prevDecValue = decSelectEl.value;
+                            const uniqueDecSymbols = new Set();
+                            decisions.forEach(dec => {
+                                const sym = (dec.proposed_symbol || 'PORTFOLIO HOLD').toUpperCase();
+                                uniqueDecSymbols.add(sym);
+                            });
+                            const sortedDecSymbols = Array.from(uniqueDecSymbols).sort();
+                            let decOptionsHtml = '<option value="ALL">ALL TICKERS</option>';
+                            sortedDecSymbols.forEach(symbol => {
+                                decOptionsHtml += `<option value="${symbol}">${symbol}</option>`;
+                            });
+                            decSelectEl.innerHTML = decOptionsHtml;
+                            if (uniqueDecSymbols.has(prevDecValue)) {
+                                decSelectEl.value = prevDecValue;
+                            } else {
+                                decSelectEl.value = 'ALL';
+                            }
+                        }
+                        if (typeof filterDecisionStream === 'function') {
+                            filterDecisionStream();
+                        }
                     }
                 }
 
                 // 4. Broker-Side Executed Orders — single source: live Alpaca orders.
                 //    After the dexter cutover the broker ledger is authoritative;
                 //    we no longer merge the (stale pre-cutover) DB trades into it.
+                //    The panel is COLLAPSED by default and lazily fetches orders
+                //    via /api/orders (last 1 month) only when the user expands it.
+                //    If orders have already been loaded this session, reuse them
+                //    instead of re-fetching on every cache cycle.
                 const tradesTbody = document.getElementById('trades-tbody');
                 if (tradesTbody) {
-                    tradesTbody.innerHTML = '';
-                    const brokerOrders = (data && data.broker_orders) || [];
-                    const allOrders = [...brokerOrders];
-                    // Sort descending by timestamp (newest first)
-                    allOrders.sort((a, b) => {
-                        const tsA = a.timestamp || '';
-                        const tsB = b.timestamp || '';
-                        return tsB.localeCompare(tsA);
-                    });
-
-                    if (allOrders.length === 0) {
-                        tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No orders registered in database.</td></tr>';
-                    } else {
-                        allOrders.forEach(t => {
-                            const side = t.side || 'buy';
-                            const sideClass = side.toLowerCase() === 'buy' ? 'text-green' : 'text-crimson';
-                            const dateStr = t.timestamp ? formatToEastern(t.timestamp) : 'N/A';
-                            // Created time (when the order was submitted). For GTC
-                            // limit orders this can be days before the fill — that's
-                            // why Alpaca's UI (created-time) and this table
-                            // (fill-time) can look mismatched.
-                            const createdStr = t.created_at ? formatToEastern(t.created_at) : '—';
-                            const fillPriceStr = t.filled_avg_price ? '$' + t.filled_avg_price.toFixed(2) : '<span style="color: var(--text-muted)">Unfilled</span>';
-                            const symbol = t.symbol || 'N/A';
-                            const qty = t.qty !== undefined ? t.qty : 0;
-                            const status = t.status || 'filled';
-                            const orderId = t.alpaca_order_id || 'N/A';
-                            // Show a hint when created != filled (GTC limit order that
-                            // rested before filling) so the date gap is obvious.
-                            const dateGapHint = (t.created_at && t.timestamp && t.created_at.slice(0,10) !== t.timestamp.slice(0,10))
-                                ? ' <span style="color: var(--color-gold); font-size: 0.7rem;" title="Order was created on a different day than it filled (GTC limit order).">↔</span>'
-                                : '';
-                            
-                            tradesTbody.innerHTML += `
-                                <tr>
-                                    <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;">${dateStr}${dateGapHint}</td>
-                                    <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-muted);">${createdStr}</td>
-                                    <td style="font-weight: 600;">${symbol}</td>
-                                    <td class="${sideClass}" style="text-transform: uppercase; font-weight: bold;">${side}</td>
-                                    <td>${qty}</td>
-                                    <td style="font-family: 'JetBrains Mono', monospace;">${fillPriceStr}</td>
-                                    <td><span class="badge" style="background: rgba(255, 255, 255, 0.05); color: #e5e7eb;">${status}</span></td>
-                                    <td style="font-family: 'JetBrains Mono', monospace; color: var(--text-muted); font-size: 0.8rem;">${orderId}</td>
-                                </tr>
-                            `;
-                        });
-                    }
-                    
-                    // Populate unique tickers in the select dropdown dynamically (from all orders)
-                    const selectEl = document.getElementById('orders-ticker-select');
-                    if (selectEl) {
-                        const previousValue = selectEl.value;
-                        const uniqueSymbols = new Set();
-                        allOrders.forEach(t => {
-                            if (t.symbol) {
-                                uniqueSymbols.add(t.symbol.toUpperCase());
-                            }
-                        });
-                        const sortedSymbols = Array.from(uniqueSymbols).sort();
-                        let optionsHtml = '<option value="ALL">ALL TICKERS</option>';
-                        sortedSymbols.forEach(symbol => {
-                            optionsHtml += `<option value="${symbol}">${symbol}</option>`;
-                        });
-                        selectEl.innerHTML = optionsHtml;
-                        if (uniqueSymbols.has(previousValue)) {
-                            selectEl.value = previousValue;
+                    const ordersBody = document.getElementById('orders-collapsible-body');
+                    const isOrdersExpanded = ordersBody && ordersBody.style.display !== 'none';
+                    if (isOrdersExpanded) {
+                        // Only render orders if the panel is expanded (lazy).
+                        if (typeof window._brokerOrdersLoaded === 'undefined' || !window._brokerOrdersLoaded) {
+                            // Not loaded yet this session — fetch lazily.
+                            tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--color-gold); padding: 1.5rem;"><span class="spinner"></span> Loading broker orders...</td></tr>';
+                            fetch('/api/orders')
+                                .then(res => res.json())
+                                .then(ordersData => {
+                                    window._brokerOrders = (ordersData && ordersData.broker_orders) || [];
+                                    window._brokerOrdersLoaded = true;
+                                    renderBrokerOrders(window._brokerOrders);
+                                })
+                                .catch(err => {
+                                    tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">Failed to load broker orders.</td></tr>';
+                                });
                         } else {
-                            selectEl.value = 'ALL';
+                            renderBrokerOrders(window._brokerOrders || []);
                         }
-                    }
-
-                    if (typeof filterExecutedOrders === 'function') {
-                        filterExecutedOrders();
+                    } else {
+                        // Panel is collapsed — leave the placeholder; orders load
+                        // on expand. Do NOT fetch broker orders here.
+                        tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">Expand to load broker orders (last 1 month).</td></tr>';
                     }
                 }
 
@@ -3794,6 +3847,151 @@ HTML_CONTENT = """<!DOCTYPE html>
             showToast(`Conversation exported as ${filename}`);
         }
 
+        // Render the Broker-Side Executed Orders table from a broker_orders array
+        // (fetched lazily via /api/orders). Also populates the ticker dropdown.
+        function renderBrokerOrders(brokerOrders) {
+            const tradesTbody = document.getElementById('trades-tbody');
+            if (!tradesTbody) return;
+            tradesTbody.innerHTML = '';
+            const allOrders = [...(brokerOrders || [])];
+            // Sort descending by timestamp (newest first)
+            allOrders.sort((a, b) => {
+                const tsA = a.timestamp || '';
+                const tsB = b.timestamp || '';
+                return tsB.localeCompare(tsA);
+            });
+
+            if (allOrders.length === 0) {
+                tradesTbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No orders in the last 1 month.</td></tr>';
+            } else {
+                // Sideload universe metadata (generic name + reserved symbols).
+                const sideloadName = window._sideloadUniverseName || 'Sideload Expert Lane';
+                const sideloadSymbols = (window._sideloadReservedSymbols || []).map(s => s.toUpperCase());
+                allOrders.forEach(t => {
+                    const side = t.side || 'buy';
+                    const sideClass = side.toLowerCase() === 'buy' ? 'text-green' : 'text-crimson';
+                    const dateStr = t.timestamp ? formatToEastern(t.timestamp) : 'N/A';
+                    const createdStr = t.created_at ? formatToEastern(t.created_at) : '—';
+                    const fillPriceStr = t.filled_avg_price ? '$' + t.filled_avg_price.toFixed(2) : '<span style="color: var(--text-muted)">Unfilled</span>';
+                    const symbol = t.symbol || 'N/A';
+                    const qty = t.qty !== undefined ? t.qty : 0;
+                    const status = t.status || 'filled';
+                    const orderId = t.alpaca_order_id || 'N/A';
+                    const dateGapHint = (t.created_at && t.timestamp && t.created_at.slice(0,10) !== t.timestamp.slice(0,10))
+                        ? ' <span style="color: var(--color-gold); font-size: 0.7rem;" title="Order was created on a different day than it filled (GTC limit order).">↔</span>'
+                        : '';
+                    
+                    // Universe classification: sideload-reserved symbols get a
+                    // distinct color-coded universe badge (generic name, NOT the
+                    // ticker) so future sideload lanes share one universe.
+                    const symUpper = symbol.toUpperCase();
+                    const isSideload = sideloadSymbols.includes(symUpper);
+                    let universeCell;
+                    if (isSideload) {
+                        universeCell = `<span class="badge" style="background: rgba(192, 132, 252, 0.15); color: #c084fc; text-transform: none;">${sideloadName}</span>`;
+                    } else {
+                        universeCell = `<span style="color: var(--text-muted); font-size: 0.75rem;">Core</span>`;
+                    }
+                    
+                    tradesTbody.innerHTML += `
+                        <tr>
+                            <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;">${dateStr}${dateGapHint}</td>
+                            <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-muted);">${createdStr}</td>
+                            <td style="font-weight: 600;">${symbol}</td>
+                            <td>${universeCell}</td>
+                            <td class="${sideClass}" style="text-transform: uppercase; font-weight: bold;">${side}</td>
+                            <td>${qty}</td>
+                            <td style="font-family: 'JetBrains Mono', monospace;">${fillPriceStr}</td>
+                            <td><span class="badge" style="background: rgba(255, 255, 255, 0.05); color: #e5e7eb;">${status}</span></td>
+                            <td style="font-family: 'JetBrains Mono', monospace; color: var(--text-muted); font-size: 0.8rem;">${orderId}</td>
+                        </tr>
+                    `;
+                });
+            }
+
+            // Populate unique tickers in the select dropdown dynamically
+            const selectEl = document.getElementById('orders-ticker-select');
+            if (selectEl) {
+                const previousValue = selectEl.value;
+                const uniqueSymbols = new Set();
+                allOrders.forEach(t => {
+                    if (t.symbol) uniqueSymbols.add(t.symbol.toUpperCase());
+                });
+                const sortedSymbols = Array.from(uniqueSymbols).sort();
+                // Add a universe filter option for the sideload lane (generic
+                // name, not a ticker) so all sideload-reserved symbols can be
+                // viewed together under one color-coded universe.
+                const sideloadName = window._sideloadUniverseName || 'Sideload Expert Lane';
+                let optionsHtml = '<option value="ALL">ALL TICKERS</option>';
+                optionsHtml += `<option value="__SIDELOAD__">${sideloadName}</option>`;
+                sortedSymbols.forEach(symbol => {
+                    optionsHtml += `<option value="${symbol}">${symbol}</option>`;
+                });
+                selectEl.innerHTML = optionsHtml;
+                if (uniqueSymbols.has(previousValue)) {
+                    selectEl.value = previousValue;
+                } else {
+                    selectEl.value = 'ALL';
+                }
+            }
+
+            if (typeof filterExecutedOrders === 'function') {
+                filterExecutedOrders();
+            }
+        }
+
+        // Filter the AI Strategy Decision Stream by the selected ticker.
+        function filterDecisionStream() {
+            const selectEl = document.getElementById('decisions-ticker-select');
+            if (!selectEl) return;
+            const ticker = selectEl.value;
+            const cards = document.querySelectorAll('#thought-stream .thought-card');
+            cards.forEach(card => {
+                const sym = (card.getAttribute('data-symbol') || '').toUpperCase();
+                const isMatch = (ticker === 'ALL' || sym === ticker);
+                card.style.display = isMatch ? '' : 'none';
+            });
+        }
+
+        // Collapse/expand the Broker-Side Executed Orders panel. Defaults to
+        // collapsed. Expanding triggers a lazy fetch of broker orders (last 1
+        // month) via /api/orders so the slow Alpaca ledger call is NOT made on
+        // every cache cycle.
+        function toggleOrdersCollapse() {
+            const body = document.getElementById('orders-collapsible-body');
+            const btn = document.getElementById('orders-collapse-btn');
+            if (!body || !btn) return;
+            const isCollapsed = body.style.display === 'none' || body.style.display === '';
+            if (isCollapsed) {
+                body.style.display = 'block';
+                btn.innerHTML = `<i data-lucide="chevrons-up-down" id="orders-collapse-icon" style="width: 0.9rem; height: 0.9rem;"></i>`;
+                btn.setAttribute('title', 'Collapse Orders');
+                // Lazy-load broker orders on first expand.
+                if (typeof window._brokerOrdersLoaded === 'undefined' || !window._brokerOrdersLoaded) {
+                    const tradesTbody = document.getElementById('trades-tbody');
+                    if (tradesTbody) {
+                        tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--color-gold); padding: 1.5rem;"><span class="spinner"></span> Loading broker orders...</td></tr>';
+                    }
+                    fetch('/api/orders')
+                        .then(res => res.json())
+                        .then(ordersData => {
+                            window._brokerOrders = (ordersData && ordersData.broker_orders) || [];
+                            window._brokerOrdersLoaded = true;
+                            renderBrokerOrders(window._brokerOrders);
+                        })
+                        .catch(err => {
+                            const tb = document.getElementById('trades-tbody');
+                            if (tb) tb.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">Failed to load broker orders.</td></tr>';
+                        });
+                }
+            } else {
+                body.style.display = 'none';
+                btn.innerHTML = `<i data-lucide="chevrons-down-up" id="orders-collapse-icon" style="width: 0.9rem; height: 0.9rem;"></i>`;
+                btn.setAttribute('title', 'Expand Orders');
+            }
+            safeCreateIcons();
+        }
+
         function toggleOrdersMaximize() {
             const panel = document.getElementById('executed-orders-panel');
             const btn = document.getElementById('orders-maximize-btn');
@@ -3833,12 +4031,22 @@ HTML_CONTENT = """<!DOCTYPE html>
                 if (row.cells.length < 3) return;
                 
                 const symbol = row.cells[2].textContent.trim();
-                const action = row.cells[3].textContent.trim().toUpperCase();
-                const qty = parseFloat(row.cells[4].textContent.trim()) || 0;
-                const priceText = row.cells[5].textContent.trim();
+                const universe = row.cells[3].textContent.trim();
+                const action = row.cells[4].textContent.trim().toUpperCase();
+                const qty = parseFloat(row.cells[5].textContent.trim()) || 0;
+                const priceText = row.cells[6].textContent.trim();
                 const price = priceText.includes('Unfilled') ? 0 : parseFloat(priceText.replace('$', '').replace(/,/g, '')) || 0;
                 
-                const isMatch = (ticker === 'ALL' || symbol === ticker);
+                // Universe filter: "__SIDELOAD__" matches any row whose Universe
+                // cell is NOT the plain "Core" label (i.e. any sideload lane).
+                let isMatch;
+                if (ticker === 'ALL') {
+                    isMatch = true;
+                } else if (ticker === '__SIDELOAD__') {
+                    isMatch = (universe !== 'Core');
+                } else {
+                    isMatch = (symbol === ticker);
+                }
                 if (isMatch) {
                     row.style.display = '';
                     matchCount++;
@@ -3878,20 +4086,21 @@ HTML_CONTENT = """<!DOCTYPE html>
                 return;
             }
             
-            let csvContent = "Filled,Symbol,Action,Qty,Avg Fill Price,Status,Alpaca Order ID\\r\\n";
+            let csvContent = "Filled,Symbol,Universe,Action,Qty,Avg Fill Price,Status,Alpaca Order ID\\r\\n";
             let count = 0;
             
             rows.forEach(row => {
-                if (row.style.display !== 'none' && row.cells.length >= 8) {
+                if (row.style.display !== 'none' && row.cells.length >= 9) {
                     const timestamp = row.cells[0].textContent.trim().replace(/,/g, '');
                     const symbol = row.cells[2].textContent.trim();
-                    const action = row.cells[3].textContent.trim();
-                    const qty = row.cells[4].textContent.trim();
-                    const price = row.cells[5].textContent.trim().replace('$', '').replace(/,/g, '');
-                    const status = row.cells[6].textContent.trim();
-                    const orderId = row.cells[7].textContent.trim();
+                    const universe = row.cells[3].textContent.trim();
+                    const action = row.cells[4].textContent.trim();
+                    const qty = row.cells[5].textContent.trim();
+                    const price = row.cells[6].textContent.trim().replace('$', '').replace(/,/g, '');
+                    const status = row.cells[7].textContent.trim();
+                    const orderId = row.cells[8].textContent.trim();
                     
-                    csvContent += `"${timestamp}","${symbol}","${action}",${qty},${price},"${status}","${orderId}"\\r\\n`;
+                    csvContent += `"${timestamp}","${symbol}","${universe}","${action}",${qty},${price},"${status}","${orderId}"\\r\\n`;
                     count++;
                 }
             });
@@ -4692,6 +4901,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                         "logs": ["Dashboard server is initializing, please wait..."],
                         "trading_universe": config.TRADING_UNIVERSE,
                         "screener_pool": [],
+                        "sideload_universe_name": getattr(config, "SIDELOAD_UNIVERSE_NAME", "Sideload Expert Lane"),
+                        "sideload_reserved_symbols": sorted(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set())),
                         "latest_watchlist": [],
                         "interval": config.TRADING_INTERVAL_MINUTES,
                         "is_mock": True,
@@ -4721,6 +4932,42 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(encoded_payload)
             except Exception as e:
                 encoded_err = json.dumps({"error": str(e)}).encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(encoded_err)))
+                self.end_headers()
+                self.wfile.write(encoded_err)
+        elif self.path == '/api/orders':
+            # Lazy-loaded Broker-Side Executed Orders. The panel is collapsed by
+            # default and only calls this endpoint when the user expands it, so
+            # the slow Alpaca order-ledger pagination is NOT run on every cache
+            # cycle. Defaults to the last 1 month of filled orders.
+            try:
+                from datetime import datetime, timedelta, timezone
+                # Default to last 1 month of fills.
+                since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+                client = AlpacaClient()
+                orders = []
+                if not client.is_mock:
+                    orders = client.get_executed_orders(limit=500, since=since)
+                payload = {
+                    "broker_orders": orders,
+                    "sideload_universe_name": getattr(config, "SIDELOAD_UNIVERSE_NAME", "Sideload Expert Lane"),
+                    "sideload_reserved_symbols": sorted(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set())),
+                    "since": since,
+                }
+                encoded_payload = json.dumps(payload).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(encoded_payload)))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                self.end_headers()
+                self.wfile.write(encoded_payload)
+            except Exception as e:
+                encoded_err = json.dumps({"error": str(e), "broker_orders": []}).encode('utf-8')
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Content-Length', str(len(encoded_err)))

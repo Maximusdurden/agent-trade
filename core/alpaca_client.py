@@ -452,7 +452,7 @@ class AlpacaClient:
             }
         return result
 
-    def get_executed_orders(self, limit: int = 200, page_size: int = 2000) -> list[dict]:
+    def get_executed_orders(self, limit: int = 200, page_size: int = 2000, since: str | None = None) -> list[dict]:
         """Fetches filled/closed orders directly from Alpaca, paginating for full history.
 
         This catches TP/SL bracket fills and broker-side sells that the runner
@@ -463,6 +463,14 @@ class AlpacaClient:
 
         Duplicate detection happens at the call site (dashboard cache worker /
         runner reconciliation) by comparing ``alpaca_order_id`` values.
+
+        Args:
+            limit: Max number of distinct filled orders to return (newest first).
+            page_size: Alpaca page size per request.
+            since: Optional ISO-8601 datetime string. When provided, only orders
+                filled at/after this time are returned (e.g. "last 1 month").
+                This avoids paging through the entire order history when the
+                caller only needs recent orders.
         """
         if self.is_mock:
             return []
@@ -488,6 +496,14 @@ class AlpacaClient:
                 for order in page:
                     if order.filled_at is None:
                         continue
+                    # If a `since` cutoff is set, stop collecting once we hit an
+                    # order filled before the cutoff (pages are newest-first).
+                    if since is not None:
+                        filled_iso = order.filled_at.isoformat() if hasattr(order.filled_at, "isoformat") else str(order.filled_at)
+                        if filled_iso < since:
+                            # This order is older than the cutoff; we can stop
+                            # paging entirely because everything older is too.
+                            return self._dedupe_and_trim(executed, limit)
                     # Map Alpaca's slashless crypto symbol back
                     sym = (order.symbol or "").upper()
                     trading_universe = getattr(config, "TRADING_UNIVERSE", [])
@@ -526,19 +542,22 @@ class AlpacaClient:
                 until = oldest_filled.isoformat() if hasattr(oldest_filled, "isoformat") else str(oldest_filled)
                 if len(executed) >= limit:
                     break
-            # Trim to requested limit, keeping most recent first (dedupe first).
-            seen = set()
-            unique = []
-            for o in executed:
-                if o["alpaca_order_id"] in seen:
-                    continue
-                seen.add(o["alpaca_order_id"])
-                unique.append(o)
-            unique.sort(key=lambda o: o["timestamp"], reverse=True)
-            return unique[:limit]
+            return self._dedupe_and_trim(executed, limit)
         except Exception as e:
             logger.error(f"Error fetching executed orders from Alpaca: {e}")
             return []
+
+    def _dedupe_and_trim(self, executed: list[dict], limit: int) -> list[dict]:
+        """Dedupe by alpaca_order_id and trim to `limit`, newest first."""
+        seen = set()
+        unique = []
+        for o in executed:
+            if o["alpaca_order_id"] in seen:
+                continue
+            seen.add(o["alpaca_order_id"])
+            unique.append(o)
+        unique.sort(key=lambda o: o["timestamp"], reverse=True)
+        return unique[:limit]
 
     def get_historical_bars(self, symbol, limit: int = 100, timeframe_str: str = "day", max_retries: int = 3) -> pd.DataFrame:
         """Fetches historical daily or intraday bar data for a ticker or list of tickers (automatically handles Stocks or Crypto).
