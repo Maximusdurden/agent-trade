@@ -90,6 +90,13 @@ class RiskGuardrails:
         sym = normalize_symbol(symbol)
         if is_crypto_member(sym) or "/" in sym:
             return None  # crypto is 24/7 and evidence shows it's the profitable book
+        # Sideload-reserved symbols (e.g. AMD owned by the AMD expert lane) are
+        # exclusively owned by a dedicated sideload lane and are backtest-validated
+        # by that lane. The strict-universe watchlist check is a NORMAL-lane
+        # guardrail; it must never block the sideload lane's dedicated symbol.
+        reserved = set(getattr(config, "SIDELOAD_RESERVED_SYMBOLS", set()))
+        if symbol.upper() in reserved or sym.upper() in reserved:
+            return None
         if self._in_latest_watchlist(symbol):
             return None  # screener-endorsed this cycle -> always eligible
         held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
