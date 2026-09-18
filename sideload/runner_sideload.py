@@ -88,6 +88,9 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     cycle_id = _build_cycle_id()
     cycle_context = {"spent": 0.0, "trades": 0}
     executed_results = []
+    # Capture the AMD decision payload so it can be re-inserted into a fresh GCS
+    # DB right before upload (race-condition fix — see step 8).
+    amd_decision_payload = None
 
     for decision in decisions:
         if not isinstance(decision, dict):
@@ -110,6 +113,25 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         qty = float(adjusted.get("quantity", 0.0) or 0.0)
         thought = adjusted.get("thought_process", "")
         reasoning = adjusted.get("reasoning") or thought
+
+        # Capture the payload for the pre-upload re-insert (step 8).
+        amd_decision_payload = {
+            "ticker_indicators": {symbol: market_state.get("indicators", {})},
+            "portfolio_state": {"cash": cash, "equity": equity, "positions": positions},
+            "thought_process": thought,
+            "proposed_action": action,
+            "proposed_symbol": symbol,
+            "proposed_qty": qty,
+            "is_approved": is_approved,
+            "rejection_reason": status_msg if not is_approved else None,
+            "direction": adjusted.get("direction"),
+            "conviction": adjusted.get("conviction"),
+            "instrument": adjusted.get("instrument"),
+            "cycle_id": cycle_id,
+            "reasoning": reasoning,
+            "model": adjusted.get("model"),
+            "entry_gate": adjusted.get("entry_gate"),
+        }
 
         # 5. Log decision to the SAME DB (dashboard picks it up).
         decision_id = None
@@ -214,6 +236,28 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         log_exception_to_jira(e, "AMD Sideload Broker Reconciliation Failure")
 
     # 8. Sync to GCS if configured (so the cloud DB stays fresh for blog/dashboard).
+    # RACE-CONDITION FIX (2026-09-18): the normal lane and this sideload lane both
+    # upload the WHOLE trading_agent.db to the same GCS blob, and the last upload
+    # wins. When the normal lane uploads AFTER this lane, it clobbers this lane's
+    # AMD decision — so AMD "disappears" from the dashboard a few minutes after
+    # appearing. To prevent that, re-download the freshest GCS DB right before
+    # uploading and re-insert this lane's AMD decision into it, so this upload
+    # carries BOTH the latest normal-lane decisions AND the AMD decision.
+    try:
+        from core.gcs_sync import download_from_gcs
+        download_from_gcs()
+        # Re-insert this cycle's AMD decision into the freshly-downloaded DB so
+        # it survives the upload (the download may have overwritten the local DB,
+        # which is fine — we only need to persist the AMD decision).
+        if amd_decision_payload:
+            try:
+                database.log_decision(**amd_decision_payload)
+                logger.info("Re-inserted AMD decision into fresh GCS DB before upload.")
+            except Exception as reinsert_err:
+                logger.error(f"Failed to re-insert AMD decision before upload: {reinsert_err}")
+    except Exception as dl_err:
+        logger.warning(f"Could not re-download GCS DB before sideload upload: {dl_err}")
+
     try:
         from core.gcs_sync import upload_to_gcs
         upload_to_gcs()
