@@ -154,7 +154,7 @@ function Deploy-Job {
         $K = $Parts[0]
         $V = $Parts[1]
         $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
-        $FlagLines += "  $K: `"$Escaped`""
+        $FlagLines += "  ${K}: `"$Escaped`""
     }
     [System.IO.File]::WriteAllText($FlagsFile, [string]::Join("`n", $FlagLines), [System.Text.Encoding]::UTF8)
 
