@@ -6,6 +6,19 @@ from core import config
 
 logger = logging.getLogger("GCSSync")
 
+def _kill_switch_local_path() -> str:
+    """Return the local kill-switch cache path.
+
+    Overridable via KILL_SWITCH_LOCAL_PATH so tests can point it at a temp file
+    instead of the repo-root kill_switch.json (which check_kill_switch writes to
+    as a GCS-down fallback cache — a test flipping it to HALTED would otherwise
+    halt trading if committed).
+    """
+    override = os.getenv("KILL_SWITCH_LOCAL_PATH")
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kill_switch.json")
+
 def get_gcs_client():
     """
     Returns a google.cloud.storage.Client instance.
@@ -263,7 +276,7 @@ def check_kill_switch() -> dict:
     """
     import json
     gcs_bucket = os.getenv("GCS_BUCKET_NAME")
-    local_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kill_switch.json")
+    local_path = _kill_switch_local_path()
     
     if not gcs_bucket:
         # Fallback to local if no GCS bucket
@@ -320,7 +333,7 @@ def set_kill_switch_state(status: str, updated_by: str = "system") -> bool:
         "updated_at": datetime.utcnow().isoformat() + "Z",
         "updated_by": updated_by
     }
-    local_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kill_switch.json")
+    local_path = _kill_switch_local_path()
     
     # Save local cache
     try:

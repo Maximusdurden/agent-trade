@@ -67,10 +67,21 @@ class TestSprintFeatures(unittest.TestCase):
         mock_client.bucket.return_value = mock_bucket
         mock_get_client.return_value = mock_client
         
-        # Override env to simulate GCS configured
-        with patch.dict(os.environ, {"GCS_BUCKET_NAME": "test-bucket"}):
+        # Point the local kill-switch cache at a temp file so check_kill_switch's
+        # "sync to local cache" write doesn't clobber the real repo-root
+        # kill_switch.json (which would flip it to HALTED and halt trading if
+        # committed).
+        import tempfile
+        tmp_ks = os.path.join(tempfile.gettempdir(), "test_kill_switch_cache.json")
+        if os.path.exists(tmp_ks):
+            os.remove(tmp_ks)
+        # Override env to simulate GCS configured + isolated local cache path
+        with patch.dict(os.environ, {"GCS_BUCKET_NAME": "test-bucket",
+                                     "KILL_SWITCH_LOCAL_PATH": tmp_ks}):
             status = check_kill_switch()
             self.assertEqual(status.get("status"), "HALTED")
+        if os.path.exists(tmp_ks):
+            os.remove(tmp_ks)
 
     @patch("core.alpaca_client.AlpacaClient")
     def test_data_provider_crypto_symbol_standardization_and_timeframe(self, mock_client_class):
