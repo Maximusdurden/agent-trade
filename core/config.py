@@ -257,9 +257,11 @@ STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 # strategy_history.strategy_version). This lets us measure which model writes
 # higher-conviction / better-performing rules over a few weeks, without a code
 # redeploy. If unset, the strategist uses STRATEGIST_MODEL_TIER (current behavior).
-# Default here is the intended experiment: [deepseek-r1 (control), Claude Sonnet (variant)].
-# claude-sonnet-5 verified live on OpenRouter (2026-06 GA), stronger & cheaper than sonnet-4.
-_ab_default = "deepseek/deepseek-r1,anthropic/claude-sonnet-5"
+# DISABLED by default (2026-09-18): Claude Sonnet is too token-expensive and was
+# banned. Empty default => no A/B experiment; strategist uses STRATEGIST_MODEL_TIER
+# (daily_driver -> google/gemini-2.5-flash). Set STRATEGIST_AB_MODELS in .env to
+# re-enable with CHEAP models only (never Claude Sonnet).
+_ab_default = ""
 STRATEGIST_AB_MODELS = os.getenv("STRATEGIST_AB_MODELS", _ab_default)
 # Optional experiment label so harness reports can name the trial.
 STRATEGIST_AB_LABEL = os.getenv("STRATEGIST_AB_LABEL", "r1-vs-sonnet")
