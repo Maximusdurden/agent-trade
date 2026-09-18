@@ -88,6 +88,17 @@ def main() -> None:
     from core.trading_brain import TradingBrain
     from sideload import runner_sideload as rs
 
+    # CRITICAL: download the latest GCS DB BEFORE running so the sideload lane
+    # MERGES its AMD decision into the existing data instead of starting from an
+    # empty /tmp DB and overwriting the normal lane's decisions on upload. This
+    # was the root cause of the dashboard "flipping" between the AMD post and the
+    # normal-lane posts (each job's upload clobbered the other's).
+    try:
+        from core.gcs_sync import download_from_gcs
+        download_from_gcs()
+    except Exception as dl_err:
+        logger.warning(f"Could not download GCS DB before sideload cycle: {dl_err}")
+
     alpaca_client = AlpacaClient()
     data_provider = DataProvider(alpaca_client)
     brain = TradingBrain()

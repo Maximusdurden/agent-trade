@@ -144,15 +144,29 @@ function Deploy-Job {
     $JobExists = ($LastExitCode -eq 0)
     $ErrorActionPreference = $OldPreference
 
+    # BRAIN_AB_MODELS is a comma-separated list; gcloud --set-env-vars treats
+    # commas as key separators, so pass env vars via a YAML flags file instead
+    # (robust to commas/special chars). Quote every value so YAML keeps strings.
+    $FlagsFile = Join-Path $StagingDir "deploy_flags_${JobName}.yaml"
+    $FlagLines = @("--set-env-vars:")
+    foreach ($Entry in $EnvVariablesList) {
+        $Parts = $Entry.Split("=", 2)
+        $K = $Parts[0]
+        $V = $Parts[1]
+        $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
+        $FlagLines += "  $K: `"$Escaped`""
+    }
+    [System.IO.File]::WriteAllText($FlagsFile, [string]::Join("`n", $FlagLines), [System.Text.Encoding]::UTF8)
+
     if (-not $JobExists) {
         & $GCloud run jobs create $JobName --image $ImageTag --region $Region `
             --command "python" --args $Entrypoint `
-            --set-env-vars ($EnvVariablesList -join ",") `
+            --flags-file $FlagsFile `
             --set-secrets ($SecretReferences -join ",")
     } else {
         & $GCloud run jobs update $JobName --image $ImageTag --region $Region `
             --command "python" --args $Entrypoint `
-            --set-env-vars ($EnvVariablesList -join ",") `
+            --flags-file $FlagsFile `
             --set-secrets ($SecretReferences -join ",")
     }
     if ($LASTEXITCODE -ne 0) {
