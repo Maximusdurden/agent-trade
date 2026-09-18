@@ -137,6 +137,9 @@ Write-Host "`n--- Deploying Cloud Run Service: $ServiceName ---"
 # partly from pandas/numpy + DataProvider market-state fetches in the chat
 # handler). Pin 1Gi/1cpu here so the memory bump is reproducible, not a manual
 # one-off `gcloud run services update`.
+# BRAIN_AB_MODELS is a comma-separated list; gcloud --set-env-vars treats commas
+# as key separators, so escape them with a backslash to keep the value intact.
+$EscapedBrainAbModels = $BrainAbModels.Replace(",", "\,")
 gcloud run deploy $ServiceName `
     --image $ImageTag `
     --region $Region `
@@ -144,7 +147,7 @@ gcloud run deploy $ServiceName `
     --memory 1Gi `
     --cpu 1 `
     --labels "service=agenttrade-dashboard,app=agent-trade,env=prod" `
-    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper,GEMINI_API_KEY=$GeminiApiKey,GEMINI_MODEL=$GeminiModel,OPENROUTER_API_KEY=$OpenRouterApiKey,OPENROUTER_BASE_URL=$OpenRouterBaseUrl,MODEL_DAILY_DRIVER=$ModelDailyDriver,BRAIN_AB_MODELS=$BrainAbModels,BRAIN_AB_LABEL=$BrainAbLabel" `
+    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper,GEMINI_API_KEY=$GeminiApiKey,GEMINI_MODEL=$GeminiModel,OPENROUTER_API_KEY=$OpenRouterApiKey,OPENROUTER_BASE_URL=$OpenRouterBaseUrl,MODEL_DAILY_DRIVER=$ModelDailyDriver,BRAIN_AB_MODELS=$EscapedBrainAbModels,BRAIN_AB_LABEL=$BrainAbLabel" `
     --quiet
 
 # 7. Clean Staging Directory
