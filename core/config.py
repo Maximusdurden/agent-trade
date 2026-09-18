@@ -160,6 +160,13 @@ STRATEGY_STALE_HOURS = float(os.getenv("STRATEGY_STALE_HOURS", "26"))
 # at least MIN_VWAP_BARS intraday bars.
 MIN_VWAP_BARS = int(os.getenv("MIN_VWAP_BARS", "4"))
 
+# Rolling VWAP window for 24/7 crypto (hours). Crypto trades around the clock, so
+# a per-UTC-day VWAP reset makes VWAP degenerate right after midnight UTC (the
+# new day has < MIN_VWAP_BARS bars), gating VWAP to None. For crypto we instead
+# compute VWAP over a rolling window of this many hours, guaranteeing a
+# meaningful VWAP value at all times. Equities keep session-based (per-day) VWAP.
+VWAP_ROLLING_HOURS = float(os.getenv("VWAP_ROLLING_HOURS", "24"))
+
 # Whipsaw-prevention knobs (2026-09-09). These target the WFC-style intraday
 # buy/sell flip-flop where a stateless brain re-decides every 15 min and churns
 # a tight range around VWAP.

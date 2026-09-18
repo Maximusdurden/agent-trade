@@ -130,7 +130,7 @@ class DataProvider:
                 return {}
 
             # Calculate technical indicators
-            df = self._add_technical_indicators(df)
+            df = self._add_technical_indicators(df, symbol=symbol)
             
             # Get the latest close and interval details
             latest = df.iloc[-1]
@@ -166,7 +166,7 @@ class DataProvider:
             # until the current day has at least MIN_VWAP_BARS bars so the brain
             # cannot cite VWAP as confluence early in the session.
             from core import config
-            today_bars = self._count_today_bars(df)
+            today_bars = self._count_today_bars(df, symbol=symbol)
             vwap_valid = today_bars >= config.MIN_VWAP_BARS
             if not vwap_valid:
                 logger.info(
@@ -228,14 +228,21 @@ class DataProvider:
             logger.error(f"Error compiling market state for {symbol}: {e}")
             return {}
 
-    def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Helper to calculate standard technical indicators using Pandas/Numpy."""
-        if isinstance(df.index, pd.MultiIndex):
-            return df.groupby(level=0, group_keys=False).apply(self._add_technical_indicators_single)
-        else:
-            return self._add_technical_indicators_single(df)
+    def _add_technical_indicators(self, df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
+        """Helper to calculate standard technical indicators using Pandas/Numpy.
 
-    def _add_technical_indicators_single(self, df: pd.DataFrame) -> pd.DataFrame:
+        ``symbol`` is used to decide the VWAP day boundary: 24/7 crypto uses a
+        rolling window (so VWAP never goes stale at midnight UTC), while equities
+        keep session-based (per-UTC-day) VWAP.
+        """
+        if isinstance(df.index, pd.MultiIndex):
+            return df.groupby(level=0, group_keys=False).apply(
+                lambda g: self._add_technical_indicators_single(g, symbol)
+            )
+        else:
+            return self._add_technical_indicators_single(df, symbol)
+
+    def _add_technical_indicators_single(self, df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
         """Helper to calculate standard technical indicators for a single symbol."""
         df = df.copy()
         if df.empty:
@@ -283,21 +290,45 @@ class DataProvider:
         # ATR as a % of price (volatility ratio) for cross-asset comparison.
         df["atr_pct"] = df["atr_14"] / np.where(df["close"] == 0, 0.00001, df["close"]) * 100.0
 
-        # 5. Dynamic Intraday VWAP and Bands (resetting daily)
+        # 5. Dynamic Intraday VWAP and Bands.
+        # Equities: VWAP resets daily (session-based) — the standard definition.
+        # 24/7 crypto: VWAP is computed over a ROLLING window (VWAP_ROLLING_HOURS)
+        # so it never goes stale at midnight UTC. A per-UTC-day reset makes crypto
+        # VWAP degenerate right after midnight (the new day has < MIN_VWAP_BARS
+        # bars), which previously gated VWAP to None for ~20 min every day.
         df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
         df["tp_vol"] = df["typical_price"] * df["volume"]
-        
-        dates = df.index.date if not isinstance(df.index, pd.MultiIndex) else df.index.get_level_values(1).date
-        
-        df["cum_tp_vol"] = df.groupby(dates)["tp_vol"].cumsum()
-        df["cum_vol"] = df.groupby(dates)["volume"].cumsum()
-        df["vwap"] = df["cum_tp_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
-        
-        df["tp_vwap_diff_sq_vol"] = ((df["typical_price"] - df["vwap"]) ** 2) * df["volume"]
-        df["cum_diff_sq_vol"] = df.groupby(dates)["tp_vwap_diff_sq_vol"].cumsum()
-        df["vwap_var"] = df["cum_diff_sq_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
-        df["vwap_std"] = np.sqrt(np.maximum(df["vwap_var"], 0))
-        
+
+        is_crypto = bool(symbol) and ("/" in symbol or "USD" in symbol)
+        if is_crypto:
+            from core import config
+            window_hours = float(getattr(config, "VWAP_ROLLING_HOURS", 24.0))
+            # Rolling window in bars (5-min bars -> 12/hour). Use the index
+            # timestamps to build a boolean mask of bars within the window.
+            idx = df.index
+            if isinstance(idx, pd.MultiIndex):
+                idx = idx.get_level_values(1)
+            latest_ts = idx[-1]
+            window_start = latest_ts - pd.Timedelta(hours=window_hours)
+            in_window = idx >= window_start
+            # Cumulative sums over the rolling window (reset at window start).
+            df["cum_tp_vol"] = df["tp_vol"].where(in_window, 0.0).cumsum()
+            df["cum_vol"] = df["volume"].where(in_window, 0.0).cumsum()
+            df["vwap"] = df["cum_tp_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
+            df["tp_vwap_diff_sq_vol"] = ((df["typical_price"] - df["vwap"]) ** 2) * df["volume"]
+            df["cum_diff_sq_vol"] = df["tp_vwap_diff_sq_vol"].where(in_window, 0.0).cumsum()
+            df["vwap_var"] = df["cum_diff_sq_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
+            df["vwap_std"] = np.sqrt(np.maximum(df["vwap_var"], 0))
+        else:
+            dates = df.index.date if not isinstance(df.index, pd.MultiIndex) else df.index.get_level_values(1).date
+            df["cum_tp_vol"] = df.groupby(dates)["tp_vol"].cumsum()
+            df["cum_vol"] = df.groupby(dates)["volume"].cumsum()
+            df["vwap"] = df["cum_tp_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
+            df["tp_vwap_diff_sq_vol"] = ((df["typical_price"] - df["vwap"]) ** 2) * df["volume"]
+            df["cum_diff_sq_vol"] = df.groupby(dates)["tp_vwap_diff_sq_vol"].cumsum()
+            df["vwap_var"] = df["cum_diff_sq_vol"] / np.where(df["cum_vol"] == 0, 0.00001, df["cum_vol"])
+            df["vwap_std"] = np.sqrt(np.maximum(df["vwap_var"], 0))
+
         df["vwap_upper_1"] = df["vwap"] + df["vwap_std"]
         df["vwap_lower_1"] = df["vwap"] - df["vwap_std"]
         df["vwap_upper_2"] = df["vwap"] + (df["vwap_std"] * 2)
@@ -306,15 +337,19 @@ class DataProvider:
         
         return df
 
-    def _count_today_bars(self, df: pd.DataFrame) -> int:
-        """Count how many intraday bars fall on the latest trading day in df.
+    def _count_today_bars(self, df: pd.DataFrame, symbol: str | None = None) -> int:
+        """Count how many intraday bars fall in the VWAP window.
 
         VWAP is cumulative within a single day, so its value (and bands /
         dist_pct) is only meaningful once enough bars have accumulated. With a
         single bar, vwap == typical_price and vwap_dist_pct collapses to ~0%,
         which the brain can mistake for "price hugging VWAP" confluence. This
-        helper returns the number of bars on the most recent day so callers can
-        gate VWAP-derived fields.
+        helper returns the number of bars in the VWAP window so callers can gate
+        VWAP-derived fields.
+
+        For equities the window is the latest UTC trading day (session-based).
+        For 24/7 crypto the window is a rolling VWAP_ROLLING_HOURS window, so the
+        count never collapses to < MIN_VWAP_BARS right after midnight UTC.
         """
         if df is None or df.empty:
             return 0
@@ -326,6 +361,13 @@ class DataProvider:
             idx = df.index
         if not hasattr(idx, "date"):
             return 0
+        is_crypto = bool(symbol) and ("/" in symbol or "USD" in symbol)
+        if is_crypto:
+            from core import config
+            window_hours = float(getattr(config, "VWAP_ROLLING_HOURS", 24.0))
+            latest_ts = idx[-1]
+            window_start = latest_ts - pd.Timedelta(hours=window_hours)
+            return int((idx >= window_start).sum())
         latest_date = idx[-1].date()
         return int((idx.date == latest_date).sum())
 
