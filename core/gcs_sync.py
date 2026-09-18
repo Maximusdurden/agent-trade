@@ -186,6 +186,37 @@ def _merge_local_into_gcs_db(local_db_path: str, gcs_db_path: str) -> bool:
         conn_local = sqlite3.connect(local_db_path)
         conn_gcs = sqlite3.connect(gcs_db_path)
         try:
+            # system_state is a key-value table (key TEXT PRIMARY KEY) holding
+            # the cycle heartbeat (last_cycle_*) and other operational state.
+            # It is NOT a log table — the freshest value must win, so we use
+            # INSERT OR REPLACE (local DB is the freshest by definition here).
+            # Without this, the merge would preserve a stale GCS heartbeat while
+            # still merging fresh decisions, causing the dashboard to report
+            # "RUNNER STALE — HEARTBEAT OVERDUE" even though the runner is live.
+            try:
+                local_state_cols = {r[1] for r in conn_local.execute("PRAGMA table_info(system_state)")}
+                gcs_state_cols = {r[1] for r in conn_gcs.execute("PRAGMA table_info(system_state)")}
+                if local_state_cols and gcs_state_cols:
+                    state_cols = [c for c in local_state_cols if c in gcs_state_cols]
+                    if "key" in state_cols and "value" in state_cols:
+                        state_col_list = ", ".join(f'"{c}"' for c in state_cols)
+                        state_placeholders = ", ".join("?" for _ in state_cols)
+                        state_sql = (
+                            f"INSERT OR REPLACE INTO system_state ({state_col_list}) "
+                            f"VALUES ({state_placeholders})"
+                        )
+                        state_rows = conn_local.execute(
+                            f"SELECT {state_col_list} FROM system_state"
+                        ).fetchall()
+                        for row in state_rows:
+                            try:
+                                conn_gcs.execute(state_sql, tuple(row))
+                            except Exception as ins_err:
+                                logger.warning(f"Insert into system_state failed: {ins_err}")
+                        logger.info(f"Merged {len(state_rows)} system_state key(s) (freshest wins).")
+            except Exception as state_err:
+                logger.warning(f"Failed to merge system_state: {state_err}")
+
             # Tables to merge. For tables with a global AUTOINCREMENT `id` (like
             # decisions), the `id` is NOT a safe merge key because both DBs start
             # at 1 and collide — so we use a NATURAL key (cycle_id + symbol +
