@@ -47,6 +47,26 @@ from core import database
 
 logger = logging.getLogger("TradingBrain")
 
+
+def _fmt_freshness(freshness) -> str:
+    """Format the data-freshness block for the brain prompt.
+
+    Alpaca's intraday bar feed can lag the live quote. When the bar indicators
+    (RSI/VWAP/regime) are computed on stale bars, the brain must know so it can
+    discount them and rely on the live price instead.
+    """
+    if not isinstance(freshness, dict):
+        return "n/a"
+    lag = freshness.get("bar_lag_minutes")
+    is_stale = freshness.get("is_stale", False)
+    live = freshness.get("live_price")
+    bar = freshness.get("bar_close")
+    if is_stale:
+        return (f"STALE (bar feed {lag} min behind live; live=${live:,.2f} vs bar=${bar:,.2f}). "
+                f"Indicators may be outdated — rely on the LIVE price and be conservative.")
+    return f"FRESH (bar lag {lag} min)."
+
+
 class TradingBrain:
     """The AI engine that consumes market and portfolio state and generates a trading decision."""
     
@@ -364,6 +384,7 @@ Ticker: {symbol}
 - VWAP Upper Band (+2σ): ${ind.get('vwap_upper_2')}
 - VWAP Lower Band (-2σ): ${ind.get('vwap_lower_2')}
 - Price Distance from VWAP: {ind.get('vwap_dist_pct')}%
+- DATA FRESHNESS: {_fmt_freshness(data.get('data_freshness'))}
 - ADVANCED PRICE ANCHORS:
   - Fibonacci Retracement Levels: {fib_str}
   - Psychological Levels: {psy_str}

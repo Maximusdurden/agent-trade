@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 import numpy as np
+from datetime import datetime, timezone
 from core.alpaca_client import AlpacaClient
 
 logger = logging.getLogger("DataProvider")
@@ -191,14 +192,51 @@ class DataProvider:
             # the VWAP fields) so early-session "no signal" isn't misread as 0.
             edge_sigma = edge_sigma if (vwap_valid and edge_sigma is not None) else None
 
+            # ------------------------------------------------------------------
+            # LIVE-PRICE ALIGNMENT (2026-09-18)
+            # Alpaca's intraday bar feed can LAG the real-time quote by minutes
+            # to hours (observed: 5-min bars showed $105.75 while the live quote
+            # was $111.82). The brain's indicators (RSI/VWAP/regime) are computed
+            # from bars, but `current_price` should reflect the LIVE price so the
+            # brain sizes/decides against reality, not a stale bar close. We fetch
+            # the real-time quote and override `current_price` with it, and expose
+            # a `data_freshness` block so the brain can see how stale the bar
+            # indicators are (and discount them if needed).
+            # ------------------------------------------------------------------
+            bar_close = float(latest["close"])
+            live_price = bar_close
+            bar_lag_minutes = 0.0
+            try:
+                live_price = float(self.client.get_latest_price(symbol))
+            except Exception as live_err:
+                logger.warning(f"Could not fetch live price for {symbol}: {live_err}. Using bar close.")
+                live_price = bar_close
+            # How stale is the latest bar relative to now? (bar feed lag)
+            try:
+                latest_ts = df.index[-1]
+                if isinstance(df.index, pd.MultiIndex):
+                    latest_ts = latest_ts[-1]
+                if latest_ts.tzinfo is None:
+                    latest_ts = latest_ts.tz_localize("UTC")
+                bar_lag_minutes = max(0.0, (datetime.now(timezone.utc) - latest_ts).total_seconds() / 60.0)
+            except Exception as lag_err:
+                logger.debug(f"Could not compute bar lag for {symbol}: {lag_err}")
+
             market_state = {
                 "symbol": symbol,
-                "current_price": float(latest["close"]),
+                "current_price": live_price,
+                "bar_close": bar_close,
                 "prev_close": prev_close_val,
                 "daily_return_pct": daily_return_pct,
                 "volume": int(latest["volume"]),
                 "regime": regime,
                 "edge_sigma": edge_sigma,
+                "data_freshness": {
+                    "bar_lag_minutes": round(bar_lag_minutes, 1),
+                    "is_stale": bar_lag_minutes > float(getattr(config, "DATA_STALE_MINUTES", 15)),
+                    "live_price": live_price,
+                    "bar_close": bar_close,
+                },
                 "indicators": {
                     "rsi_14": float(latest["rsi_14"]) if not pd.isna(latest["rsi_14"]) else None,
                     "sma_20": float(latest["sma_20"]) if not pd.isna(latest["sma_20"]) else None,

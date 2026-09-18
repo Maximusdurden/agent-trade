@@ -167,6 +167,13 @@ MIN_VWAP_BARS = int(os.getenv("MIN_VWAP_BARS", "4"))
 # meaningful VWAP value at all times. Equities keep session-based (per-day) VWAP.
 VWAP_ROLLING_HOURS = float(os.getenv("VWAP_ROLLING_HOURS", "24"))
 
+# Data-freshness guard (2026-09-18): Alpaca's intraday bar feed can lag the
+# real-time quote by minutes-to-hours. `DataProvider.get_market_state()` now
+# overrides `current_price` with the live quote and exposes a `data_freshness`
+# block. A bar older than this many minutes is flagged `is_stale` so the brain
+# can discount indicators computed on stale bars.
+DATA_STALE_MINUTES = float(os.getenv("DATA_STALE_MINUTES", "15"))
+
 # Whipsaw-prevention knobs (2026-09-09). These target the WFC-style intraday
 # buy/sell flip-flop where a stateless brain re-decides every 15 min and churns
 # a tight range around VWAP.
