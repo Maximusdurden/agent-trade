@@ -475,12 +475,11 @@ DIRECTIONS:
 
 OUTPUT FORMAT:
 You must reply with a valid JSON object ONLY. Do not wrap in markdown blocks other than standard JSON mime type. The output is an object with a "decisions" array (one element per ticker).
-CONCISENESS REQUIREMENT (CRITICAL): Keep the ENTIRE response compact. The "thought_process" field MUST be at most 1-2 short sentences (under ~40 words) per ticker — a terse justification of the action and conviction only. Do NOT pad with filler, do NOT restate the market data, do NOT repeat the rule text. A verbose, bloated response is a FAILURE and will be truncated. Prioritize brevity so the full JSON completes quickly.
 JSON Schema:
 {{
   "decisions": [
     {{
-      "thought_process": "Terse 1-2 sentence reasoning: the action, the key indicator that drove it, and the conviction justification. Under ~40 words.",
+      "thought_process": "Detailed explanation of technical indicators analyzed, how news and advanced anchors/pivots influenced direction, your confluence reasoning for the chosen dynamic trade size, and compliance with the mandatory strategy rule. MUST also explicitly state: (1) your conviction level and why, and (2) if the symbol is in the options universe, whether you'd express the view via options (leverage) vs shares, and why.",
       "action": "BUY" | "SELL" | "HOLD",
       "symbol": {allowed_symbols_str},
       "quantity": float (number of shares, use 0 for HOLD),

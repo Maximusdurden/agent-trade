@@ -307,12 +307,12 @@ BRAIN_AB_LABEL = os.getenv("BRAIN_AB_LABEL", "flash-vs-pro")
 # verbose decision (with a long thought_process) per appraised ticker, so the
 # default 2048-token cap truncates the JSON mid-response and forces a rule-based
 # fallback. Bump this well above the expected response size.
-# NOTE: 8192 was too high — it let verbose models (deepseek/deepseek-v4-flash-0731)
-# stream a huge response that exceeded the 20s attempt timeout, causing 4x
-# timeouts -> Gemini fallback on every deepseek day. 4096 + the verbosity
-# constraint in the brain prompt keeps the response compact enough to finish
-# within the (now adaptive) timeout while still fitting all 16 tickers.
-BRAIN_MAX_OUTPUT_TOKENS = int(os.getenv("BRAIN_MAX_OUTPUT_TOKENS", "4096"))
+# NOTE: was temporarily 4096 to cap deepseek's verbose output (deepseek timeout
+# fix), but deepseek is now removed from the brain A/B (single gemini-2.5-flash,
+# which is fast even on large outputs). Restored to 8192 so the brain has room
+# for detailed, high-conviction reasoning (the verbosity constraint was reverted
+# because it degraded decision quality to terse 0.0-conviction HOLDs).
+BRAIN_MAX_OUTPUT_TOKENS = int(os.getenv("BRAIN_MAX_OUTPUT_TOKENS", "8192"))
 # Max output tokens for the strategist's daily rule JSON. The strategist emits a
 # verbose meta_reasoning + todays_rules per ticker; the default 2048-token cap
 # truncates the JSON mid-response, which surfaces as "Expecting ',' delimiter"
