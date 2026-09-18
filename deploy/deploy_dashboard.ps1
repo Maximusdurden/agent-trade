@@ -142,19 +142,19 @@ Write-Host "`n--- Deploying Cloud Run Service: $ServiceName ---"
 # pass the env vars via a YAML flags file instead (robust to commas/special chars).
 $FlagsFile = Join-Path $StagingDir "deploy_flags.yaml"
 @"
-set-env-vars:
+--set-env-vars:
   GCS_BUCKET_NAME: agenttrade-us-data-bucket
   DATABASE_FILENAME: /tmp/trading_agent.db
-  ALPACA_API_KEY: "$AlpacaApiKey"
-  ALPACA_SECRET_KEY: "$AlpacaSecretKey"
-  ALPACA_PAPER: "$AlpacaPaper"
-  GEMINI_API_KEY: "$GeminiApiKey"
-  GEMINI_MODEL: "$GeminiModel"
-  OPENROUTER_API_KEY: "$OpenRouterApiKey"
-  OPENROUTER_BASE_URL: "$OpenRouterBaseUrl"
-  MODEL_DAILY_DRIVER: "$ModelDailyDriver"
-  BRAIN_AB_MODELS: "$BrainAbModels"
-  BRAIN_AB_LABEL: "$BrainAbLabel"
+  ALPACA_API_KEY: $AlpacaApiKey
+  ALPACA_SECRET_KEY: $AlpacaSecretKey
+  ALPACA_PAPER: $AlpacaPaper
+  GEMINI_API_KEY: $GeminiApiKey
+  GEMINI_MODEL: $GeminiModel
+  OPENROUTER_API_KEY: $OpenRouterApiKey
+  OPENROUTER_BASE_URL: $OpenRouterBaseUrl
+  MODEL_DAILY_DRIVER: $ModelDailyDriver
+  BRAIN_AB_MODELS: $BrainAbModels
+  BRAIN_AB_LABEL: $BrainAbLabel
 "@ | Set-Content -Path $FlagsFile -Encoding utf8
 
 gcloud run deploy $ServiceName `
