@@ -25,6 +25,7 @@ from core import database
 from core.alpaca_client import AlpacaClient
 from core.data_provider import DataProvider
 from core.screener import load_screener_pool
+from core.llm_client import SharedLLMClient
 
 try:
     from google import genai
@@ -49,6 +50,27 @@ GCS_SYNC_INTERVAL_SECONDS = 120
 # payload before the local /tmp DB exists (which caused a blank/flat equity
 # curve for the first ~2 min after boot).
 GCS_FIRST_SYNC_DONE = False
+
+# --- Chat rate limiting ---
+# The chat endpoint calls a paid LLM (OpenRouter). Cap how often a single
+# client IP can hit it to prevent runaway spend now that the endpoint is
+# publicly reachable. Per-IP sliding window: N requests per WINDOW seconds.
+CHAT_RATE_LIMIT_MAX = int(os.getenv("CHAT_RATE_LIMIT_MAX", "10"))
+CHAT_RATE_LIMIT_WINDOW = int(os.getenv("CHAT_RATE_LIMIT_WINDOW", "60"))
+_chat_hits = {}          # ip -> list[monotonic timestamps]
+_chat_hits_lock = threading.Lock()
+
+def _chat_rate_limited(client_ip: str) -> bool:
+    """Return True if ``client_ip`` has exceeded the chat rate limit."""
+    now = time.monotonic()
+    with _chat_hits_lock:
+        hits = [t for t in _chat_hits.get(client_ip, []) if now - t < CHAT_RATE_LIMIT_WINDOW]
+        if len(hits) >= CHAT_RATE_LIMIT_MAX:
+            _chat_hits[client_ip] = hits
+            return True
+        hits.append(now)
+        _chat_hits[client_ip] = hits
+        return False
 
 def sync_database_from_gcs():
     """
@@ -5044,6 +5066,18 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"error": "Empty message."}).encode('utf-8'))
                     return
 
+                # Rate limit per client IP so a public endpoint can't rack up
+                # unbounded LLM spend.
+                client_ip = self.client_address[0] if self.client_address else "unknown"
+                if _chat_rate_limited(client_ip):
+                    self.send_response(429)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": f"Rate limit exceeded. Max {CHAT_RATE_LIMIT_MAX} requests per {CHAT_RATE_LIMIT_WINDOW}s."
+                    }).encode('utf-8'))
+                    return
+
                 # The SQLite DB is periodically replaced by the GCS sync worker.
                 # Retry transient "database is locked"/"unable to open" errors so
                 # a chat request that coincides with a sync doesn't 500.
@@ -5182,21 +5216,30 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 )
                 
                 response_text = ""
-                if GENAI_AVAILABLE and config.GEMINI_API_KEY and config.GEMINI_API_KEY != "your_gemini_api_key_here":
-                    try:
-                        g_client = genai.Client(api_key=config.GEMINI_API_KEY)
-                        response = g_client.models.generate_content(
-                            model=config.GEMINI_MODEL,
-                            contents=user_msg,
-                            config=types.GenerateContentConfig(
-                                system_instruction=system_instruction
-                            )
-                        )
-                        response_text = response.text
-                    except Exception as llm_err:
-                        response_text = f"Failed to query Gemini API: {llm_err}. Please ensure your GEMINI_API_KEY is correct in your .env file."
-                else:
-                    response_text = "Gemini API Client is offline or missing credentials. Please make sure google-genai is installed and GEMINI_API_KEY is configured."
+                try:
+                    # Route the chat through the SAME OpenRouter client + brain
+                    # A/B model that is actually trading, so the chat uses the
+                    # same model the system trusts (and never the expensive
+                    # direct Gemini 3.5-flash path that caused the 9/14-9/16
+                    # cost spike). Mirrors TradingBrain._pick_ab_model().
+                    llm = SharedLLMClient()
+                    chat_model = None
+                    raw_ab = getattr(config, "BRAIN_AB_MODELS", "") or ""
+                    ab_models = [m.strip() for m in raw_ab.split(",") if m.strip()]
+                    if len(ab_models) >= 2:
+                        from datetime import datetime as _dt
+                        chat_model = ab_models[_dt.utcnow().date().toordinal() % len(ab_models)]
+                    response_text = llm.generate_text(
+                        prompt=user_msg,
+                        system_prompt=system_instruction,
+                        tier="daily_driver",
+                        explicit_model=chat_model,
+                        max_output_tokens=2048,
+                    )
+                except Exception as llm_err:
+                    response_text = f"Failed to query LLM: {llm_err}. Please check the OpenRouter configuration."
+                if not response_text:
+                    response_text = "The LLM returned an empty response. Please try again."
                 
                 encoded_chat_res = json.dumps({"response": response_text}).encode('utf-8')
                 self.send_response(200)

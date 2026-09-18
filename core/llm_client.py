@@ -315,6 +315,34 @@ class SharedLLMClient:
                 
         raise LLMClientError("OpenRouter failed and Gemini fallback is not configured.")
 
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: str | None = None,
+        tier: str | None = None,
+        max_output_tokens: int | None = None,
+        explicit_model: str | None = None,
+        temperature: float = 0.2,
+    ) -> str:
+        """Execute a free-form (non-JSON) chat completion.
+
+        Thin wrapper over ``_execute_completion`` for conversational / prose
+        callers (e.g. the dashboard chat widget) that do NOT need the strict
+        JSON-schema enforcement of ``generate_structured``. OpenRouter is
+        primary; Gemini is the cross-provider fallback. ``explicit_model``
+        bypasses the tier->model mapping (used to mirror the brain A/B model
+        selection so the chat uses the same model that is actually trading).
+
+        Returns the raw text content of the model response.
+        """
+        return self._execute_completion(
+            prompt=prompt,
+            system_prompt=system_prompt or "",
+            tier=tier,
+            max_output_tokens=max_output_tokens,
+            explicit_model=explicit_model,
+        )
+
     @staticmethod
     def _is_transient_error(err: Exception) -> bool:
         """Return True if ``err`` is a transient provider error worth retrying.

@@ -20,6 +20,11 @@ $AlpacaSecretKey = ""
 $AlpacaPaper = ""
 $GeminiApiKey = ""
 $GeminiModel = ""
+$OpenRouterApiKey = ""
+$OpenRouterBaseUrl = ""
+$ModelDailyDriver = ""
+$BrainAbModels = ""
+$BrainAbLabel = ""
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -32,6 +37,11 @@ Get-Content $EnvPath | ForEach-Object {
         if ($Key -eq "ALPACA_PAPER") { $AlpacaPaper = $Val }
         if ($Key -eq "GEMINI_API_KEY") { $GeminiApiKey = $Val }
         if ($Key -eq "GEMINI_MODEL") { $GeminiModel = $Val }
+        if ($Key -eq "OPENROUTER_API_KEY") { $OpenRouterApiKey = $Val }
+        if ($Key -eq "OPENROUTER_BASE_URL") { $OpenRouterBaseUrl = $Val }
+        if ($Key -eq "MODEL_DAILY_DRIVER") { $ModelDailyDriver = $Val }
+        if ($Key -eq "BRAIN_AB_MODELS") { $BrainAbModels = $Val }
+        if ($Key -eq "BRAIN_AB_LABEL") { $BrainAbLabel = $Val }
     }
 }
 
@@ -133,7 +143,8 @@ gcloud run deploy $ServiceName `
     --project $GcpProject `
     --memory 1Gi `
     --cpu 1 `
-    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper,GEMINI_API_KEY=$GeminiApiKey,GEMINI_MODEL=$GeminiModel" `
+    --labels "service=agenttrade-dashboard,app=agent-trade,env=prod" `
+    --set-env-vars "GCS_BUCKET_NAME=agenttrade-us-data-bucket,DATABASE_FILENAME=/tmp/trading_agent.db,ALPACA_API_KEY=$AlpacaApiKey,ALPACA_SECRET_KEY=$AlpacaSecretKey,ALPACA_PAPER=$AlpacaPaper,GEMINI_API_KEY=$GeminiApiKey,GEMINI_MODEL=$GeminiModel,OPENROUTER_API_KEY=$OpenRouterApiKey,OPENROUTER_BASE_URL=$OpenRouterBaseUrl,MODEL_DAILY_DRIVER=$ModelDailyDriver,BRAIN_AB_MODELS=$BrainAbModels,BRAIN_AB_LABEL=$BrainAbLabel" `
     --quiet
 
 # 7. Clean Staging Directory
