@@ -176,6 +176,122 @@ def _repair_unescaped_quotes_in_strings(text: str):
     return "".join(out) if changed else text
 
 
+def _escape_control_chars_in_strings(text: str):
+    """Escape ANY raw control character (0x00-0x1F, 0x7F) found inside a JSON
+    string value.
+
+    The sanitize step strips most control chars but deliberately keeps ``\\n``
+    (0x0a), ``\\r`` (0x0d), and ``\\t`` (0x09). When a model emits a *literal*
+    control character that is NOT one of those three inside a quoted value,
+    ``json.loads`` fails with ``Invalid control character at: line N column M``
+    — the exact failure signature of the TMCL-977..988 strategist tickets. This
+    walks the text string-aware and replaces ANY raw control char inside a
+    quoted value with its escaped form (\\n, \\r, \\t, \\uXXXX otherwise).
+
+    Returns the repaired string, or the original if nothing needed fixing.
+    """
+    if not text:
+        return text
+    out = []
+    in_string = False
+    escaped = False
+    changed = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                continue
+            code = ord(ch)
+            if code < 0x20 or code == 0x7f:
+                # Raw control char inside a string -> escape it.
+                if ch == "\n":
+                    out.append("\\n")
+                elif ch == "\r":
+                    out.append("\\r")
+                elif ch == "\t":
+                    out.append("\\t")
+                else:
+                    out.append(f"\\u{code:04x}")
+                changed = True
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out) if changed else text
+
+
+def _repair_stray_quote_comma(text: str):
+    """Repair a stray ``",`` / ``";`` fragment that the model sometimes emits
+    between JSON key/value pairs.
+
+    Observed (TMCL-982): the model emitted ``...gap.\";\n  \",\n    \"todays_rules\": ...``
+    — a literal ``";`` followed by a ``",`` on its own line between
+    ``meta_reasoning`` and ``todays_rules``. This is a structural corruption:
+    the stray quote breaks string tracking and the brace-matching extraction,
+    so the whole response is rejected as "Invalid JSON structure".
+
+    Key insight: a legitimate string OPENER is always followed by content, never
+    immediately by a structural character (``,`` ``;`` ``:`` ``}`` ``]``). So
+    when we are OUTSIDE a string and encounter a ``"`` that is immediately
+    followed (after optional whitespace) by one of those structural characters,
+    it is a stray fragment — drop the quote and keep the structural char.
+
+    Returns the repaired string, or the original if nothing changed.
+    """
+    if not text:
+        return text
+    out = []
+    in_string = False
+    escaped = False
+    changed = False
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            # Outside a string: check if this quote is a stray fragment.
+            # Peek ahead past whitespace for a structural char.
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in ",;":
+                # Stray fragment: drop the quote AND the following comma or
+                # semicolon (both are leftover corruption, e.g. `";` then `",`
+                # in TMCL-982). A legit string opener is never immediately
+                # followed by `,` or `;`.
+                changed = True
+                i = j + 1
+                continue
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out) if changed else text
+
+
 class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
@@ -720,6 +836,18 @@ class SharedLLMClient:
                     logger.warning(f"JSON parse attempt {attempt + 1} failed: {e}")
 
                     if attempt == 0:
+                        # Root cause of the TMCL-977..988 strategist tickets:
+                        # a stray `",` / `";` fragment between key/value pairs
+                        # (e.g. TMCL-982). This MUST run before any string-aware
+                        # escaping, because the stray quote makes the whitespace
+                        # repair treat the rest of the object as one giant string
+                        # and escape all its newlines, mangling the structure.
+                        repaired = _repair_stray_quote_comma(json_str)
+                        if repaired != json_str:
+                            json_str = repaired
+                            continue
+
+                    if attempt == 1:
                         # Root cause of "Expecting ',' delimiter: line 2 column NNN":
                         # a LITERAL newline/tab inside a quoted string value. Escape
                         # them string-aware before any other heuristic.
@@ -728,13 +856,23 @@ class SharedLLMClient:
                             json_str = repaired
                             continue
 
-                    if attempt == 1:
+                    if attempt == 2:
                         # Root cause of the TMCL-963..974 strategist tickets: the
                         # model emits a string value containing an UNESCAPED
                         # double-quote (e.g. "He said "buy now""). The whitespace
                         # repair above doesn't touch quotes, so escape them
                         # string-aware here before the fragile regex heuristics.
                         repaired = _repair_unescaped_quotes_in_strings(json_str)
+                        if repaired != json_str:
+                            json_str = repaired
+                            continue
+
+                    if attempt == 3:
+                        # Root cause of the TMCL-988 strategist ticket: a raw
+                        # control character that is NOT \t/\n/\r surviving inside
+                        # a string value -> "Invalid control character at: line N
+                        # column M". Escape any remaining control char string-aware.
+                        repaired = _escape_control_chars_in_strings(json_str)
                         if repaired != json_str:
                             json_str = repaired
                             continue

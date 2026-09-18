@@ -527,17 +527,33 @@ Schema:
             todays_rules = result.get("todays_rules", "").strip()
             is_valid, validation_reason = validate_strategy_rule(ticker, todays_rules)
             if not is_valid:
-                logger.error(
+                # The LLM produced a rule that fails the selectivity guardrail
+                # (e.g. rule_not_selective_vwap_dist_0pct) or is otherwise
+                # unusable. Do NOT leave the ticker with no rule — fall back to
+                # a conservative, ticker-scoped default and persist it so the
+                # runner's ensure_active_strategy finds a valid rule and the
+                # ticker stays appraisable (fixes TMCL-985/986: QCOM was left
+                # with a missing_rule and skipped every cycle).
+                logger.warning(
                     f"Emergency strategist generated an invalid rule for {ticker} "
-                    f"({validation_reason})."
+                    f"({validation_reason}). Falling back to a conservative default rule."
                 )
-                return False
-            
+                todays_rules = _safe_default_rule(ticker, yesterdays_rules)
+                fallback_reason = (
+                    f"[EMERGENCY INTRADAY RE-EVALUATION] Generated rule rejected "
+                    f"({validation_reason}); persisted conservative default. "
+                    f"{result.get('meta_reasoning', '')}"
+                )
+            else:
+                fallback_reason = (
+                    f"[EMERGENCY INTRADAY RE-EVALUATION] {result.get('meta_reasoning', '')}"
+                )
+
             db_id = database.log_strategy_history(
                 ticker=ticker,
                 yesterdays_rules=yesterdays_rules,
                 todays_rules=todays_rules,
-                meta_reasoning=f"[EMERGENCY INTRADAY RE-EVALUATION] {result['meta_reasoning']}",
+                meta_reasoning=fallback_reason,
                 strategy_version=f"{next_strategy_version()}|model={self._norm_model_tag(result.get('ab_model'))}"
             )
             logger.info(f"Emergency rules updated for {ticker}. DB ID: {db_id}")
