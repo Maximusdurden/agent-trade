@@ -38,6 +38,36 @@ def _insert_trade(symbol, side, qty, price, ts):
         conn.commit()
 
 
+def _today_ts(hours_ago: int) -> str:
+    """Return a timestamp string for TODAY (UTC) that is ``hours_ago`` in the past.
+
+    The open-buy cap guardrail counts trades whose timestamp starts with today's
+    UTC date (datetime.utcnow().strftime('%Y-%m-%d')). We generate timestamps
+    relative to datetime.utcnow() (naive UTC) and CLAMP to today's date so the
+    date ALWAYS matches the guardrail's "today" — subtracting hours from now can
+    roll to yesterday when it's early in the UTC day (e.g. now=00:14, minus 1h
+    = 23:14 yesterday), which silently made the trades invisible to the cap.
+    Previously the tests hardcoded 2026-09-13, which went stale and broke
+    test_at_cap_blocked.
+    """
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    ts = now - timedelta(hours=hours_ago)
+    if ts.strftime("%Y-%m-%d") != now.strftime("%Y-%m-%d"):
+        # Rolled to yesterday: clamp to just after midnight today so the trade
+        # still counts toward today's cap.
+        ts = datetime.strptime(now.strftime("%Y-%m-%d") + " 00:00:01",
+                               "%Y-%m-%d %H:%M:%S")
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _yesterday_ts(hours_ago: int) -> str:
+    """Return a timestamp string for YESTERDAY (UTC) that is ``hours_ago`` in the past."""
+    from datetime import datetime, timedelta
+    ts = datetime.utcnow() - timedelta(days=1, hours=hours_ago)
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+
 class TestEquityRsiEntryGate(unittest.TestCase):
     def setUp(self):
         init_db()
@@ -112,43 +142,46 @@ class TestEquityOpenBuyCap(unittest.TestCase):
 
     def test_under_cap_allowed(self):
         # 2 open buys today (cap=3) -> still allowed
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 10:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 11:00:00")
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(1))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(2))
         ok, msg, adj = self._buy("MSFT")
         self.assertTrue(ok, f"2 open buys < cap 3 should be allowed: {msg}")
 
     def test_at_cap_blocked(self):
         # 3 open buys today (cap=3) -> blocked
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 10:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 11:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 12:00:00")
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(1))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(2))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(3))
         ok, msg, adj = self._buy("MSFT")
         self.assertFalse(ok, f"3 open buys == cap 3 should be blocked: {msg}")
         self.assertIn("Open-buy churn cap", msg)
 
     def test_sell_closes_open_buy(self):
-        # 3 buys but 1 sell closes one -> 2 open -> allowed
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 10:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 11:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-13 12:00:00")
-        _insert_trade("MSFT", "sell", 1.0, 101.0, "2026-09-13 13:00:00")
+        # 3 buys but 1 sell closes one -> 2 open -> allowed. The sell is the
+        # OLDEST trade so the most recent trade is a BUY; the anti-whipsaw
+        # guardrail only blocks a BUY after a recent SELL, so it won't interfere
+        # with verifying the open-buy cap logic.
+        _insert_trade("MSFT", "sell", 1.0, 101.0, _today_ts(8))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(5))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(6))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _today_ts(7))
         ok, msg, adj = self._buy("MSFT")
         self.assertTrue(ok, f"Sell closes an open buy -> 2 open should be allowed: {msg}")
 
     def test_previous_day_buys_do_not_count(self):
         # Buys from a prior day don't count toward today's cap
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-12 10:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-12 11:00:00")
-        _insert_trade("MSFT", "buy", 1.0, 100.0, "2026-09-12 12:00:00")
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _yesterday_ts(1))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _yesterday_ts(2))
+        _insert_trade("MSFT", "buy", 1.0, 100.0, _yesterday_ts(3))
         ok, msg, adj = self._buy("MSFT")
         self.assertTrue(ok, f"Prior-day buys should not count: {msg}")
 
     def test_crypto_exempt_from_open_buy_cap(self):
         # Crypto exempt from the open-buy churn cap
-        _insert_trade("SOL/USD", "buy", 1.0, 100.0, "2026-09-13 10:00:00")
-        _insert_trade("SOL/USD", "buy", 1.0, 100.0, "2026-09-13 11:00:00")
-        _insert_trade("SOL/USD", "buy", 1.0, 100.0, "2026-09-13 12:00:00")
-        _insert_trade("SOL/USD", "buy", 1.0, 100.0, "2026-09-13 13:00:00")
+        _insert_trade("SOL/USD", "buy", 1.0, 100.0, _today_ts(1))
+        _insert_trade("SOL/USD", "buy", 1.0, 100.0, _today_ts(2))
+        _insert_trade("SOL/USD", "buy", 1.0, 100.0, _today_ts(3))
+        _insert_trade("SOL/USD", "buy", 1.0, 100.0, _today_ts(4))
         ok, msg, adj = self._buy("SOL/USD")
         self.assertTrue(ok, f"Crypto should be exempt from open-buy cap: {msg}")
 
