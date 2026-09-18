@@ -633,7 +633,19 @@ class SharedLLMClient:
                             f"LLM call exceeded total {max_total_seconds}s budget (retries={retry_count})."
                         )
                     # Remaining budget caps this attempt's timeout to the global deadline.
-                    attempt_timeout = min(20, max(1, max_total_seconds - elapsed))
+                    # Base timeout is 20s, but scale it up for large-output calls
+                    # (e.g. the brain's 16-ticker batch with max_output_tokens=8192).
+                    # Verbose models like deepseek/deepseek-v4-flash-0731 can take
+                    # >20s to stream a large JSON response, which previously caused
+                    # 4x timeouts -> Gemini fallback on every deepseek day. Scale the
+                    # per-attempt timeout with the requested output size so a large
+                    # batch call gets enough time to complete on the primary model.
+                    base_timeout = 20
+                    if max_output_tokens and max_output_tokens > 2048:
+                        # ~1s per 512 output tokens beyond the 2048 baseline, capped
+                        # so a hung request still can't blow the global budget.
+                        base_timeout = min(60, 20 + (max_output_tokens - 2048) // 512)
+                    attempt_timeout = min(base_timeout, max(1, max_total_seconds - elapsed))
                     attempt_timeout = max(attempt_timeout, 1)
                     try:
                         future = executor.submit(
