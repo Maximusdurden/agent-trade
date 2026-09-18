@@ -292,7 +292,14 @@ STRATEGIST_MODEL_TIER = os.getenv("STRATEGIST_MODEL_TIER", "heavyweight")
 # deepseek/deepseek-v4-flash-0731 (1.4s response on OpenRouter, vs gemini-2.5-flash
 # at 0.7s). Both models are fast enough that the cycle stays well within the 20m
 # task timeout. Control = gemini-2.5-flash, variant = deepseek-v4-flash-0731.
-_brain_ab_default = "google/gemini-2.5-flash,deepseek/deepseek-v4-flash-0731"
+#
+# FIX (2026-09-18): deepseek-v4-flash-0731 is fast on SMALL responses (1.4s) but
+# too slow on the LARGE 16-ticker batch brain call — it streams a verbose
+# response that exceeds the attempt timeout (24s+), causing 4x timeouts -> Gemini
+# fallback on every deepseek day. The brain A/B is DISABLED (single model) so the
+# brain uses the fast, reliable gemini-2.5-flash daily driver. Re-enable only
+# with a variant verified fast on LARGE batch outputs.
+_brain_ab_default = ""
 BRAIN_AB_MODELS = os.getenv("BRAIN_AB_MODELS", _brain_ab_default)
 # Optional experiment label so harness reports can name the trial.
 BRAIN_AB_LABEL = os.getenv("BRAIN_AB_LABEL", "flash-vs-pro")
