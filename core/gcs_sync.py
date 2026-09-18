@@ -163,6 +163,78 @@ def build_dod_csv():
         return False
 
 
+def _merge_local_into_gcs_db(local_db_path: str, gcs_db_path: str) -> bool:
+    """Merge the local DB's new rows into a downloaded GCS DB copy.
+
+    RACE-CONDITION FIX (2026-09-18): the normal lane and the AMD sideload lane
+    both upload the WHOLE trading_agent.db to the same GCS blob, and the last
+    upload wins — so whichever lane uploads last clobbers the other's decisions
+    (AMD "disappears" from the dashboard when the normal lane uploads after the
+    sideload). To stop that, before uploading we download the freshest GCS DB
+    and MERGE the local DB's rows into it (inserting only rows that don't
+    already exist), so the upload carries BOTH lanes' data regardless of order.
+
+    Merges the ``decisions``, ``trades``, ``executions``, ``strategy_history``,
+    and ``ticker_conviction`` tables by their primary key / natural key. Returns
+    True on success (or if there is nothing to merge), False on failure.
+    """
+    import sqlite3
+    try:
+        if not os.path.exists(gcs_db_path):
+            # No GCS DB to merge into — just use the local DB as-is.
+            return True
+        conn_local = sqlite3.connect(local_db_path)
+        conn_gcs = sqlite3.connect(gcs_db_path)
+        try:
+            # Tables to merge, keyed by the column that uniquely identifies a row.
+            merge_tables = {
+                "decisions": "id",
+                "trades": "id",
+                "executions": "id",
+                "strategy_history": "id",
+                "ticker_conviction": "id",
+            }
+            for table, key_col in merge_tables.items():
+                # Ensure the table exists in both DBs.
+                local_cols = {r[1] for r in conn_local.execute(f"PRAGMA table_info({table})")}
+                gcs_cols = {r[1] for r in conn_gcs.execute(f"PRAGMA table_info({table})")}
+                if not local_cols or not gcs_cols:
+                    continue
+                common_cols = [c for c in local_cols if c in gcs_cols]
+                if key_col not in common_cols:
+                    continue
+                # Existing keys in the GCS DB.
+                existing = {r[0] for r in conn_gcs.execute(f"SELECT {key_col} FROM {table}")}
+                col_list = ", ".join(f'"{c}"' for c in common_cols)
+                placeholders = ", ".join("?" for _ in common_cols)
+                insert_sql = (
+                    f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})"
+                )
+                rows = conn_local.execute(
+                    f"SELECT {col_list} FROM {table}"
+                ).fetchall()
+                inserted = 0
+                for row in rows:
+                    # Skip rows whose key already exists in GCS.
+                    if key_col == "id" and row[common_cols.index(key_col)] in existing:
+                        continue
+                    try:
+                        conn_gcs.execute(insert_sql, tuple(row))
+                        inserted += 1
+                    except Exception:
+                        continue
+                if inserted:
+                    logger.info(f"Merged {inserted} new row(s) into {table}.")
+            conn_gcs.commit()
+        finally:
+            conn_local.close()
+            conn_gcs.close()
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to merge local DB into GCS DB: {e}")
+        return False
+
+
 def upload_to_gcs():
     """
     Rebuilds the DoD CSV from DB, then uploads the database, trading log,
@@ -188,8 +260,29 @@ def upload_to_gcs():
         db_path = str(config.DATABASE_PATH)
         if os.path.exists(db_path):
             blob = bucket.blob("trading_agent.db")
-            blob.upload_from_filename(db_path)
-            logger.info(f"Successfully uploaded {db_path} to GCS.")
+            # RACE-CONDITION FIX: download the freshest GCS DB, merge the local
+            # DB's new rows into it, then upload the merged DB so neither lane
+            # clobbers the other's decisions.
+            merged_db_path = db_path + ".merged"
+            try:
+                blob.download_to_filename(merged_db_path)
+                if _merge_local_into_gcs_db(db_path, merged_db_path):
+                    blob.upload_from_filename(merged_db_path)
+                    logger.info(f"Successfully uploaded merged DB to GCS.")
+                else:
+                    # Merge failed — fall back to uploading the local DB as-is.
+                    blob.upload_from_filename(db_path)
+                    logger.info(f"Merge failed; uploaded local DB to GCS as-is.")
+            except Exception as merge_err:
+                logger.warning(f"Could not merge GCS DB ({merge_err}); uploading local DB as-is.")
+                blob.upload_from_filename(db_path)
+                logger.info(f"Successfully uploaded {db_path} to GCS.")
+            finally:
+                if os.path.exists(merged_db_path):
+                    try:
+                        os.remove(merged_db_path)
+                    except Exception:
+                        pass
         else:
             logger.warning(f"Database file not found at {db_path}.")
 
