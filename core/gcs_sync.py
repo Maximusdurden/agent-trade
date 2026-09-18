@@ -186,25 +186,32 @@ def _merge_local_into_gcs_db(local_db_path: str, gcs_db_path: str) -> bool:
         conn_local = sqlite3.connect(local_db_path)
         conn_gcs = sqlite3.connect(gcs_db_path)
         try:
-            # Tables to merge, keyed by the column that uniquely identifies a row.
+            # Tables to merge. For tables with a global AUTOINCREMENT `id` (like
+            # decisions), the `id` is NOT a safe merge key because both DBs start
+            # at 1 and collide — so we use a NATURAL key (cycle_id + symbol +
+            # timestamp) to detect duplicates. For tables where `id` is a stable
+            # business key, we use `id`.
             merge_tables = {
-                "decisions": "id",
-                "trades": "id",
-                "executions": "id",
-                "strategy_history": "id",
-                "ticker_conviction": "id",
+                "decisions": ("cycle_id", "proposed_symbol", "timestamp"),
+                "trades": ("id",),
+                "executions": ("id",),
+                "strategy_history": ("id",),
+                "ticker_conviction": ("id",),
             }
-            for table, key_col in merge_tables.items():
+            for table, key_cols in merge_tables.items():
                 # Ensure the table exists in both DBs.
                 local_cols = {r[1] for r in conn_local.execute(f"PRAGMA table_info({table})")}
                 gcs_cols = {r[1] for r in conn_gcs.execute(f"PRAGMA table_info({table})")}
                 if not local_cols or not gcs_cols:
                     continue
                 common_cols = [c for c in local_cols if c in gcs_cols]
-                if key_col not in common_cols:
+                if not all(k in common_cols for k in key_cols):
                     continue
-                # Existing keys in the GCS DB.
-                existing = {r[0] for r in conn_gcs.execute(f"SELECT {key_col} FROM {table}")}
+                # Existing natural keys in the GCS DB.
+                key_select = ", ".join(f'"{k}"' for k in key_cols)
+                existing = {
+                    tuple(r) for r in conn_gcs.execute(f"SELECT {key_select} FROM {table}")
+                }
                 col_list = ", ".join(f'"{c}"' for c in common_cols)
                 placeholders = ", ".join("?" for _ in common_cols)
                 insert_sql = (
@@ -215,13 +222,16 @@ def _merge_local_into_gcs_db(local_db_path: str, gcs_db_path: str) -> bool:
                 ).fetchall()
                 inserted = 0
                 for row in rows:
-                    # Skip rows whose key already exists in GCS.
-                    if key_col == "id" and row[common_cols.index(key_col)] in existing:
+                    # Build the natural key for this row.
+                    row_dict = dict(zip(common_cols, row))
+                    row_key = tuple(row_dict.get(k) for k in key_cols)
+                    if row_key in existing:
                         continue
                     try:
                         conn_gcs.execute(insert_sql, tuple(row))
                         inserted += 1
-                    except Exception:
+                    except Exception as ins_err:
+                        logger.warning(f"Insert into {table} failed: {ins_err}")
                         continue
                 if inserted:
                     logger.info(f"Merged {inserted} new row(s) into {table}.")
