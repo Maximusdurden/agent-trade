@@ -89,6 +89,14 @@ SL_VOL_SIZING_BASELINE_ATR_PCT = _env_float("SL_VOL_SIZING_BASELINE_ATR_PCT", 2.
 SL_MAX_HOLD_HOURS = _env_float("SL_MAX_HOLD_HOURS", 72.0)
 # Trailing-stop giveback % (0 = disabled).
 SL_TRAIL_STOP_GIVEBACK_PCT = _env_float("SL_TRAIL_STOP_GIVEBACK_PCT", 0.03)
+# Hard stop-loss % (P0 fix): exit when price moves against the position by this
+# much. 0 = disabled. A 24/7 crypto can gap/cascade on liquidation events, so a
+# hard stop is essential (the old trailing-only exit silently dropped losers).
+SL_STOP_LOSS_PCT = _env_float("SL_STOP_LOSS_PCT", 0.03)
+# Take-profit % (P0 fix): close a winner at this gain so trend winners are
+# realized instead of riding to end-of-data (the old trailing-only exit dropped
+# them as unrealized). 0 = disabled.
+SL_TAKE_PROFIT_PCT = _env_float("SL_TAKE_PROFIT_PCT", 0.05)
 # Per-day round-trip budget (avoid churn).
 SL_MAX_ROUND_TRIPS_PER_DAY = _env_int("SL_MAX_ROUND_TRIPS_PER_DAY", 2)
 

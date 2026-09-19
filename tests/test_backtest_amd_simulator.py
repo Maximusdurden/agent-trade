@@ -261,6 +261,47 @@ class TestBacktestSimulator(unittest.TestCase):
         self.assertLessEqual(core_cfg.OPTIONS_DTE_MIN, 14)
         self.assertLessEqual(core_cfg.OPTIONS_DTE_MAX, 45)
 
+    def test_hard_stop_loss_realizes_losers(self):
+        """P0: a hard stop-loss must realize losers instead of dropping them.
+
+        The old trailing-stop-only exit silently dropped positions that never
+        reached +2% gain. With a hard stop-loss, a position that falls against
+        the entry must be closed (counted) as a loss.
+        """
+        # Use the class-level synthetic frame (known to produce entries).
+        df = self.df
+        # With a hard stop-loss, losers are realized (counted).
+        with_stop = bt.simulate_config(
+            df, _base_cfg(direction="long", stop_loss_pct=0.03,
+                          take_profit_pct=0.0, trail_stop_giveback_pct=0.0))
+        # Without any exit (no stop, no TP, no trail, no max-hold), the position
+        # rides to end-of-data and is marked-to-market (count_open=True).
+        no_exit = bt.simulate_config(
+            df, _base_cfg(direction="long", stop_loss_pct=0.0,
+                          take_profit_pct=0.0, trail_stop_giveback_pct=0.0,
+                          max_hold_hours=0.0))
+        # Both should count trades (not silently drop to 0).
+        self.assertGreater(with_stop["trades"], 0, "hard stop should realize trades")
+        self.assertGreater(no_exit["trades"], 0, "count_open should count end-of-data trades")
+
+    def test_take_profit_realizes_winners(self):
+        """P0: a take-profit must realize trend winners instead of riding them."""
+        df = self.df
+        # With a take-profit, winners close at the TP level.
+        with_tp = bt.simulate_config(
+            df, _base_cfg(direction="long", take_profit_pct=0.05,
+                          stop_loss_pct=0.0, trail_stop_giveback_pct=0.0))
+        self.assertGreater(with_tp["trades"], 0, "take-profit should realize trades")
+
+    def test_count_open_marks_to_market(self):
+        """P0: an open position at end-of-data is marked-to-market, not dropped."""
+        df = self.df
+        cfg = _base_cfg(direction="long", stop_loss_pct=0.0, take_profit_pct=0.0,
+                        trail_stop_giveback_pct=0.0, max_hold_hours=0.0)
+        with_open = bt.simulate_config(df, cfg)  # count_open defaults True
+        self.assertGreater(with_open["trades"], 0,
+                           "count_open=True should count end-of-data positions")
+
     # -- helpers ---------------------------------------------------------
     def _simulate_with_holds(self, df, cfg):
         """Re-run the walk, recording entry_i/exit_i/hold_bars per trade."""

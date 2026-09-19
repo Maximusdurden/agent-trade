@@ -194,6 +194,11 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
     direction = cfg.get("direction", "long")
     # Short-side entry gate (P2): RSI at/above this = overbought fade (bearish).
     rsi_short_entry_min = float(cfg.get("rsi_short_entry_min", 60.0))
+    # P0 exit-model knobs: hard stop-loss, take-profit, and whether to count
+    # end-of-data open positions (mark-to-market) instead of silently dropping.
+    stop_loss_pct = float(cfg.get("stop_loss_pct", sl_cfg.SL_STOP_LOSS_PCT))
+    take_profit_pct = float(cfg.get("take_profit_pct", sl_cfg.SL_TAKE_PROFIT_PCT))
+    count_open = bool(cfg.get("count_open", True))
 
     # --- Vectorized signal computation (numpy arrays) ---
     price = df["close"].to_numpy(dtype=float)
@@ -294,11 +299,13 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
     if direction in ("long", "both"):
         trades += _walk_direction(
             price, rsi, atr_pct, exit_sig, long_entry_sig, n,
-            max_alloc, baseline_atr, max_hold_bars, trail_giveback, "long")
+            max_alloc, baseline_atr, max_hold_bars, trail_giveback,
+            stop_loss_pct, take_profit_pct, count_open, "long")
     if direction in ("short", "both"):
         trades += _walk_direction(
             price, rsi, atr_pct, exit_sig, short_entry_sig, n,
-            max_alloc, baseline_atr, max_hold_bars, trail_giveback, "short")
+            max_alloc, baseline_atr, max_hold_bars, trail_giveback,
+            stop_loss_pct, take_profit_pct, count_open, "short")
 
     if not trades:
         return {"trades": 0, "pnl": 0.0, "win_rate": 0.0, "expectancy": 0.0}
@@ -319,12 +326,23 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
 
 def _walk_direction(price, rsi, atr_pct, exit_sig, entry_sig, n,
                     max_alloc, baseline_atr, max_hold_bars, trail_giveback,
+                    stop_loss_pct, take_profit_pct, count_open,
                     direction: str) -> list[dict]:
     """Walk one direction (long or short) to form round-trips.
 
-    Long:  buy at entry, profit when price rises (exit on trailing stop / max-hold).
-    Short: sell/put at entry, profit when price FALLS (exit when price fades back
-           toward entry — trailing stop on the short side / max-hold).
+    Long:  buy at entry, profit when price rises.
+    Short: sell/put at entry, profit when price FALLS.
+
+    P0 exit-model fix (2026-09-19): the OLD trailing-stop-only exit silently
+    dropped both pure losers (never reached +2% gain) and the best trend winners
+    (never gave back the trailing %), inflating the win rate. This version:
+      - Adds a HARD STOP-LOSS (exit when price moves against the position by
+        ``stop_loss_pct``) so losers are realized, not dropped.
+      - Adds a TAKE-PROFIT (close a winner at ``take_profit_pct`` gain) so trend
+        winners are realized, not ridden to end-of-data.
+      - COUNTS EVERY ENTRY as a trade: if a position is still open at end-of-data
+        and ``count_open`` is True, it is marked-to-market at the last price
+        (explicitly noted) instead of silently dropped.
     """
     entry_idx = np.flatnonzero(entry_sig)
     trades = []
@@ -353,11 +371,28 @@ def _walk_direction(price, rsi, atr_pct, exit_sig, entry_sig, n,
             i += 1
         else:
             exit_reason = None
-            if max_hold_bars > 0 and (i - position["entry_i"]) >= max_hold_bars:
-                exit_reason = "max_hold"
-            if trail_giveback > 0:
+            # 1. Hard stop-loss (P0): price moved against us by stop_loss_pct.
+            if stop_loss_pct > 0:
                 if direction == "long":
-                    # Long: trailing stop on the upside (price falls back from peak).
+                    if (position["entry_price"] - price[i]) / position["entry_price"] >= stop_loss_pct:
+                        exit_reason = "stop_loss"
+                else:
+                    if (price[i] - position["entry_price"]) / position["entry_price"] >= stop_loss_pct:
+                        exit_reason = "stop_loss"
+            # 2. Take-profit (P0): close a winner at take_profit_pct gain.
+            if exit_reason is None and take_profit_pct > 0:
+                if direction == "long":
+                    if (price[i] - position["entry_price"]) / position["entry_price"] >= take_profit_pct:
+                        exit_reason = "take_profit"
+                else:
+                    if (position["entry_price"] - price[i]) / position["entry_price"] >= take_profit_pct:
+                        exit_reason = "take_profit"
+            # 3. Max-hold (existing): force-exit stale positions.
+            if exit_reason is None and max_hold_bars > 0 and (i - position["entry_i"]) >= max_hold_bars:
+                exit_reason = "max_hold"
+            # 4. Trailing stop (existing): exit when a peak gain is given back.
+            if exit_reason is None and trail_giveback > 0:
+                if direction == "long":
                     extreme = max(position["extreme"], price[i])
                     position["extreme"] = extreme
                     gain = (extreme - position["entry_price"]) / position["entry_price"]
@@ -365,7 +400,6 @@ def _walk_direction(price, rsi, atr_pct, exit_sig, entry_sig, n,
                     if gain >= 0.02 and giveback >= trail_giveback:
                         exit_reason = "trailing_stop"
                 else:
-                    # Short: trailing stop on the downside (price rises back from trough).
                     extreme = min(position["extreme"], price[i])
                     position["extreme"] = extreme
                     gain = (position["entry_price"] - extreme) / position["entry_price"]
@@ -379,10 +413,23 @@ def _walk_direction(price, rsi, atr_pct, exit_sig, entry_sig, n,
                     pnl = (position["entry_price"] - price[i]) * position["qty"]
                 trades.append({
                     "pnl": pnl, "entry_i": position["entry_i"], "exit_i": i,
-                    "direction": direction,
+                    "direction": direction, "exit_reason": exit_reason,
                 })
                 position = None
             i += 1
+
+    # P0: count any position still open at end-of-data (mark-to-market) instead
+    # of silently dropping it. This removes the exit selection bias.
+    if position is not None and count_open:
+        last = price[n - 1]
+        if direction == "long":
+            pnl = (last - position["entry_price"]) * position["qty"]
+        else:
+            pnl = (position["entry_price"] - last) * position["qty"]
+        trades.append({
+            "pnl": pnl, "entry_i": position["entry_i"], "exit_i": n - 1,
+            "direction": direction, "exit_reason": "open_end",
+        })
     return trades
 
 
