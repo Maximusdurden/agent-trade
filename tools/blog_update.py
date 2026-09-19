@@ -88,12 +88,26 @@ def pull_db_from_gcs() -> bool:
 # ---------------------------------------------------------------------------
 def create_intro_content(date_str, total_pnl, news, buys_context, ticker_list, daily_notes=None):
     import re
+    from core.brain import _extract_json_object
     notes_section = (f"SPECIAL INSTRUCTIONS / DAILY NOTES:\n{daily_notes}\n\n" if daily_notes else "")
     combined = f"{notes_section}MARKET NEWS:\n{news}\n\nLATEST BUYS CONTEXT:\n{buys_context}"
     t = generate_blog_intro(date_str, total_pnl, combined, ticker_list)
     if not t:
         return {"title": f"Market Update: {date_str}", "meta": "", "body": "Dexter is napping."}
     parsed = {"title": f"Market Update: {date_str}", "meta": "", "body": ""}
+
+    # Some models return a JSON object {"title": ..., "meta": ..., "body": ...}
+    # instead of the TITLE:/META:/BODY: plain-text format. Handle that first so
+    # raw JSON never leaks into the published post.
+    obj = _extract_json_object(t)
+    if obj:
+        for key, target in (("title", "title"), ("meta", "meta"), ("body", "body")):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                parsed[target] = val.strip()
+        if parsed["body"]:
+            return parsed
+
     clean = re.sub(r"\*\*(TITLE|META|BODY)\s*:\*\*", r"\1:", t, flags=re.IGNORECASE)
     title_m = re.search(r"TITLE\s*:\s*(.*?)(?=\s*META\s*:|\s*BODY\s*:|\Z)", clean, flags=re.I | re.S)
     meta_m = re.search(r"META\s*:\s*(.*?)(?=\s*BODY\s*:|\Z)", clean, flags=re.I | re.S)
@@ -113,7 +127,7 @@ def create_intro_content(date_str, total_pnl, news, buys_context, ticker_list, d
     return parsed
 
 
-def verify_pnl_in_body(body, total_pnl):
+def verify_pnl_in_body(body, total_pnl, date_str=None):
     import re
     if body is None or total_pnl is None:
         return body
@@ -122,6 +136,32 @@ def verify_pnl_in_body(body, total_pnl):
     except (ValueError, TypeError):
         return body
     correct_str = format_pnl(pnl_float)
+
+    # Repair the known LLM token-fusion bug where the date and PnL get glued
+    # together, e.g. "-$105-09-18" (from "2026-09-18" + "-$105"). The model
+    # drops the year and splices the dollar figure onto the "-MM-DD" fragment.
+    # Pattern: optional sign + $ + digits, immediately followed by a date
+    # fragment like "-09-18" (or "-09-18" with a leading year already present).
+    fused = re.search(
+        r"(?P<lead>\s*)(?P<sign>[-−]?)\s*\$?\s*(?P<num>\d[\d,]*)\s*"
+        r"(?P<dash>-)\s*(?P<mm>\d{1,2})\s*-\s*(?P<dd>\d{1,2})\b",
+        body,
+    )
+    if fused:
+        # Rebuild the full date (the model dropped the year). Prefer the real
+        # target date when available; otherwise fall back to "-MM-DD".
+        date_frag = f"-{fused.group('mm')}-{fused.group('dd')}"
+        if date_str:
+            try:
+                y, m, d = str(date_str).split("-")
+                if int(m) == int(fused.group("mm")) and int(d) == int(fused.group("dd")):
+                    date_frag = f"{y}-{int(m):02d}-{int(d):02d}"
+            except (ValueError, TypeError):
+                pass
+        repaired = (body[:fused.start()] + fused.group("lead")
+                    + correct_str + " " + date_frag + body[fused.end():])
+        return repaired
+
     match = re.search(r"(?P<lead>\s*)(?P<sign>[-−]?)\s*\$?\s*(?P<num>\d[\d,]*)", body)
     if not match:
         return body
@@ -282,7 +322,7 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
     # ---- 4. Intro (Dexter brain) ----
     news = _market_research(target_date, tickers)
     intro = create_intro_content(target_date, total_pnl, news, "No new buys.", tickers)
-    intro["body"] = verify_pnl_in_body(intro["body"], total_pnl)
+    intro["body"] = verify_pnl_in_body(intro["body"], total_pnl, target_date)
 
     # ---- 5. Per-ticker blurbs (with grade context from DB) ----
     grade_map = {}

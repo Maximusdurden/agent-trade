@@ -56,6 +56,8 @@ def _ensure_strategy_table() -> None:
                 trail_stop_giveback_pct REAL,
                 time_of_day TEXT,
                 regime_filter TEXT,
+                direction TEXT,
+                rsi_short_entry_min REAL,
                 test_expectancy REAL,
                 test_win_rate REAL,
                 test_trades INTEGER,
@@ -121,6 +123,13 @@ def _build_rule_text(cfg: dict) -> str:
         lines.append(f"Only trade during {time_of_day.upper()} window.")
     if regime != "all":
         lines.append(f"Only trade in {regime} regime.")
+    direction = cfg.get("direction", "long")
+    if direction == "both":
+        lines.append("Trade BOTH directions: long call on RSI pullback, long put on "
+                     f"RSI overbought (>= {cfg.get('rsi_short_entry_min', 60.0)}).")
+    elif direction == "short":
+        lines.append(f"Trade SHORT only: long put on RSI overbought "
+                     f"(>= {cfg.get('rsi_short_entry_min', 60.0)}).")
     lines.append("Skip low-confidence days: HOLD unless the setup is a clear winner.")
     return " ".join(lines)
 
@@ -171,8 +180,9 @@ def learn(dry: bool = False) -> dict:
                 created_ts, interval, rsi_entry_max, rsi_exit_overbought, macd_filter,
                 vwap_dead_zone_sigma, min_edge_sigma, atr_sizing_baseline_pct,
                 max_hold_hours, trail_stop_giveback_pct, time_of_day, regime_filter,
+                direction, rsi_short_entry_min,
                 test_expectancy, test_win_rate, test_trades, rule_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             best.get("interval"), best.get("rsi_entry_max"), best.get("rsi_exit_overbought"),
@@ -180,6 +190,7 @@ def learn(dry: bool = False) -> dict:
             best.get("min_edge_sigma"), best.get("atr_sizing_baseline_pct"),
             best.get("max_hold_hours"), best.get("trail_stop_giveback_pct"),
             best.get("time_of_day"), best.get("regime_filter"),
+            best.get("direction", "long"), best.get("rsi_short_entry_min"),
             best.get("test_expectancy"), best.get("test_win_rate"), best.get("test_trades"),
             rule_text,
         ))

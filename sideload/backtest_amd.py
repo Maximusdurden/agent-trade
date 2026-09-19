@@ -92,15 +92,46 @@ def _grid_size(grid: dict) -> int:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_amd_bars(client: AlpacaClient, interval: str, limit: int = 2000) -> pd.DataFrame:
-    """Fetch AMD historical bars for an interval and compute indicators."""
+def load_amd_bars(client: AlpacaClient, interval: str, limit: int = 2000,
+                  days_back: int = 730) -> pd.DataFrame:
+    """Fetch AMD historical bars for an interval and compute indicators.
+
+    For intraday intervals (1h/15min/5min/1min) a single Alpaca request is
+    capped at ~2000 bars (only weeks-months of history). We paginate to pull up
+    to ``days_back`` calendar days so the multi-fold walk-forward has enough
+    bars for a meaningful OOS sample. Daily bars are fetched directly (the full
+    ~6y history fits in one request).
+    """
     dp = DataProvider(client)
-    df = client.get_historical_bars(sl_cfg.SL_SYMBOL, limit=limit, timeframe_str=interval)
+    bar_hours = _bar_hours_from_interval(interval)
+    if bar_hours >= 20.0:
+        # Daily: single request covers full history.
+        df = client.get_historical_bars(sl_cfg.SL_SYMBOL, limit=limit, timeframe_str=interval)
+    else:
+        # Intraday: paginate to get more history.
+        df = client.get_historical_bars_paginated(
+            sl_cfg.SL_SYMBOL, timeframe_str=interval, days_back=days_back)
     if df is None or df.empty:
         return pd.DataFrame()
     # Compute the same indicators the live lane uses.
     df = dp._add_technical_indicators(df)
     return df
+
+
+def _bar_hours_from_interval(interval: str) -> float:
+    """Approximate hours per bar for an interval string (for daily detection)."""
+    iv = (interval or "").strip().lower()
+    if iv in ("1d", "1day", "day"):
+        return 24.0
+    if iv in ("1h", "1hour", "hour"):
+        return 1.0
+    if iv in ("15min", "15m"):
+        return 0.25
+    if iv in ("5min", "5m"):
+        return 5.0 / 60.0
+    if iv in ("1min", "1m", "minute"):
+        return 1.0 / 60.0
+    return 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +169,13 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
     Deterministic and VECTORIZED (numpy): computes boolean entry/exit signal
     arrays once, then finds round-trips via numpy argwhere. This is ~100-1000x
     faster than a per-bar Python loop, which is essential for the large grid.
+
+    Direction (P2): ``cfg["direction"]`` selects the trade side:
+      - "long"  (default): buy RSI pullback, exit on trailing stop / max-hold.
+      - "short": sell/put on RSI overbought (or price >= 1 ATR above VWAP),
+                 exit when price fades back toward entry (trailing stop on the
+                 short side) / max-hold.
+      - "both":  run long and short independently and combine round-trips.
     """
     if df is None or len(df) < 60:
         return {"trades": 0, "pnl": 0.0, "win_rate": 0.0, "expectancy": 0.0}
@@ -153,6 +191,9 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
     trail_giveback = float(cfg.get("trail_stop_giveback_pct", 0.0))
     time_of_day = cfg.get("time_of_day", "all")
     regime_filter = cfg.get("regime_filter", "all")
+    direction = cfg.get("direction", "long")
+    # Short-side entry gate (P2): RSI at/above this = overbought fade (bearish).
+    rsi_short_entry_min = float(cfg.get("rsi_short_entry_min", 60.0))
 
     # --- Vectorized signal computation (numpy arrays) ---
     price = df["close"].to_numpy(dtype=float)
@@ -196,70 +237,62 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
             regime_mask = ~trending
 
     # VWAP dead zone + min edge (vectorized).
+    #
+    # NOTE (2026-09-19 audit): the VWAP dead-zone gate is only meaningful for
+    # INTRADAY bars. On DAILY bars (1 bar/day) the session-based VWAP collapses
+    # to that single day's typical price, so |price - vwap| ~ 0 and the gate
+    # blocks ~97% of bars — an artifact, not a signal. Detect daily bars and
+    # disable the dead-zone gate (keep the min-edge gate, which is still a
+    # volatility-normalized distance check).
+    bar_hours = _bar_hours(df)
+    is_daily = bar_hours >= 20.0  # ~24h bars
     valid_vwap = (vwap > 0) & (atr > 0)
     edge_sigma = np.where(valid_vwap, np.abs(price - vwap) / np.where(atr > 0, atr, 1.0), np.nan)
-    in_dead_zone = valid_vwap & (np.abs(price - vwap) <= vwap_sigma * atr)
+    if is_daily:
+        # VWAP is degenerate on daily bars — do not veto entries on it.
+        in_dead_zone = np.zeros(n, dtype=bool)
+    else:
+        in_dead_zone = valid_vwap & (np.abs(price - vwap) <= vwap_sigma * atr)
     has_edge = np.isnan(edge_sigma) | (edge_sigma >= min_edge)
 
-    # Entry signal: RSI pullback + outside dead zone + has edge + MACD + filters.
-    entry_sig = (rsi <= rsi_entry_max) & (~in_dead_zone) & has_edge & tod_mask & regime_mask
+    # Entry signals (vectorized).
+    # LONG: RSI pullback + outside dead zone + has edge + MACD + filters.
+    long_entry_sig = (rsi <= rsi_entry_max) & (~in_dead_zone) & has_edge & tod_mask & regime_mask
     if macd_filter == "hist_gt_0":
-        entry_sig = entry_sig & (macd_hist > 0)
-    entry_idx = np.flatnonzero(entry_sig)
+        long_entry_sig = long_entry_sig & (macd_hist > 0)
+    # SHORT (P2): RSI overbought (>= rsi_short_entry_min) OR price >= 1 ATR above
+    # VWAP (extended above VWAP), outside dead zone, has edge, filters.
+    short_entry_sig = (rsi >= rsi_short_entry_min) & (~in_dead_zone) & has_edge & tod_mask & regime_mask
+    if macd_filter == "hist_gt_0":
+        short_entry_sig = short_entry_sig & (macd_hist > 0)
 
-    # Exit signal: RSI overbought (if enabled).
+    # Exit signal: RSI overbought (if enabled) — for LONG exits.
     exit_sig = np.zeros(n, dtype=bool)
     if rsi_exit > 0:
         exit_sig = rsi >= rsi_exit
 
-    bar_hours = _bar_hours(df)
     max_hold_bars = int(max_hold / bar_hours) if (max_hold > 0 and bar_hours > 0) else 0
 
     # --- Walk entries/exits to form round-trips (still a loop, but only over
     #     entry candidates, which is far fewer than all bars). ---
+    #
+    # IMPORTANT (look-ahead-bias fix): the loop index ``i`` MUST be advanced to
+    # the entry bar ``e`` before opening a position. The previous implementation
+    # opened the position at the current ``i`` while recording ``entry_i = e``
+    # (a FUTURE bar), so the trailing-stop/max-hold exits measured PnL against
+    # prices BEFORE the entry (negative hold durations) — i.e. it peeked at
+    # future data and inflated the backtest. We use an explicit ``while`` loop
+    # so we can jump ``i`` to the entry bar.
     trades = []
-    ei = 0
-    position = None  # {entry_price, qty, entry_i, peak_price}
-    for i in range(20, n):
-        if position is None:
-            # Find the next entry at or after i.
-            while ei < len(entry_idx) and entry_idx[ei] < i:
-                ei += 1
-            if ei >= len(entry_idx):
-                break
-            e = entry_idx[ei]
-            if e < i:
-                continue
-            p = price[e]
-            if p <= 0 or np.isnan(p):
-                ei += 1
-                continue
-            # Size by ATR (vol-based), capped at max allocation.
-            size_pct = max_alloc
-            ap = atr_pct[e]
-            if ap > 0 and baseline_atr > 0:
-                size_pct = max_alloc * min(1.0, baseline_atr / ap)
-            qty = max(1.0, size_pct / p)
-            position = {"entry_price": p, "qty": qty, "entry_i": e, "peak_price": p}
-            ei += 1
-        else:
-            # Check exits at bar i.
-            exit_reason = None
-            if rsi_exit > 0 and exit_sig[i]:
-                exit_reason = "rsi_overbought"
-            if max_hold_bars > 0 and (i - position["entry_i"]) >= max_hold_bars:
-                exit_reason = "max_hold"
-            if trail_giveback > 0:
-                peak = max(position["peak_price"], price[i])
-                position["peak_price"] = peak
-                gain = (peak - position["entry_price"]) / position["entry_price"]
-                giveback = (peak - price[i]) / peak if peak > 0 else 0.0
-                if gain >= 0.02 and giveback >= trail_giveback:
-                    exit_reason = "trailing_stop"
-            if exit_reason:
-                pnl = (price[i] - position["entry_price"]) * position["qty"]
-                trades.append({"pnl": pnl, "entry_i": position["entry_i"], "exit_i": i})
-                position = None
+    # Run long and short independently (for "both", combine).
+    if direction in ("long", "both"):
+        trades += _walk_direction(
+            price, rsi, atr_pct, exit_sig, long_entry_sig, n,
+            max_alloc, baseline_atr, max_hold_bars, trail_giveback, "long")
+    if direction in ("short", "both"):
+        trades += _walk_direction(
+            price, rsi, atr_pct, exit_sig, short_entry_sig, n,
+            max_alloc, baseline_atr, max_hold_bars, trail_giveback, "short")
 
     if not trades:
         return {"trades": 0, "pnl": 0.0, "win_rate": 0.0, "expectancy": 0.0}
@@ -273,15 +306,98 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
         "pnl": total_pnl,
         "win_rate": win_rate,
         "expectancy": total_pnl / len(trades),
+        "long_trades": sum(1 for t in trades if t["direction"] == "long"),
+        "short_trades": sum(1 for t in trades if t["direction"] == "short"),
     }
 
 
+def _walk_direction(price, rsi, atr_pct, exit_sig, entry_sig, n,
+                    max_alloc, baseline_atr, max_hold_bars, trail_giveback,
+                    direction: str) -> list[dict]:
+    """Walk one direction (long or short) to form round-trips.
+
+    Long:  buy at entry, profit when price rises (exit on trailing stop / max-hold).
+    Short: sell/put at entry, profit when price FALLS (exit when price fades back
+           toward entry — trailing stop on the short side / max-hold).
+    """
+    entry_idx = np.flatnonzero(entry_sig)
+    trades = []
+    ei = 0
+    position = None
+    i = 20
+    while i < n:
+        if position is None:
+            while ei < len(entry_idx) and entry_idx[ei] < i:
+                ei += 1
+            if ei >= len(entry_idx):
+                break
+            e = entry_idx[ei]
+            p = price[e]
+            if p <= 0 or np.isnan(p):
+                ei += 1
+                continue
+            i = e
+            size_pct = max_alloc
+            ap = atr_pct[e]
+            if ap > 0 and baseline_atr > 0:
+                size_pct = max_alloc * min(1.0, baseline_atr / ap)
+            qty = max(1.0, size_pct / p)
+            position = {"entry_price": p, "qty": qty, "entry_i": e, "extreme": p}
+            ei += 1
+            i += 1
+        else:
+            exit_reason = None
+            if max_hold_bars > 0 and (i - position["entry_i"]) >= max_hold_bars:
+                exit_reason = "max_hold"
+            if trail_giveback > 0:
+                if direction == "long":
+                    # Long: trailing stop on the upside (price falls back from peak).
+                    extreme = max(position["extreme"], price[i])
+                    position["extreme"] = extreme
+                    gain = (extreme - position["entry_price"]) / position["entry_price"]
+                    giveback = (extreme - price[i]) / extreme if extreme > 0 else 0.0
+                    if gain >= 0.02 and giveback >= trail_giveback:
+                        exit_reason = "trailing_stop"
+                else:
+                    # Short: trailing stop on the downside (price rises back from trough).
+                    extreme = min(position["extreme"], price[i])
+                    position["extreme"] = extreme
+                    gain = (position["entry_price"] - extreme) / position["entry_price"]
+                    giveback = (price[i] - extreme) / extreme if extreme > 0 else 0.0
+                    if gain >= 0.02 and giveback >= trail_giveback:
+                        exit_reason = "trailing_stop"
+            if exit_reason:
+                if direction == "long":
+                    pnl = (price[i] - position["entry_price"]) * position["qty"]
+                else:
+                    pnl = (position["entry_price"] - price[i]) * position["qty"]
+                trades.append({
+                    "pnl": pnl, "entry_i": position["entry_i"], "exit_i": i,
+                    "direction": direction,
+                })
+                position = None
+            i += 1
+    return trades
+
+
 def _bar_hours(df: pd.DataFrame) -> float:
-    """Estimate hours per bar from the index (fallback 0.25)."""
+    """Estimate hours per bar from the index (fallback 0.25).
+
+    Uses the MODE of consecutive-bar deltas rather than the last two bars,
+    because the last two bars often span a market-close gap (e.g. 20:00 ->
+    next 09:30), which would overstate the bar length for intraday intervals.
+    """
     try:
         if len(df.index) >= 2:
-            delta = pd.Timestamp(df.index[-1]) - pd.Timestamp(df.index[-2])
-            return max(0.05, delta.total_seconds() / 3600.0)
+            idx = df.index
+            if isinstance(idx, pd.MultiIndex):
+                idx = idx.get_level_values(1)
+            deltas = pd.Series(idx).diff().dropna()
+            if len(deltas) > 0:
+                # Mode of deltas (most common bar spacing).
+                mode_delta = deltas.mode()
+                if len(mode_delta) > 0:
+                    return max(0.05, float(mode_delta.iloc[0].total_seconds()) / 3600.0)
     except Exception:
         pass
     return 0.25
@@ -368,6 +484,78 @@ def walk_forward_validate(df_by_interval: dict, configs: list[dict],
     return validated
 
 
+def walk_forward_validate_multifold(df_by_interval: dict, configs: list[dict],
+                                    n_folds: int = 5,
+                                    min_oos_trades: int = 30) -> list[dict]:
+    """Multi-fold walk-forward validation (P1: honest OOS sample).
+
+    The single-split ``walk_forward_validate`` produces a razor-thin OOS sample
+    (the 2026-09-19 audit found only 4 OOS trades — statistically meaningless).
+    This version splits history into ``n_folds`` chronological segments and, for
+    each fold, trains on all bars BEFORE the fold and tests on the fold itself.
+    OOS trades are AGGREGATED across folds, so a config must produce at least
+    ``min_oos_trades`` out-of-sample trades to be considered — a much more
+    honest bar than 3-4.
+
+    Returns configs enriched with per-fold and aggregate OOS stats, ranked by
+    aggregate OOS expectancy (requiring the aggregate win rate and expectancy
+    to clear the configured minimums).
+    """
+    validated = []
+    for cfg in configs:
+        interval = cfg["interval"]
+        df = df_by_interval.get(interval)
+        if df is None or len(df) < 100:
+            continue
+        n = len(df)
+        # Chronological fold boundaries (expanding-window walk-forward).
+        fold_edges = [int(n * (i + 1) / n_folds) for i in range(n_folds)]
+        fold_stats = []
+        agg_trades = 0
+        agg_pnl = 0.0
+        agg_wins = 0
+        for fold_idx, end in enumerate(fold_edges):
+            start = 0 if fold_idx == 0 else fold_edges[fold_idx - 1]
+            train_df = df.iloc[:start] if start > 0 else df.iloc[:1]  # empty train -> skip
+            test_df = df.iloc[start:end]
+            if len(test_df) < 60:
+                continue
+            # Train on the past (if any), test on the fold.
+            train_stats = simulate_config(train_df, cfg) if len(train_df) >= 60 else {"trades": 0}
+            test_stats = simulate_config(test_df, cfg)
+            fold_stats.append({
+                "fold": fold_idx,
+                "start": str(test_df.index[0]),
+                "end": str(test_df.index[-1]),
+                "train_trades": train_stats.get("trades", 0),
+                "test_trades": test_stats["trades"],
+                "test_pnl": test_stats["pnl"],
+                "test_win_rate": test_stats["win_rate"],
+                "test_expectancy": test_stats["expectancy"],
+            })
+            agg_trades += test_stats["trades"]
+            agg_pnl += test_stats["pnl"]
+            agg_wins += int(test_stats["trades"] * test_stats["win_rate"])
+        if agg_trades < min_oos_trades:
+            continue
+        agg_win_rate = agg_wins / agg_trades if agg_trades else 0.0
+        agg_expectancy = agg_pnl / agg_trades if agg_trades else 0.0
+        validated.append({
+            **cfg,
+            "n_folds": len(fold_stats),
+            "oos_trades": agg_trades,
+            "oos_pnl": agg_pnl,
+            "oos_win_rate": agg_win_rate,
+            "oos_expectancy": agg_expectancy,
+            "folds": fold_stats,
+        })
+    validated = [v for v in validated
+                 if v["oos_win_rate"] >= sl_cfg.SL_MIN_WIN_RATE
+                 and v["oos_expectancy"] >= sl_cfg.SL_MIN_EXPECTANCY_USD]
+    validated.sort(key=lambda v: v["oos_expectancy"], reverse=True)
+    return validated
+
+
 def _load_all_intervals(client: AlpacaClient, intervals: list[str]) -> dict:
     df_by_interval = {}
     for interval in intervals:
@@ -410,6 +598,8 @@ def main() -> None:
     parser.add_argument("--walkforward", action="store_true", help="Walk-forward validate")
     parser.add_argument("--all", action="store_true", help="Run all passes")
     parser.add_argument("--limit", type=int, default=2000, help="Bars per interval")
+    parser.add_argument("--folds", type=int, default=5,
+                        help="Number of walk-forward folds (multi-fold OOS)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -459,13 +649,18 @@ def main() -> None:
                     candidates = []
             if not candidates:
                 candidates = run_grid(df_by_interval, COARSE_GRID, top_n=sl_cfg.SL_TOP_N_CONFIGS)
-            validated = walk_forward_validate(df_by_interval, candidates,
-                                              train_frac=sl_cfg.SL_BACKTEST_TRAIN_FRACTION)
-            logger.info(f"Walk-forward shippable configs: {len(validated)}")
+            # P1: use multi-fold walk-forward for an honest OOS sample (>=30
+            # aggregated OOS trades) instead of the single-split 3-4 trade sample.
+            validated = walk_forward_validate_multifold(
+                df_by_interval, candidates,
+                n_folds=args.folds,
+                min_oos_trades=sl_cfg.SL_MIN_OOS_TRADES,
+            )
+            logger.info(f"Multi-fold walk-forward shippable configs: {len(validated)}")
             for v in validated:
                 logger.info(f"  {v['interval']} rsi<={v['rsi_entry_max']} "
-                            f"test_exp=${v['test_expectancy']:.2f} test_win={v['test_win_rate']:.0%} "
-                            f"test_trades={v['test_trades']}")
+                            f"oos_exp=${v['oos_expectancy']:.2f} oos_win={v['oos_win_rate']:.0%} "
+                            f"oos_trades={v['oos_trades']} folds={v['n_folds']}")
             with open("sideload/backtest_validated.json", "w") as f:
                 json.dump(validated, f, indent=2, default=str)
             _notify_discord("walk-forward", validated)

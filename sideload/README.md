@@ -6,6 +6,21 @@ and options stack, but with AMD-tuned rules. It writes to the **same database**
 so AMD flows automatically to both **treatmotivated.capital** (blog) and
 **dashboard.agenttrade.us** (decisions/thoughts) — zero changes to either.
 
+## Two sub-lanes (P3 split, 2026-09-19)
+
+Stocks and options are split into **dedicated lanes** (the analyst's
+recommendation + the user's "sideload options" idea):
+
+| Lane | Runner | Owns | Instruments |
+|---|---|---|---|
+| **AMD stock lane** | `runner_sideload.py` | AMD shares | Stocks (long + short via long puts) |
+| **AMD options lane** | `runner_options.py` | AMD options | Options (long calls + long puts) |
+
+- **Core product is now stocks-only** (`OPTIONS_ENABLED=false` in `.env`).
+  Options moved OUT of core into the dedicated AMD-options lane.
+- The options lane applies AMD-specific tuning (DTE 14-45, OTM 1-8%, 5% alloc,
+  conviction 0.7) via `config_sideload.apply_sideload_options_overrides()`.
+
 ## Positioning
 
 This lane is an **AMD expert / king / god**. It:
@@ -23,7 +38,7 @@ The north star: *when you see the agent "in on AMD", you KNOW it's going to win.
 | Trading | **Paper** (same Alpaca account) |
 | Database | **Same DB** (blog + dashboard pick AMD up automatically) |
 | AMD ownership | **Exclusive to sideload** (normal lane excludes it) |
-| Instruments | **Stocks first** — no options until the agent is expert |
+| Instruments | **Stocks + options, split into dedicated lanes** (both directions) |
 | Learning | **Daily, self-directed** (no user intervention) |
 | Backtest | **Grid-only** (deterministic rule search, no ML model) |
 | Data source | **Alpaca** historical bars |
@@ -49,7 +64,8 @@ sideload/
 ├── __init__.py
 ├── config_sideload.py        # AMD-tuned config overrides (env-driven, SL_*)
 ├── jira_logging.py           # shared Jira error-logging helper
-├── runner_sideload.py        # AMD-only trading cycle (paper, same DB)
+├── runner_sideload.py        # AMD STOCK trading cycle (paper, same DB)
+├── runner_options.py         # AMD OPTIONS trading cycle (P3: dedicated lane)
 ├── backtest_amd.py           # deterministic grid-search backtest (grid-only)
 ├── learn_amd.py              # daily learning agent (edge -> tuned rule)
 ├── publish_fact_of_day.py    # "Dexter's AMD Fact of the Day" blog post

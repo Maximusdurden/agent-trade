@@ -99,6 +99,27 @@ SL_MAX_ROUND_TRIPS_PER_DAY = _env_int("SL_MAX_ROUND_TRIPS_PER_DAY", 2)
 # flips this later.
 SL_OPTIONS_ENABLED = _env_bool("SL_OPTIONS_ENABLED", False)
 
+# --- AMD-specific options tuning (P3: dedicated AMD-options lane) ---
+# AMD options DTE window (shorter than core's 30-60 because AMD is high-beta and
+# we want to capture event-driven moves without holding through earnings).
+SL_OPTIONS_DTE_MIN = _env_int("SL_OPTIONS_DTE_MIN", 14)
+SL_OPTIONS_DTE_MAX = _env_int("SL_OPTIONS_DTE_MAX", 45)
+# AMD options OTM% window (tighter than core's 1-10% — AMD is volatile, so a
+# wider OTM band risks buying deep-OTM contracts that never go ITM).
+SL_OPTIONS_OTM_PCT_MIN = _env_float("SL_OPTIONS_OTM_PCT_MIN", 0.01)
+SL_OPTIONS_OTM_PCT_MAX = _env_float("SL_OPTIONS_OTM_PCT_MAX", 0.08)
+# AMD options max allocation % of equity per position (options are leveraged, so
+# smaller than the stock lane's 10%).
+SL_OPTIONS_MAX_ALLOC_PCT = _env_float("SL_OPTIONS_MAX_ALLOC_PCT", 0.05)
+# AMD options max contracts per ticker.
+SL_OPTIONS_MAX_CONTRACTS = _env_int("SL_OPTIONS_MAX_CONTRACTS", 3)
+# AMD options conviction threshold (route to options only at high conviction).
+SL_OPTIONS_CONVICTION_THRESHOLD = _env_float("SL_OPTIONS_CONVICTION_THRESHOLD", 0.7)
+# AMD options auto-close DTE (close before expiry to avoid assignment).
+SL_OPTIONS_AUTO_CLOSE_DTE = _env_int("SL_OPTIONS_AUTO_CLOSE_DTE", 3)
+# AMD options event gate (flatten before earnings/FOMC).
+SL_OPTIONS_EVENT_GATE_ENABLED = _env_bool("SL_OPTIONS_EVENT_GATE_ENABLED", True)
+
 # ---------------------------------------------------------------------------
 # Intervals to consider in the backtest (>= 5m floor, prefer longer).
 # ---------------------------------------------------------------------------
@@ -115,6 +136,10 @@ SL_BACKTEST_TRAIN_FRACTION = _env_float("SL_BACKTEST_TRAIN_FRACTION", 0.7)
 SL_MIN_WIN_RATE = _env_float("SL_MIN_WIN_RATE", 0.55)
 # Minimum out-of-sample expectancy (net PnL per round-trip, USD) to ship.
 SL_MIN_EXPECTANCY_USD = _env_float("SL_MIN_EXPECTANCY_USD", 5.0)
+# Minimum AGGREGATED out-of-sample trades across walk-forward folds before a
+# config is considered shippable (P1: the old single-split 3-4 trade sample was
+# statistically meaningless; 30+ gives a meaningful win-rate/expectancy bound).
+SL_MIN_OOS_TRADES = _env_int("SL_MIN_OOS_TRADES", 30)
 # How many top configs to carry into the fine grid / walk-forward.
 SL_TOP_N_CONFIGS = _env_int("SL_TOP_N_CONFIGS", 20)
 
@@ -157,6 +182,30 @@ def apply_sideload_overrides() -> None:
     # so we add it to the trading universe for the sideload cycle).
     if SL_SYMBOL not in cfg.TRADING_UNIVERSE:
         cfg.TRADING_UNIVERSE = list(cfg.TRADING_UNIVERSE) + [SL_SYMBOL]
+
+
+def apply_sideload_options_overrides() -> None:
+    """Enable AMD options with AMD-specific tuning (P3: dedicated options lane).
+
+    Call this AFTER ``apply_sideload_overrides()`` and BEFORE constructing the
+    option executor/lifecycle so they read the AMD-tuned option knobs. This is
+    used by the dedicated AMD-options lane (``sideload/runner_options.py``),
+    which owns AMD options exclusively while the stock lane owns AMD shares.
+    """
+    cfg = base_config
+    cfg.OPTIONS_ENABLED = True
+    cfg.OPTIONS_DTE_MIN = SL_OPTIONS_DTE_MIN
+    cfg.OPTIONS_DTE_MAX = SL_OPTIONS_DTE_MAX
+    cfg.OPTIONS_OTM_PERCENT_MIN = SL_OPTIONS_OTM_PCT_MIN
+    cfg.OPTIONS_OTM_PERCENT_MAX = SL_OPTIONS_OTM_PCT_MAX
+    cfg.OPTIONS_MAX_ALLOCATION_PCT = SL_OPTIONS_MAX_ALLOC_PCT
+    cfg.OPTIONS_MAX_CONTRACTS_PER_TICKER = SL_OPTIONS_MAX_CONTRACTS
+    cfg.OPTIONS_CONVICTION_THRESHOLD = SL_OPTIONS_CONVICTION_THRESHOLD
+    cfg.OPTIONS_AUTO_CLOSE_DTE = SL_OPTIONS_AUTO_CLOSE_DTE
+    cfg.OPTIONS_EVENT_GATE_ENABLED = SL_OPTIONS_EVENT_GATE_ENABLED
+    # Ensure AMD is in the options universe.
+    if SL_SYMBOL not in cfg.OPTIONS_UNIVERSE:
+        cfg.OPTIONS_UNIVERSE = list(cfg.OPTIONS_UNIVERSE) + [SL_SYMBOL]
 
 
 # ---------------------------------------------------------------------------

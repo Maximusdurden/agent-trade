@@ -186,6 +186,22 @@ def _calculate_return(df: pd.DataFrame) -> float:
     return 0.0
 
 
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten yfinance MultiIndex columns (Ticker, Field) to plain Field names.
+
+    yfinance >= 1.6 with pandas 3.x returns a MultiIndex column frame even for a
+    single ticker, so ``df["High"]`` yields a DataFrame and ``.max()`` returns a
+    Series — which breaks ``max(...)`` with an ambiguous-truth-value error. This
+    normalizes columns to the top level so ``df["High"]`` is a plain Series.
+    """
+    if df is None or df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
 def _letter_grade(score: float) -> str:
     if score >= 95.0: return "A+"
     if score >= 90.0: return "A"
@@ -209,10 +225,16 @@ def grade_trades_for_date(date_str: str, db_path: str = str(DATABASE_PATH)) -> i
     matching = []
     for _, row in df.iterrows():
         try:
+            # The realized_trades mirror stores exit_date as a DATE-ONLY string
+            # already in America/New_York (see tools/build_blog_db.round_trip_to_row,
+            # which formats the ET close_ts as %Y-%m-%d). So a naive value like
+            # "2026-09-18" MEANS 9/18 Eastern — do NOT re-localize it as UTC and
+            # convert to ET, which would shift it back a day (9/18 -> 9/17) and
+            # make the grader grade the wrong day's trades.
             exit_dt = pd.to_datetime(str(row["exit_date"]))
             if exit_dt.tzinfo is None:
-                exit_dt = pytz.utc.localize(exit_dt)
-            if exit_dt.astimezone(NY_TZ).date() == target_date:
+                exit_dt = NY_TZ.localize(exit_dt)
+            if exit_dt.date() == target_date:
                 matching.append(row.to_dict())
         except Exception as e:
             logger.warning("Bad exit_date %s: %s", row.get("exit_date"), e)
@@ -239,10 +261,10 @@ def _grade_one(trade: dict, date_str: str, db_path: str) -> int:
 
     entry_dt = pd.to_datetime(trade["entry_date"])
     if entry_dt.tzinfo is None:
-        entry_dt = pytz.utc.localize(entry_dt)
+        entry_dt = NY_TZ.localize(entry_dt)
     exit_dt = pd.to_datetime(trade["exit_date"])
     if exit_dt.tzinfo is None:
-        exit_dt = pytz.utc.localize(exit_dt)
+        exit_dt = NY_TZ.localize(exit_dt)
 
     grade_ticker = option_underlying(ticker) if is_option_contract_symbol(ticker) else ticker
     sector_symbol = get_sector_etf(grade_ticker)
@@ -258,6 +280,7 @@ def _grade_one(trade: dict, date_str: str, db_path: str) -> int:
     alpha_vs_sector = stock_return - sector_return
 
     if not df_stock.empty:
+        df_stock = _flatten_columns(df_stock)
         max_p = max(df_stock["High"].max(), entry_price, exit_price)
         min_p = min(df_stock["Low"].min(), entry_price, exit_price)
     else:

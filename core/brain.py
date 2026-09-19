@@ -18,6 +18,7 @@ live in ``core/personas.py``. Readers only ever see Treat Motivated Capital.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -205,6 +206,142 @@ def _apply_persona(raw_content: str, task_instruction: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# JSON-tolerant output handling
+#
+# Some models (e.g. Hermes 3 via OpenRouter) occasionally return a JSON object
+# instead of the requested plain-text format — e.g. for the intro they emit
+# {"title": ..., "meta": ..., "body": ...} and for a blurb {"text": ..., "persona": ...}.
+# These helpers robustly extract the JSON object (handling fences / embedded
+# prose / literal control chars) so the caller can pull the field it needs and
+# never publish raw JSON to the blog.
+# ---------------------------------------------------------------------------
+def _sanitize_control_chars_in_json(text: str) -> str:
+    """Escape raw control chars inside JSON string values so json.loads works.
+
+    Models often emit literal newlines/tabs inside string values, which are
+    invalid in strict JSON. Structural whitespace between tokens is preserved.
+    """
+    result = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                result.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                result.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                result.append(ch)
+                in_string = False
+                continue
+            if ch == "\n":
+                result.append("\\n")
+                continue
+            if ch == "\r":
+                result.append("\\r")
+                continue
+            if ch == "\t":
+                result.append("\\t")
+                continue
+            if ord(ch) < 32:
+                result.append("\\u%04x" % ord(ch))
+                continue
+            result.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            result.append(ch)
+    return "".join(result)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Robustly extract a JSON object from model output.
+
+    Handles pure JSON, JSON wrapped in ```json ... ``` fences, or JSON embedded
+    in surrounding prose. Returns the parsed dict, or None if no object found.
+    """
+    if not text:
+        return None
+    text = text.strip()
+
+    def _try_parse(candidate: str) -> dict | None:
+        if not candidate:
+            return None
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        sanitized = _sanitize_control_chars_in_json(candidate)
+        try:
+            parsed = json.loads(sanitized)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return None
+
+    parsed = _try_parse(text)
+    if parsed:
+        return parsed
+
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_match:
+        parsed = _try_parse(fence_match.group(1))
+        if parsed:
+            return parsed
+
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        parsed = _try_parse(candidate)
+                        if parsed:
+                            return parsed
+                        break
+    return None
+
+
+def _unwrap_json(text: str, *keys: str) -> str | None:
+    """If ``text`` is (or contains) a JSON object, return the first present key's
+    string value; otherwise return None. Used to normalize a JSON-returning model
+    back to plain text for the blog.
+    """
+    obj = _extract_json_object(text)
+    if not obj:
+        return None
+    for key in keys:
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Public: content generators
 # ---------------------------------------------------------------------------
 def format_pnl(val) -> str:
@@ -222,8 +359,14 @@ def generate_blog_intro(date_str, pnl, context_payload, active_tickers) -> str:
     """Generate the blog intro (Title / Meta / Body) in the active persona's voice."""
     logger.info("Generating blog intro (%s persona) for %s...", BLOG_PERSONA, date_str)
     formatted_pnl = format_pnl(pnl)
-    raw = (f"Date: {date_str} | PnL: {formatted_pnl} | "
-           f"Context & News: {context_payload} | Tickers: {active_tickers}")
+    # NOTE: Date and PnL are placed on SEPARATE lines (not adjacent tokens).
+    # When they were joined as "Date: 2026-09-18 | PnL: -$105", the model
+    # sometimes fused them into "-$105-09-18". Keeping them apart (plus the
+    # explicit rule below) prevents that token fusion.
+    raw = (f"Date: {date_str}\n"
+           f"Total PnL: {formatted_pnl}\n"
+           f"Context & News: {context_payload}\n"
+           f"Tickers: {active_tickers}")
     task = """
 Write the Blog Intro using the persona above.
 1. PRIORITY 1: If the context has "DAILY NOTES" or "SPECIAL INSTRUCTIONS", write about that topic FIRST.
@@ -232,7 +375,8 @@ Write the Blog Intro using the persona above.
 4. Focus on: What news drove performance? What was the total P/L? State the total P/L exactly as supplied (rounded to nearest dollar).
 5. Stay in the persona's voice the whole time. Keep the market discussion macro and simple — do NOT explain technical trading terms (EMAs, Crosses).
 6. FORMATTING: Strictly DO NOT use markdown bolding (**).
-7. Output format must be strictly:
+7. The DATE and the P/L are two SEPARATE values. Never merge or concatenate them (e.g. never write "-$105-09-18"). Always keep the date and the dollar amount distinct.
+8. Output format must be strictly:
    TITLE: [Title]
    META: [SEO Description]
    BODY: [The content]
@@ -284,7 +428,11 @@ Analyze the trade for {ticker} in the persona's voice.
 5. Use ONE high-quality, playful-but-professional metaphor, varied naturally. Do not repeat stock phrases.
 6. FORMATTING: Strictly DO NOT use markdown bolding (**).{grade_instruction}
 """
-    return _apply_persona(raw, task)
+    result = _apply_persona(raw, task)
+    # Some models wrap the blurb in JSON like {"text": "...", "persona": "dexter"}.
+    # Unwrap it so only the prose reaches the blog (never raw JSON).
+    unwrapped = _unwrap_json(result, "text", "body", "output", "content")
+    return unwrapped if unwrapped is not None else result
 
 
 if __name__ == "__main__":

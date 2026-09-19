@@ -621,6 +621,57 @@ class AlpacaClient:
                 combined_df = combined_df.groupby(level=0, group_keys=False).apply(lambda x: x.tail(limit))
             return combined_df
 
+    def get_historical_bars_paginated(self, symbol: str, timeframe_str: str = "1d",
+                                      days_back: int = 365, chunk_days: int = 90,
+                                      max_retries: int = 3) -> pd.DataFrame:
+        """Fetch MORE historical bars than a single Alpaca request allows.
+
+        Alpaca caps a single bars request at ~2000 bars. For intraday intervals
+        (1h/15min/5min/1min) that only covers a few weeks-months. This method
+        paginates by fetching overlapping date-window chunks and concatenating
+        them, so we can pull a full year+ of intraday history.
+
+        Args:
+            symbol: Ticker (single).
+            timeframe_str: e.g. '1d', '1h', '15min', '5min', '1min'.
+            days_back: how many calendar days of history to cover.
+            chunk_days: size of each date-window chunk (overlap to avoid gaps).
+            max_retries: per-chunk retry count.
+
+        Returns:
+            pd.DataFrame of concatenated bars (deduplicated, sorted by time).
+        """
+        tf, _ = self._get_timeframe(timeframe_str)
+        end = datetime.now()
+        start = end - timedelta(days=days_back)
+        frames = []
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + timedelta(days=chunk_days), end)
+            try:
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=symbol.upper(),
+                    timeframe=tf,
+                    start=cursor,
+                    end=chunk_end,
+                )
+                if DATA_FEED_AVAILABLE:
+                    request_params.feed = DataFeed.IEX
+                bars = self._fetch_with_retry(
+                    self.data_client, request_params, self.data_client.get_stock_bars, max_retries)
+                if bars and bars.df is not None and not bars.df.empty:
+                    frames.append(bars.df)
+            except Exception as e:
+                logger.warning(f"Paginated fetch failed for {symbol} {timeframe_str} "
+                               f"{cursor}..{chunk_end}: {e}")
+            cursor = chunk_end
+        if not frames:
+            return pd.DataFrame()
+        combined = pd.concat(frames)
+        # Deduplicate on the index (timestamp), sort chronologically.
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        return combined
+
     def _generate_mock_bars(self, symbols_list: list[str], limit: int, timeframe_str: str, is_list: bool) -> pd.DataFrame:
         """Generate mock historical bars for testing."""
         all_dfs = []
@@ -666,23 +717,38 @@ class AlpacaClient:
             
     def _get_timeframe(self, timeframe_str: str) -> tuple:
         """Convert timeframe string to TimeFrame object and day multiplier."""
-        if timeframe_str == "day":
+        ts = (timeframe_str or "").strip().lower()
+        if ts in ("day", "1d", "1day"):
             tf = TimeFrame.Day
             day_multiplier = 2
-        elif timeframe_str in ("15min", "15m"):
+        elif ts in ("1h", "1hour", "hour"):
+            try:
+                from alpaca.data.timeframe import TimeFrameUnit
+                tf = TimeFrame(1, TimeFrameUnit.Hour)
+            except Exception:
+                tf = TimeFrame.Day  # Safe fallback
+            day_multiplier = 10  # Cover enough days back to satisfy limit of 1h intervals
+        elif ts in ("15min", "15m"):
             try:
                 from alpaca.data.timeframe import TimeFrameUnit
                 tf = TimeFrame(15, TimeFrameUnit.Minute)
             except Exception:
                 tf = TimeFrame.Minute # Safe fallback if custom unit creation fails
             day_multiplier = 10  # Cover enough days back to satisfy limit of 15m intervals
-        elif timeframe_str in ("5min", "5m"):
+        elif ts in ("5min", "5m"):
             try:
                 from alpaca.data.timeframe import TimeFrameUnit
                 tf = TimeFrame(5, TimeFrameUnit.Minute)
             except Exception:
                 tf = TimeFrame.Minute  # Safe fallback if custom unit creation fails
             day_multiplier = 10  # Cover enough days back to satisfy limit of 5m intervals
+        elif ts in ("1min", "1m", "minute"):
+            try:
+                from alpaca.data.timeframe import TimeFrameUnit
+                tf = TimeFrame(1, TimeFrameUnit.Minute)
+            except Exception:
+                tf = TimeFrame.Minute  # Safe fallback if custom unit creation fails
+            day_multiplier = 10  # Cover enough days back to satisfy limit of 1m intervals
         else:
             tf = TimeFrame.Day
             day_multiplier = 2
