@@ -644,21 +644,37 @@ class AlpacaClient:
         tf, _ = self._get_timeframe(timeframe_str)
         end = datetime.now()
         start = end - timedelta(days=days_back)
+        # Route crypto symbols (e.g. SOL/USD) to the crypto client; stocks to
+        # the stock client. Crypto symbols contain '/' or end in a quote.
+        from core.strategy_rules import is_crypto_symbol
+        is_crypto = is_crypto_symbol(symbol)
         frames = []
         cursor = start
         while cursor < end:
             chunk_end = min(cursor + timedelta(days=chunk_days), end)
             try:
-                request_params = StockBarsRequest(
-                    symbol_or_symbols=symbol.upper(),
-                    timeframe=tf,
-                    start=cursor,
-                    end=chunk_end,
-                )
-                if DATA_FEED_AVAILABLE:
-                    request_params.feed = DataFeed.IEX
-                bars = self._fetch_with_retry(
-                    self.data_client, request_params, self.data_client.get_stock_bars, max_retries)
+                if is_crypto:
+                    request_params = CryptoBarsRequest(
+                        symbol_or_symbols=symbol.upper(),
+                        timeframe=tf,
+                        start=cursor,
+                        end=chunk_end,
+                    )
+                    bars = self._fetch_with_retry(
+                        self.crypto_data_client, request_params,
+                        self.crypto_data_client.get_crypto_bars, max_retries)
+                else:
+                    request_params = StockBarsRequest(
+                        symbol_or_symbols=symbol.upper(),
+                        timeframe=tf,
+                        start=cursor,
+                        end=chunk_end,
+                    )
+                    if DATA_FEED_AVAILABLE:
+                        request_params.feed = DataFeed.IEX
+                    bars = self._fetch_with_retry(
+                        self.data_client, request_params,
+                        self.data_client.get_stock_bars, max_retries)
                 if bars and bars.df is not None and not bars.df.empty:
                     frames.append(bars.df)
             except Exception as e:

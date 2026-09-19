@@ -244,12 +244,18 @@ def simulate_config(df: pd.DataFrame, cfg: dict, equity: float = 10000.0) -> dic
     # blocks ~97% of bars — an artifact, not a signal. Detect daily bars and
     # disable the dead-zone gate (keep the min-edge gate, which is still a
     # volatility-normalized distance check).
+    #
+    # EXCEPTION (2026-09-19): CRYPTO uses a ROLLING VWAP window (24/7), which is
+    # meaningful even on daily bars — so we do NOT disable the dead-zone for
+    # crypto daily bars.
+    from core.strategy_rules import is_crypto_symbol
+    is_crypto = is_crypto_symbol(sl_cfg.SL_SYMBOL)
     bar_hours = _bar_hours(df)
     is_daily = bar_hours >= 20.0  # ~24h bars
     valid_vwap = (vwap > 0) & (atr > 0)
     edge_sigma = np.where(valid_vwap, np.abs(price - vwap) / np.where(atr > 0, atr, 1.0), np.nan)
-    if is_daily:
-        # VWAP is degenerate on daily bars — do not veto entries on it.
+    if is_daily and not is_crypto:
+        # Equity daily VWAP is degenerate — do not veto entries on it.
         in_dead_zone = np.zeros(n, dtype=bool)
     else:
         in_dead_zone = valid_vwap & (np.abs(price - vwap) <= vwap_sigma * atr)
