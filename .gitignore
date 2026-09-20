@@ -62,6 +62,13 @@ sideload/backtest_coarse.json
 sideload/backtest_fine.json
 sideload/backtest_validated.json
 
+# Anchor study runtime outputs (regenerated each run, not source)
+sideload/anchor_study_*.csv
+sideload/anchor_study_summary.json
+sideload/anchor_intraday_*.csv
+sideload/anchor_options_backtest.json
+sideload/anchor_stock_backtest.json
+
 # Generated env-vars YAML for Cloud Run (contains secrets from .env)
 deploy/env_vars.yaml
 

@@ -292,6 +292,66 @@ def _repair_stray_quote_comma(text: str):
     return "".join(out) if changed else text
 
 
+def _repair_missing_comma(text: str):
+    """Insert a missing comma between JSON array elements / object members.
+
+    Root cause of the TMCL-997..1003 brain tickets: the brain's 16-ticker
+    ``decisions`` array is large (often >8KB), and the model intermittently
+    DROPS the comma between two adjacent array elements (``}{``) or between an
+    object member and the next key (``}"``). ``json.loads`` then fails with
+    ``Expecting ',' delimiter: line N column M`` — the exact failure signature
+    of these tickets. None of the other repairs (stray quote-comma, literal
+    whitespace, unescaped quotes, control chars) insert a missing comma, so the
+    whole response was rejected and the brain fell back to rule-based trading.
+
+    This walks the text string-aware and, whenever it is OUTSIDE a string and
+    sees a structural closer (``}`` or ``]``) immediately followed (after
+    optional whitespace) by an opener (``{``, ``[``, or ``"``), inserts a comma
+    between them. A legit JSON document never has ``}{``, ``]["``, ``}"``, etc.
+    without a comma, so this is safe.
+
+    Returns the repaired string, or the original if nothing changed.
+    """
+    if not text:
+        return text
+    out = []
+    in_string = False
+    escaped = False
+    changed = False
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch in "}]":
+            # Outside a string: peek ahead past whitespace for an opener that
+            # would require a comma before it (next array element or member).
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "{[\"":
+                # Missing comma between `}`/`]` and the next element/member.
+                out.append(ch)
+                out.append(",")
+                changed = True
+                i += 1
+                continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+        i += 1
+    return "".join(out) if changed else text
+
+
 class SharedLLMClient:
     """
     Centralized OpenRouter Client Wrapper for structured generation.
@@ -839,12 +899,12 @@ class SharedLLMClient:
                 json_str = cleaned_text[start_idx:end_idx+1]
 
         # Parse JSON with multiple recovery attempts
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 result_dict = json.loads(json_str)
                 return result_dict
             except json.JSONDecodeError as e:
-                if attempt < 3:  # Try recovery on first three attempts
+                if attempt < 4:  # Try recovery on first four attempts
                     logger.warning(f"JSON parse attempt {attempt + 1} failed: {e}")
 
                     if attempt == 0:
@@ -880,6 +940,18 @@ class SharedLLMClient:
                             continue
 
                     if attempt == 3:
+                        # Root cause of the TMCL-997..1003 brain tickets: the
+                        # model DROPS a comma between array elements / object
+                        # members in the large 16-ticker `decisions` array
+                        # (e.g. `}{` instead of `},{`). Insert the missing comma
+                        # string-aware. This runs after the quote repairs so a
+                        # stray quote can't confuse the string tracking.
+                        repaired = _repair_missing_comma(json_str)
+                        if repaired != json_str:
+                            json_str = repaired
+                            continue
+
+                    if attempt == 4:
                         # Root cause of the TMCL-988 strategist ticket: a raw
                         # control character that is NOT \t/\n/\r surviving inside
                         # a string value -> "Invalid control character at: line N

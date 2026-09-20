@@ -12,7 +12,11 @@
 #   - sideload-daily   : run_amd_daily.py  (backtest -> learn -> fact-of-day)
 #   - sideload-trader  : run_amd_trader.py (intraday AMD trading loop)
 
-$ErrorActionPreference = "Stop"
+# Use "Continue" (not "Stop") because the gcloud.ps1 PowerShell wrapper converts
+# benign stderr output (e.g. "property overridden" warnings) into a
+# NativeCommandError that would abort the whole deploy. Real failures are caught
+# by explicit $LASTEXITCODE checks after each critical gcloud step below.
+$ErrorActionPreference = "Continue"
 
 # 1. Load Configurations from .env
 $EnvPath = "Z:\python\projects\agent-trade\.env"
