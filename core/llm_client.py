@@ -304,11 +304,20 @@ def _repair_missing_comma(text: str):
     whitespace, unescaped quotes, control chars) insert a missing comma, so the
     whole response was rejected and the brain fell back to rule-based trading.
 
-    This walks the text string-aware and, whenever it is OUTSIDE a string and
-    sees a structural closer (``}`` or ``]``) immediately followed (after
-    optional whitespace) by an opener (``{``, ``[``, or ``"``), inserts a comma
-    between them. A legit JSON document never has ``}{``, ``]["``, ``}"``, etc.
-    without a comma, so this is safe.
+    This walks the text string-aware and inserts a comma in two situations:
+
+    1. A structural closer (``}`` or ``]``) immediately followed (after optional
+       whitespace) by an opener (``{``, ``[``, or ``"``) — e.g. ``}{``, ``]["``,
+       ``}"``. A legit JSON document never has these without a comma.
+
+    2. A string VALUE immediately followed (after optional whitespace) by
+       another ``"`` (a key opener) — e.g. ``"thought_process": "long text"
+       "action": "BUY"``. This is the TMCL-1008..1012 signature: the model drops
+       the comma between a long string value and the next key. In valid JSON a
+       string value is always followed by ``,``, ``}``, ``]``, or end-of-input —
+       never directly by another ``"``. We track whether the string we just
+       closed was a value (vs a key) by watching the next significant char: a
+       ``:`` means it was a key, anything else means it was a value.
 
     Returns the repaired string, or the original if nothing changed.
     """
@@ -320,6 +329,10 @@ def _repair_missing_comma(text: str):
     changed = False
     n = len(text)
     i = 0
+    # True when the previous significant token was a closed string VALUE (as
+    # opposed to a key). A colon immediately after a string means it was a key;
+    # otherwise it was a value. Used to detect a dropped comma before a key.
+    prev_was_string_value = False
     while i < n:
         ch = text[i]
         if in_string:
@@ -330,6 +343,14 @@ def _repair_missing_comma(text: str):
                 escaped = True
             elif ch == '"':
                 in_string = False
+                # Tentatively mark this as a value; the next significant char
+                # decides (a ':' means it was actually a key).
+                prev_was_string_value = True
+            i += 1
+            continue
+        if ch in " \t\r\n":
+            # Whitespace between tokens: keep the pending string-value flag.
+            out.append(ch)
             i += 1
             continue
         if ch in "}]":
@@ -344,9 +365,37 @@ def _repair_missing_comma(text: str):
                 out.append(",")
                 changed = True
                 i += 1
+                prev_was_string_value = False
                 continue
+            prev_was_string_value = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ":":
+            # A colon means the preceding string was a KEY, not a value.
+            prev_was_string_value = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            prev_was_string_value = False
+            out.append(ch)
+            i += 1
+            continue
         if ch == '"':
+            if prev_was_string_value:
+                # A string value immediately followed by another `"` (a key
+                # opener) with no comma -> insert the missing comma. This is
+                # the TMCL-1008..1012 signature.
+                out.append(",")
+                changed = True
             in_string = True
+            prev_was_string_value = False
+            out.append(ch)
+            i += 1
+            continue
+        # Any other token (number, literal, etc.) clears the string-value flag.
+        prev_was_string_value = False
         out.append(ch)
         i += 1
     return "".join(out) if changed else text
@@ -920,10 +969,18 @@ class SharedLLMClient:
                             continue
 
                     if attempt == 1:
-                        # Root cause of "Expecting ',' delimiter: line 2 column NNN":
-                        # a LITERAL newline/tab inside a quoted string value. Escape
-                        # them string-aware before any other heuristic.
-                        repaired = _repair_literal_whitespace_in_strings(json_str)
+                        # Root cause of "Expecting ',' delimiter: line N column M"
+                        # in the brain's large `decisions` array: the model DROPS
+                        # a comma between array elements / object members, OR
+                        # between a string value and the next key (e.g.
+                        # `"thought_process": "long text" "action": "BUY"` —
+                        # the TMCL-1008..1012 signature). Insert the missing
+                        # comma string-aware. This MUST run BEFORE the unescaped-
+                        # quote repair: that repair cannot tell a value's closing
+                        # quote from a literal quote, so on a missing-comma
+                        # response it escapes the closing quote and swallows the
+                        # rest of the object into one giant string.
+                        repaired = _repair_missing_comma(json_str)
                         if repaired != json_str:
                             json_str = repaired
                             continue
@@ -940,13 +997,10 @@ class SharedLLMClient:
                             continue
 
                     if attempt == 3:
-                        # Root cause of the TMCL-997..1003 brain tickets: the
-                        # model DROPS a comma between array elements / object
-                        # members in the large 16-ticker `decisions` array
-                        # (e.g. `}{` instead of `},{`). Insert the missing comma
-                        # string-aware. This runs after the quote repairs so a
-                        # stray quote can't confuse the string tracking.
-                        repaired = _repair_missing_comma(json_str)
+                        # Root cause of the TMCL-977..988 strategist tickets:
+                        # a LITERAL newline/tab inside a quoted string value.
+                        # Escape them string-aware.
+                        repaired = _repair_literal_whitespace_in_strings(json_str)
                         if repaired != json_str:
                             json_str = repaired
                             continue

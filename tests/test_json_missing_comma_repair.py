@@ -89,6 +89,78 @@ class TestMissingCommaRepair(unittest.TestCase):
         self.assertEqual(len(parsed["decisions"]), 2)
         self.assertEqual(parsed["decisions"][1]["action"], "BUY")
 
+    def test_inserts_comma_between_string_value_and_key(self):
+        # TMCL-1008..1012 signature: the model drops the comma between a long
+        # string VALUE and the next KEY (e.g. thought_process -> action).
+        raw = ('{"decisions": [{"symbol": "AAPL", "action": "HOLD", '
+               '"thought_process": "Ranging, no edge" "action": "BUY"}]}')
+        repaired = _repair_missing_comma(raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed["decisions"][0]["action"], "BUY")
+        self.assertEqual(parsed["decisions"][0]["thought_process"], "Ranging, no edge")
+
+    def test_inserts_comma_between_string_value_and_key_with_whitespace(self):
+        # Same as above but with a newline/whitespace between the value and key.
+        raw = ('{"decisions": [{"symbol": "AAPL", "action": "HOLD", '
+               '"thought_process": "Ranging, no edge"\n  "action": "BUY"}]}')
+        repaired = _repair_missing_comma(raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed["decisions"][0]["action"], "BUY")
+
+    def test_does_not_insert_comma_after_key(self):
+        # A string followed by ':' is a KEY, not a value -> no comma inserted.
+        raw = '{"symbol": "AAPL", "action": "HOLD"}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(repaired, raw)
+        json.loads(repaired)
+
+    def test_does_not_insert_comma_before_colon(self):
+        # `"key":` must never become `"key",:`.
+        raw = '{"thought_process": "text", "action": "BUY"}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(repaired, raw)
+        json.loads(repaired)
+
+    def test_does_not_touch_valid_string_value_followed_by_comma(self):
+        raw = '{"thought_process": "text", "action": "BUY"}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(repaired, raw)
+
+    def test_does_not_touch_string_value_at_end_of_object(self):
+        # A string value followed by `}` (end of object) needs no comma.
+        raw = '{"a": "value"}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(repaired, raw)
+        json.loads(repaired)
+
+    def test_does_not_touch_string_value_followed_by_closing_bracket(self):
+        raw = '{"decisions": [{"a": "value"}]}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(repaired, raw)
+        json.loads(repaired)
+
+    def test_does_not_touch_escaped_quote_inside_value(self):
+        # A value containing an escaped quote must not confuse the logic.
+        raw = '{"thought_process": "say \\"hi\\" now", "action": "BUY"}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(repaired, raw)
+        json.loads(repaired)
+
+    def test_full_brain_style_missing_comma_before_key(self):
+        # Full brain-style response with a dropped comma between a long
+        # thought_process value and the next key (the TMCL-1008..1012 signature).
+        raw = (
+            '{"decisions": ['
+            '{"symbol": "AAPL", "action": "HOLD", "quantity": 0.0, '
+            '"direction": "neutral", "conviction": 0.5, '
+            '"thought_process": "Ranging, no edge" "action": "HOLD"}]}'
+        )
+        repaired = _repair_missing_comma(raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(len(parsed["decisions"]), 1)
+        self.assertEqual(parsed["decisions"][0]["action"], "HOLD")
+        self.assertEqual(parsed["decisions"][0]["thought_process"], "Ranging, no edge")
+
 
 if __name__ == "__main__":
     unittest.main()
