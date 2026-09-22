@@ -466,18 +466,21 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     setup_jira_logging(app_name="agent-trade-swing-trader")
 
-    if not args.force:
-        is_open, reason = _is_equity_market_hours()
-        if not is_open:
-            logger.info(f"Skipping swing trader: {reason}")
-            return
-
     # Auto mode: pick scan vs monitor by time-of-day. The EOD scan fires at
     # 4:05 PM ET (after the 4:00 PM close); everything else is a monitor run.
     if args.auto:
         now = _now_et()
         args.scan = (now.hour == 16 and now.minute >= 0 and now.minute <= 10)
         args.monitor = not args.scan
+
+    # The market-hours gate applies ONLY to intraday monitoring. The EOD scan
+    # runs AFTER the 4:00 PM close (4:05 PM ET), so it must bypass the gate —
+    # otherwise the post-close scan is always skipped as "Post-market".
+    if not args.force and not args.scan:
+        is_open, reason = _is_equity_market_hours()
+        if not is_open:
+            logger.info(f"Skipping swing trader: {reason}")
+            return
 
     # Cloud Run containers are ephemeral — pull the persisted swing state from
     # GCS at startup so this run starts from the last-known positions/fills.

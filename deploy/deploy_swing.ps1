@@ -118,6 +118,28 @@ $EnvVariablesList = @(
     "GOOGLE_CLOUD_PROJECT=$GcpProject",
     "GCS_BUCKET_NAME=$GcsBucket"
 )
+# Jira credentials (for error->Jira logging) from .env.
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# Alpaca credentials the swing lane needs to run on REAL market data instead of
+# falling back to the mock client. Without these the EOD scan silently runs on
+# fake bars and stages nothing real.
+$ConfigKeys = @(
+    "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER"
+)
+Get-Content $EnvPath | ForEach-Object {
+    $Line = $_.Trim()
+    if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
+        $Parts = $Line.Split("=", 2)
+        $Key = $Parts[0].Trim()
+        $Val = $Parts[1].Trim().Trim("'`"")
+        if (($JiraKeys -contains $Key -or $ConfigKeys -contains $Key) -and $Val -and -not $Val.StartsWith("your_")) {
+            $EnvVariablesList += "$Key=$Val"
+        }
+    }
+}
+$SecretReferences = @(
+    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
+)
 $FlagLines = @("--set-env-vars:")
 foreach ($Entry in $EnvVariablesList) {
     $Parts = $Entry.Split("=", 2)
@@ -131,11 +153,13 @@ foreach ($Entry in $EnvVariablesList) {
 if (-not $JobExists) {
     & $GCloud run jobs create $JobName --image $ImageTag --region $Region `
         --command "python" --args="run_swing_trader.py,--auto" `
-        --flags-file $FlagsFile
+        --flags-file $FlagsFile `
+        --set-secrets ($SecretReferences -join ",")
 } else {
     & $GCloud run jobs update $JobName --image $ImageTag --region $Region `
         --command "python" --args="run_swing_trader.py,--auto" `
-        --flags-file $FlagsFile
+        --flags-file $FlagsFile `
+        --set-secrets ($SecretReferences -join ",")
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to deploy job $JobName (exit $LASTEXITCODE)."
