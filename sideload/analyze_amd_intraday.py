@@ -155,12 +155,29 @@ def _rsi_at(intraday: pd.DataFrame, day: pd.Timestamp, cutoff: dtime) -> float |
     return float(rsi.iloc[-1])
 
 
+def _post_cutoff_range(intraday: pd.DataFrame, day: pd.Timestamp, cutoff: dtime) -> tuple[float, float] | None:
+    """Return (high, low) of bars AFTER ``cutoff`` on ``day`` (post-entry range).
+
+    Used for the amplitude target: the remaining intraday range after the 9:45
+    signal cutoff. Returns None if no bars after the cutoff.
+    """
+    day_et = day.tz_convert(ET) if day.tzinfo is not None else day.tz_localize(ET)
+    start = day_et.replace(hour=cutoff.hour, minute=cutoff.minute, second=0, microsecond=0)
+    end = day_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    window = intraday[(intraday.index > start) & (intraday.index <= end)]
+    if window.empty:
+        return None
+    return float(window["high"].max()), float(window["low"].min())
+
+
 def build_dataset(client: AlpacaClient, symbol: str, days_back: int = 730) -> pd.DataFrame:
     """Build the per-day intraday directional dataset.
 
-    One row per trading day. Target = open-to-close return. Predictors are
-    computed ONLY from bars up to 9:45 ET (open-to-9:45 momentum, 9:45 RSI,
-    AMD-vs-SPY 9:45 relative strength) plus lagged daily state (t-1 close).
+    One row per trading day. Target = 9:45-to-close return (STRICTLY post-entry,
+    no overlap with the open-to-9:45 signal). Predictors are computed ONLY from
+    bars up to 9:45 ET (open-to-9:45 momentum, 9:45 RSI, AMD-vs-SPY 9:45 relative
+    strength) plus lagged daily state (t-1 close). Amplitude columns capture the
+    post-entry range for the volatility hypothesis.
     """
     intraday = load_intraday(client, symbol, days_back)
     if intraday.empty:
@@ -206,14 +223,25 @@ def build_dataset(client: AlpacaClient, symbol: str, days_back: int = 730) -> pd
         c = float(day_oc.loc[day, "close"])
         if o <= 0:
             continue
-        # Target: open-to-close return.
-        intraday_ret = (c / o - 1.0) * 100.0
-        # Signal: open-to-9:45 momentum.
+        # Signal: open-to-9:45 momentum (knowable at entry).
         p945 = _price_at(intraday, day, SIGNAL_CUTOFF)
         if p945 is None:
             continue
         open_to_945 = (p945 / o - 1.0) * 100.0
         rsi_945 = _rsi_at(intraday, day, SIGNAL_CUTOFF)
+
+        # TARGET (leakage-free): 9:45-to-close return. This is STRICTLY the
+        # post-entry move — the open-to-9:45 move is NOT part of it, so the
+        # feature is not a sub-component of the target.
+        ret_945_to_close = (c / p945 - 1.0) * 100.0
+
+        # Amplitude target (volatility hypothesis): remaining post-9:45 range.
+        post_range = _post_cutoff_range(intraday, day, SIGNAL_CUTOFF)
+        remaining_range_pct = None
+        if post_range is not None:
+            hi, lo = post_range
+            remaining_range_pct = (hi - lo) / p945 * 100.0
+        abs_move_945_to_close = abs(ret_945_to_close)
 
         # Lagged daily state (t-1 close).
         day_prev = day - pd.Timedelta(days=1)
@@ -234,8 +262,9 @@ def build_dataset(client: AlpacaClient, symbol: str, days_back: int = 730) -> pd
             "date": str(day.date()),
             "open": o,
             "close": c,
-            "intraday_ret_pct": intraday_ret,
-            "direction": "higher" if intraday_ret > 0 else "lower",
+            "price_945": p945,
+            "intraday_ret_pct": ret_945_to_close,  # 9:45-to-close (post-entry)
+            "direction": "higher" if ret_945_to_close > 0 else "lower",
             "open_to_945_pct": open_to_945,
             "rsi_945": rsi_945,
             "rel_strength_945": rel_strength_945,
@@ -243,6 +272,8 @@ def build_dataset(client: AlpacaClient, symbol: str, days_back: int = 730) -> pd
             "prev_day_move_pct": prev_day_move,
             "prev_rsi": prev_rsi,
             "volume_vs_avg": prev_vol,
+            "remaining_range_pct": remaining_range_pct,
+            "abs_move_945_to_close": abs_move_945_to_close,
             "day_of_week": day.dayofweek,
         })
 
@@ -337,7 +368,55 @@ def analyze_descriptive(df: pd.DataFrame) -> dict:
             "mean_move_pct": float(sub["intraday_ret_pct"].mean()) if len(sub) else None,
             "downside_mean_move_pct": float(l["intraday_ret_pct"].mean()) if len(l) else None,
         })
+
+    # --- Amplitude (volatility) hypothesis --------------------------------
+    # Does morning momentum predict EXPANSION of the remaining range, even if
+    # not direction? This is the pivot from directional to volatility trading.
+    result["amplitude_analysis"] = _amplitude_analysis(df)
     return result
+
+
+def _amplitude_analysis(df: pd.DataFrame) -> dict:
+    """Test whether |open_to_945| predicts the post-9:45 range / |move|.
+
+    Returns correlations and a conditional table of median remaining range by
+    morning-velocity bucket. This is the decision gate: if corr < 0.20, abandon
+    the 9:45 open-breakout framework; if >= 0.35, design a volatility playbook.
+    """
+    out = {}
+    if "open_to_945_pct" not in df.columns or "remaining_range_pct" not in df.columns:
+        return out
+
+    abs_vel = df["open_to_945_pct"].abs()
+    range_ = df["remaining_range_pct"]
+    abs_move = df["abs_move_945_to_close"]
+
+    out["corr_abs_vel_remaining_range"] = float(abs_vel.corr(range_)) if len(abs_vel) else None
+    out["corr_abs_vel_abs_move"] = float(abs_vel.corr(abs_move)) if len(abs_vel) else None
+
+    # Conditional table: median remaining range by |open_to_945| bucket.
+    buckets = {
+        "|vel| < 0.25%": abs_vel < 0.25,
+        "0.25-0.5%": (abs_vel >= 0.25) & (abs_vel < 0.5),
+        "0.5-1.0%": (abs_vel >= 0.5) & (abs_vel < 1.0),
+        "|vel| > 1.0%": abs_vel >= 1.0,
+    }
+    base_median_range = float(range_.median()) if len(range_) else None
+    base_median_move = float(abs_move.median()) if len(abs_move) else None
+    out["base_median_remaining_range"] = base_median_range
+    out["base_median_abs_move"] = base_median_move
+    out["buckets"] = {}
+    for label, mask in buckets.items():
+        sub = df[mask]
+        if len(sub) < 20:
+            continue
+        out["buckets"][label] = {
+            "n": int(len(sub)),
+            "median_remaining_range": float(sub["remaining_range_pct"].median()) if sub["remaining_range_pct"].notna().any() else None,
+            "median_abs_move": float(sub["abs_move_945_to_close"].median()) if sub["abs_move_945_to_close"].notna().any() else None,
+            "mean_remaining_range": float(sub["remaining_range_pct"].mean()) if sub["remaining_range_pct"].notna().any() else None,
+        }
+    return out
 
 
 def _bucket_stats(df: pd.DataFrame, feature: str) -> dict:
@@ -449,7 +528,7 @@ def write_report(symbol: str, desc: dict, clf: dict | None) -> str:
     lines.append(f"- Days: **{desc['n_days']}** (higher {desc['n_higher']} / lower {desc['n_lower']})")
     lines.append(f"- **Higher rate: {_fmt_pct(desc['higher_rate'])}**")
     lines.append("")
-    lines.append("## Amplitude (open-to-close % change)")
+    lines.append("## Amplitude (9:45-to-close % change — post-entry target)")
     lines.append("")
     lines.append("| bucket | mean % | median % |")
     lines.append("|---|---|---|")
@@ -499,8 +578,35 @@ def write_report(symbol: str, desc: dict, clf: dict | None) -> str:
         dm = "n/a" if c.get("downside_mean_move_pct") is None else f"{c['downside_mean_move_pct']:+.2f}"
         lines.append(f"| {c['condition']} | {c['n']} | {_fmt_pct(c['lower_rate'])} | {c['lower_lift_vs_base']:+.1%} | {dm} |")
     lines.append("")
-    lines.append("_`downside mean move %` = mean open-to-close move on LOWER days only (expected short gain)._")
+    lines.append("_`downside mean move %` = mean 9:45-to-close move on LOWER days only (expected short gain)._")
     lines.append("")
+
+    # --- Amplitude (volatility) hypothesis section -------------------------
+    amp_an = desc.get("amplitude_analysis", {})
+    if amp_an:
+        lines.append("## Amplitude (volatility) hypothesis — does morning velocity predict range expansion?")
+        lines.append("")
+        lines.append("_Pivot from directional to volatility trading: even if direction is a coin-flip, "
+                     "morning momentum may predict a LARGER remaining range (tradeable via straddles/breakouts)._")
+        lines.append("")
+        c1 = amp_an.get("corr_abs_vel_remaining_range")
+        c2 = amp_an.get("corr_abs_vel_abs_move")
+        lines.append(f"- **corr(|open_to_945|, remaining_range):** {c1 if c1 is None else round(c1, 3)}")
+        lines.append(f"- **corr(|open_to_945|, |9:45-to-close move|):** {c2 if c2 is None else round(c2, 3)}")
+        lines.append("")
+        lines.append("| |open_to_945| bucket | n | median remaining range % | median |move| % |")
+        lines.append("|---|---|---|---|")
+        base_r = amp_an.get("base_median_remaining_range")
+        base_m = amp_an.get("base_median_abs_move")
+        lines.append(f"| baseline (all days) | {desc['n_days']} | {base_r if base_r is None else round(base_r, 2)} | {base_m if base_m is None else round(base_m, 2)} |")
+        for label, b in amp_an.get("buckets", {}).items():
+            mr = b.get("median_remaining_range")
+            mm = b.get("median_abs_move")
+            lines.append(f"| {label} | {b['n']} | {mr if mr is None else round(mr, 2)} | {mm if mm is None else round(mm, 2)} |")
+        lines.append("")
+        lines.append("_Decision gate: corr < 0.20 → abandon the 9:45 open-breakout framework; "
+                     ">= 0.35 → design a volatility playbook (strangle/breakout bracket)._")
+        lines.append("")
 
     if clf and "error" not in clf:
         lines.append("## Classifier cross-check (walk-forward logistic regression)")

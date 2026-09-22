@@ -268,6 +268,28 @@ def build_dataset(client: AlpacaClient, symbol: str, days: int, direction: str =
     df = df.dropna(subset=["rsi_14", "sma_20", "atr_14", "daily_pct_change"])
     df = df[df["prev_close"] > 0]
 
+    # --- LEAKAGE FIX: lag all predictors by one day -------------------------
+    # Every feature must be known BEFORE the day we're predicting. The raw
+    # indicators (rsi_14, bollinger_pos, gap_pct, rel_strength_spy, etc.) are
+    # computed on day t's close/open — using them to predict day t's direction
+    # is target leakage (the feature IS the label). We shift each predictor to
+    # t-1 so it represents the state at the PRIOR close, which is genuinely
+    # knowable at entry. direction / amplitude_pct stay at t (the target).
+    PREDICTOR_COLS = [
+        "sma_20", "sma_50", "sma20_slope_pct",
+        "rsi_14", "macd_line", "macd_signal", "macd_hist",
+        "bollinger_upper", "bollinger_lower", "bollinger_pos",
+        "atr_14", "atr_pct",
+        "vwap_roll_20", "vwap_dist_sigma",
+        "gap_pct", "intraday_range_pct", "close_vs_open_pct",
+        "volume_pct_change", "volume_vs_avg",
+        "overnight_share", "streak", "rel_strength_spy",
+        "regime",
+    ]
+    for col in PREDICTOR_COLS:
+        if col in df.columns:
+            df[col] = df[col].shift(1)
+
     # Keep a clean, ordered column set.
     cols = [
         "open", "high", "low", "close", "volume",
@@ -419,14 +441,22 @@ def analyze_descriptive(df: pd.DataFrame, direction: str = "close") -> dict:
         if len(sub) < 20:
             continue  # flag low-n by omitting; report notes this.
         h = sub[sub["direction"] == "higher"]
+        l = sub[sub["direction"] == "lower"]
+        higher_rate = len(h) / len(sub)
+        lower_rate = len(l) / len(sub)
         result["conditionals"].append({
             "condition": label,
             "n": int(len(sub)),
-            "higher_rate": len(h) / len(sub),
-            "lift_vs_base": (len(h) / len(sub)) - base_rate,
+            "higher_rate": higher_rate,
+            "lower_rate": lower_rate,
+            "lift_vs_base": higher_rate - base_rate,
+            # Short-side lift: how much this condition raises P(lower) over base.
+            "lower_lift_vs_base": lower_rate - (1.0 - base_rate),
             # Expectancy: mean defining-price move for the condition (the KPI
             # that actually drives PnL, not just win rate).
             "mean_move_pct": float(sub["amplitude_pct"].mean()) if len(sub) else None,
+            # Downside expectancy: mean move on LOWER days only (for shorting).
+            "downside_mean_move_pct": float(l["amplitude_pct"].mean()) if len(l) else None,
         })
 
     return result
@@ -594,16 +624,33 @@ def write_report(symbol: str, desc: dict, clf: dict | None, direction: str = "cl
     lines.append("")
     lines.append("## Conditional probabilities — P(higher | condition)")
     lines.append("")
-    lines.append(f"Base rate: **{_fmt_pct(desc['higher_rate'])}**")
+    lines.append(f"Base rate: **{_fmt_pct(desc['higher_rate'])}** (lower {_fmt_pct(1.0 - desc['higher_rate'])})")
     lines.append("")
-    lines.append("| condition | n | P(higher) | lift vs base | mean move % |")
+    lines.append("| condition | n | P(higher) | P(lower) | mean move % |")
     lines.append("|---|---|---|---|---|")
     for c in sorted(desc["conditionals"], key=lambda x: -abs(x["lift_vs_base"])):
         mm = "n/a" if c.get("mean_move_pct") is None else f"{c['mean_move_pct']:+.2f}"
-        lines.append(f"| {c['condition']} | {c['n']} | {_fmt_pct(c['higher_rate'])} | {c['lift_vs_base']:+.1%} | {mm} |")
+        lines.append(f"| {c['condition']} | {c['n']} | {_fmt_pct(c['higher_rate'])} | {_fmt_pct(c['lower_rate'])} | {mm} |")
     lines.append("")
     lines.append("_Low-n conditions (<20) are omitted; treat small-n rows with caution. "
                  "`mean move %` is the expectancy (defining-price move) — the KPI that drives PnL._")
+    lines.append("")
+
+    # --- Short-side section: rank conditions by downside expectancy ---------
+    lines.append("## Short-side signals — P(lower | condition) ranked by downside expectancy")
+    lines.append("")
+    lines.append("_For shorting AMD: conditions where P(lower) is high AND the downside move is large._")
+    lines.append("")
+    lines.append("| condition | n | P(lower) | lower lift vs base | downside mean move % |")
+    lines.append("|---|---|---|---|---|")
+    shorts = [c for c in desc["conditionals"] if c.get("lower_lift_vs_base") is not None]
+    shorts.sort(key=lambda x: -abs(x["lower_lift_vs_base"]))
+    for c in shorts[:12]:
+        dm = "n/a" if c.get("downside_mean_move_pct") is None else f"{c['downside_mean_move_pct']:+.2f}"
+        lines.append(f"| {c['condition']} | {c['n']} | {_fmt_pct(c['lower_rate'])} | {c['lower_lift_vs_base']:+.1%} | {dm} |")
+    lines.append("")
+    lines.append("_`downside mean move %` is the mean defining-price move on LOWER days only — "
+                 "the expected gain from a short. Rank by |lower lift| first, then downside size._")
     lines.append("")
 
     if clf and "error" not in clf:
@@ -644,6 +691,17 @@ def write_report(symbol: str, desc: dict, clf: dict | None, direction: str = "cl
         lines.append("- Add a `bollinger_pos` gate (e.g. only enter when `bollinger_pos > 0`).")
         lines.append("- Add an `rsi_14` floor (e.g. skip when `rsi_14 < 40`).")
         lines.append("- Add a `macd_hist` sign filter (e.g. only when `macd_hist > 0`).")
+        lines.append("")
+        # Short-side hypotheses (for shorting AMD).
+        shorts = [c for c in desc["conditionals"] if c.get("lower_lift_vs_base") is not None and c["n"] >= 50]
+        shorts.sort(key=lambda x: -abs(x["lower_lift_vs_base"]))
+        if shorts:
+            lines.append("Short-side (short AMD) hypotheses:")
+            lines.append("")
+            for c in shorts[:5]:
+                lines.append(f"- `{c['condition']}` → {_fmt_pct(c['lower_rate'])} P(lower) "
+                             f"({c['lower_lift_vs_base']:+.1%} lower lift, n={c['n']}) → short setup.")
+            lines.append("")
     else:
         lines.append("- No strong single-condition signals found (all |lift| small or low-n).")
     lines.append("")

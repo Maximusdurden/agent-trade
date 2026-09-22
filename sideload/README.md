@@ -69,6 +69,8 @@ sideload/
 ├── backtest_amd.py           # deterministic grid-search backtest (grid-only)
 ├── learn_amd.py              # daily learning agent (edge -> tuned rule)
 ├── publish_fact_of_day.py    # "Dexter's AMD Fact of the Day" blog post
+├── analyze_amd_direction.py  # what drives higher vs lower days (daily, analysis)
+├── analyze_amd_intraday.py   # intraday: open-to-9:45 momentum -> open-to-close
 └── README.md
 ```
 
@@ -157,6 +159,134 @@ python -m sideload.publish_fact_of_day            # publish today's post
 python -m sideload.publish_fact_of_day --dry      # print, don't publish
 ```
 
+### 6. `analyze_amd_direction.py`
+The **directional analysis** — the first step of the "scale the sideload method to
+other tickers" plan. Builds a per-trading-day dataset of AMD daily bars with
+**every indicator the core product computes** (RSI, SMA, MACD, Bollinger, ATR,
+volume, regime), then analyzes what separates days that finish **higher**
+(close > prior close) from days that finish **lower**.
+
+- **Higher/lower**: configurable via `--direction`:
+  - `close` (default): higher if close > prior close (amplitude = close-to-close %).
+  - `gap`: higher if OPEN > prior close (gap-up day; amplitude = open-vs-prior-close %).
+- **Descriptive stats** (primary): base rates, amplitude, per-feature bucket
+  means, and conditional probabilities `P(higher | condition)` vs base rate.
+- **Expectancy**: each conditional also reports `mean move %` (the defining-price
+  move) — the KPI that drives PnL, not just win rate.
+- **Short-side signals**: every conditional reports `P(lower)`, `lower lift`, and
+  `downside mean move %` (mean move on LOWER days only) — so we can identify
+  setups to **short AMD**, not just go long. A dedicated short-side section ranks
+  conditions by downside expectancy, and short-side hypotheses are added to the
+  candidate rules.
+- **Classifier cross-check** (optional): walk-forward logistic regression
+  (pure numpy, no ML dependency) — trains on past, tests on future, no lookahead.
+- **News**: DEFERRED (NewsAPI free tier caps ~100 results/request — not enough
+  for 3-4 yrs). Technical + volume analysis first; news can be backfilled later.
+
+### KPIs computed (beyond the core indicators)
+
+- `overnight_share` — fraction of the daily move that happens overnight (gap) vs
+  intraday: `|gap| / (|gap| + |intraday|)`. High = direction set by the gap.
+- `rel_strength_spy` — AMD daily move minus SPY daily move. **⚠️ INVALIDATED by
+  target leakage** (used day-t close to predict day-t close). The intraday
+  `rel_strength_945` (open-to-9:45 AMD vs SPY) is the valid, leakage-free version.
+- `streak` — consecutive higher/lower days (momentum vs mean-reversion).
+- `volume_vs_avg` — volume / 20-day average volume (cleaner than day-over-day).
+- `gap_pct`, `close_vs_open_pct`, `intraday_range_pct` — overnight/intraday split.
+
+> **⚠️ Leakage note:** all predictors in this module are lagged to t−1. The daily
+> analysis finds **no exploitable edge** (classifier at coin-flip). Use the
+> **intraday** module (`analyze_amd_intraday.py`) for the real signal.
+
+```bash
+python -m sideload.analyze_amd_direction --build-dataset   # build per-day dataset
+python -m sideload.analyze_amd_direction --analyze         # descriptive analysis
+python -m sideload.analyze_amd_direction --analyze --classifier  # + classifier
+python -m sideload.analyze_amd_direction --all             # everything
+python -m sideload.analyze_amd_direction --all --direction gap   # gap-up definition
+python -m sideload.analyze_amd_direction --all --symbol NVDA --days 1000  # other tickers
+```
+
+Outputs (in `sideload/`):
+- `data/amd_directional_dataset.csv` / `.json` — per-day dataset (`close` def).
+- `data/amd_gap_directional_dataset.csv` / `.json` — per-day dataset (`gap` def).
+- `data/amd_directional_buckets.json` / `amd_gap_directional_buckets.json` — per-bucket feature stats + conditionals.
+- `data/amd_directional_classifier.json` / `amd_gap_directional_classifier.json` — classifier results (if run).
+- `amd_directional_analysis.md` / `amd_gap_directional_analysis.md` — written findings + candidate rule hypotheses
+  for `backtest_amd.py` to test (analysis only, no live changes).
+
+> **Note:** the defining variable is excluded from predictors. For `--direction gap`,
+> `gap_pct` IS the label, so it's not shown as a conditional or fed to the
+> classifier (otherwise it'd be a tautological 100%/0% signal).
+
+### 7. `analyze_amd_intraday.py`
+The **intraday directional analysis** — the leakage-free continuation. Predicts
+the **9:45-to-close return** (STRICTLY post-entry, no overlap with the signal)
+from **open-to-9:45 ET momentum** (a genuinely knowable-at-entry signal), plus
+AMD-vs-SPY 9:45 relative strength and lagged daily state.
+
+**⚠️ Overlap-leakage correction (2026-09-21):** The original 69.7% finding used
+an *open-to-close* target, which included the 9:30–9:45 move that the feature
+also measured — a sub-component overlap. With the corrected **9:45-to-close**
+target, the edge **collapses to coin-flip** (classifier OOS 50.6% vs 49.7% base,
++1.0%). **There is no directional edge in morning momentum.**
+
+**Amplitude (volatility) hypothesis:** morning velocity does weakly predict range
+expansion — `corr(|open_to_945|, remaining_range) = 0.289`, and the `|vel| > 1.0%`
+bucket has median remaining range 3.33% vs 2.88% baseline. This is **below the
+0.35 threshold** for a volatility playbook and **above 0.20** (not abandoned), so
+it's a weak-but-present signal worth a closer look, not a tradeable edge yet.
+
+```bash
+python -m sideload.analyze_amd_intraday --all                # build + analyze + classifier
+python -m sideload.analyze_amd_intraday --all --symbol NVDA   # other tickers
+```
+
+Outputs:
+- `data/amd_intraday_directional_dataset.csv` / `.json`
+- `data/amd_intraday_directional_buckets.json` / `amd_intraday_directional_classifier.json`
+- `amd_intraday_directional_analysis.md`
+
+### 8. `backtest_orb.py`
+The **Opening Range Breakout (ORB) backtest** on the underlying equity — the
+final test of the 9:45 AM intraday window. Avoids options entirely (no IV crush,
+no double bid-ask spread). Per day: arm only on high morning velocity
+(`|open_to_945| > threshold`), place OCO stop-entries outside the 9:30-9:45
+range, hard stop (range or mid), exit at 2R target or 4:00 PM close.
+
+```bash
+python -m sideload.backtest_orb --all     # default config
+python -m sideload.backtest_orb --grid    # sweep filter/stop/exit params
+```
+
+**Result (2026-09-21):** Best config across 108 grid combos is **$3.81/trade
+expectancy, 56.3% win rate, 199 trades** (vel≥1.0%, range stop, 3R). **No config
+clears $5/trade expectancy.** The 9:45 AM intraday window is **too efficiently
+priced** — the ORB edge is marginal and below a meaningful threshold.
+
+Outputs: `data/amd_orb_default.json`, `data/amd_orb_grid.json`.
+
+### 9. `backtest_ema.py`
+The **walk-forward test of the dexter-trader EMA crossover strategy** on AMD.
+Dexter's backtester selects params by in-sample max PnL (selection bias); this
+re-tests the same strategy (fast/slow EMA crossover on HLC3, 200-period daily
+trend filter, trailing stop) with **walk-forward out-of-sample validation**.
+
+```bash
+python -m sideload.backtest_ema --all     # dexter's fixed AMD params (13/23/4%)
+python -m sideload.backtest_ema --grid    # small param sweep
+```
+
+**Result (2026-09-21):** Dexter's AMD params (13/23/4%) rank **5th of 18** with
+**$232/trade OOS expectancy, 50% win rate, 36 trades**. The top configs
+(fast 17/slow 27/4%) reach $304/trade but with only **50-57% win rate** — the
+expectancy is driven by a few large trend winners, not a consistent edge. The
+4% trailing stop dominates exits (32 of 36). **Promising but not robust** — the
+win rates are near coin-flip and the expectancy is concentrated in a handful of
+big winners. Worth a deeper look, not a confirmed edge.
+
+Outputs: `data/amd_ema_default.json`, `data/amd_ema_grid.json`.
+
 ## Normal-lane reservation
 
 AMD is reserved from the normal lane so the two lanes never fight over it:
@@ -205,5 +335,8 @@ Both entrypoints wire Jira error logging via `sideload/jira_logging.py`.
 6. **Learning**: `python -m sideload.learn_amd` writes a tuned strategy rule.
 7. **Fact of the Day**: `python -m sideload.publish_fact_of_day --dry` prints the
    Dexter-voiced post.
-8. **Target**: track realized AMD PnL daily; confirm the lane converges toward
+8. **Directional analysis**: `python -m sideload.analyze_amd_direction --all`
+   builds the dataset, runs descriptive + classifier analysis, and writes
+   `amd_directional_analysis.md` + supporting CSVs/JSON.
+9. **Target**: track realized AMD PnL daily; confirm the lane converges toward
    **$100/day net**.

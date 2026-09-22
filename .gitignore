@@ -62,6 +62,13 @@ sideload/backtest_coarse.json
 sideload/backtest_fine.json
 sideload/backtest_validated.json
 
+# Swing runtime state + analysis artifacts (regenerated, not source)
+sideload/data/
+
+# TSLA zone study runtime artifacts (regenerated, not source)
+sideload/zones_tsla.csv
+sideload/zones_tsla_backtest.json
+
 # Anchor study runtime outputs (regenerated each run, not source)
 sideload/anchor_study_*.csv
 sideload/anchor_study_summary.json
