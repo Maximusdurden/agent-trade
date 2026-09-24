@@ -1,0 +1,90 @@
+{
+  "task_a": {
+    "one_shot": {
+      "mode": "1shot",
+      "fill_mode": "open",
+      "trades": 62,
+      "win_rate": 0.7419354838709677,
+      "net_pnl": 187.52256308897452,
+      "profit_factor": 1.4590367654926852,
+      "max_dd_usd": 129.24341753947192,
+      "max_dd_pct": 1.2578587586779229,
+      "sharpe": 2.233412536336644,
+      "mar": 6.059412290722585,
+      "avg_hold_days": 5.419354838709677,
+      "avg_tranches": 1.0,
+      "recovery_trades": 4,
+      "exit_reasons": {
+        "time_stop": 13,
+        "cat_stop": 2,
+        "blended_tp": 4,
+        "sma_tp": 43
+      }
+    },
+    "ladder": {
+      "mode": "ladder",
+      "fill_mode": "open",
+      "trades": 62,
+      "win_rate": 0.8064516129032258,
+      "net_pnl": 448.1882237862199,
+      "profit_factor": 1.8527669957269521,
+      "max_dd_usd": 229.06484959541012,
+      "max_dd_pct": 2.1562924779092105,
+      "sharpe": 3.341739595818883,
+      "mar": 8.44815016090832,
+      "avg_hold_days": 5.419354838709677,
+      "avg_tranches": 1.4516129032258065,
+      "recovery_trades": 4,
+      "exit_reasons": {
+        "time_stop": 13,
+        "cat_stop": 2,
+        "blended_tp": 4,
+        "sma_tp": 43
+      }
+    }
+  },
+  "task_b": {
+    "next_open": {
+      "mode": "ladder",
+      "fill_mode": "open",
+      "trades": 62,
+      "win_rate": 0.8064516129032258,
+      "net_pnl": 448.1882237862199,
+      "profit_factor": 1.8527669957269521,
+      "max_dd_usd": 229.06484959541012,
+      "max_dd_pct": 2.1562924779092105,
+      "sharpe": 3.341739595818883,
+      "mar": 8.44815016090832,
+      "avg_hold_days": 5.419354838709677,
+      "avg_tranches": 1.4516129032258065,
+      "recovery_trades": 4,
+      "exit_reasons": {
+        "time_stop": 13,
+        "cat_stop": 2,
+        "blended_tp": 4,
+        "sma_tp": 43
+      }
+    },
+    "moc": {
+      "mode": "ladder",
+      "fill_mode": "moc",
+      "trades": 60,
+      "win_rate": 0.8,
+      "net_pnl": 417.61587893821263,
+      "profit_factor": 2.0494425457424486,
+      "max_dd_usd": 148.1816227857089,
+      "max_dd_pct": 1.4812267971614106,
+      "sharpe": 3.8245668253293497,
+      "mar": 11.841445853543789,
+      "avg_hold_days": 5.866666666666666,
+      "avg_tranches": 1.3833333333333333,
+      "recovery_trades": 16,
+      "exit_reasons": {
+        "time_stop": 13,
+        "cat_stop": 1,
+        "blended_tp": 2,
+        "sma_tp": 44
+      }
+    }
+  }
+}
