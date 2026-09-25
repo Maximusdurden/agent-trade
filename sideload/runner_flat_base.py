@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Flat Base Breakout production runner (Phase 2).
+"""Flat Base Breakout production runner (Phase 2/3).
 
-Scans the 29-symbol momentum universe for Stage 2 flat base breakouts, stages
+Scans the 27-symbol momentum universe for Stage 2 flat base breakouts, stages
 Market-on-Close (MOC) orders at 3:45 PM ET, and manages open positions (breakeven
 stop, 33%@3R / 33%@5R scaling, SMA20 trail, 45d time stop).
 
@@ -14,6 +14,7 @@ Usage:
     python -m sideload.runner_flat_base --scan             # stage MOC orders
     python -m sideload.runner_flat_base --monitor --dry-run  # manage exits, no orders
     python -m sideload.runner_flat_base --monitor
+    python -m sideload.runner_flat_base --auto             # auto-select by time (3:45 PM = scan)
 """
 
 from __future__ import annotations
@@ -46,9 +47,82 @@ logger = logging.getLogger("FlatBaseRunner")
 
 ET = ZoneInfo("America/New_York")
 
+# Slippage/fill log (validates the $0.05 backtest assumption).
+FILL_LOG = os.path.join(PROJECT_ROOT, "sideload", "data", "flatbase_fills.csv")
+GCS_FILLS_BLOB = "flatbase_fills.csv"
+
 
 def _now_et() -> datetime:
     return datetime.now(ET)
+
+
+def _is_equity_market_hours() -> tuple[bool, str]:
+    """Mon-Fri 09:30-16:00 ET gate (equity strategy)."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False, f"Weekend ({now.strftime('%A')})."
+    start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    end = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now < start:
+        return False, f"Pre-market (ET {now.strftime('%H:%M')})."
+    if now > end:
+        return False, f"Post-market (ET {now.strftime('%H:%M')})."
+    return True, "Market open."
+
+
+def _log_fill(cluster_id: str, symbol: str, side: str, shares: float,
+              fill_price: float, ref_price: float) -> None:
+    """Record a fill for slippage validation.
+
+    fill_price = actual broker fill (from the Alpaca order).
+    ref_price  = the theoretical reference price:
+                 - buy:  the t-1 breakout close (entry_ref, MOC proxy)
+                 - sell: the exit trigger price (target_3r / target_5r / sma20)
+    slippage_bps = (fill_price - ref_price) / ref_price * 10000
+    """
+    os.makedirs(os.path.dirname(FILL_LOG), exist_ok=True)
+    import csv
+    new = not os.path.exists(FILL_LOG)
+    with open(FILL_LOG, "a", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(["ts", "cluster_id", "symbol", "side", "shares",
+                        "fill_price", "ref_price", "slippage_bps"])
+        slip_bps = (fill_price - ref_price) / ref_price * 10000 if ref_price else 0.0
+        w.writerow([
+            _now_et().isoformat(), cluster_id, symbol, side,
+            round(shares, 4), round(fill_price, 4), round(ref_price, 4),
+            round(slip_bps, 2),
+        ])
+
+
+def _sync_fills_from_gcs() -> None:
+    """Download flatbase_fills.csv from GCS at container startup."""
+    bucket = fb_state._gcs_bucket()
+    if bucket is None:
+        return
+    os.makedirs(os.path.dirname(FILL_LOG), exist_ok=True)
+    try:
+        blob = bucket.blob(GCS_FILLS_BLOB)
+        if blob.exists():
+            blob.download_to_filename(FILL_LOG)
+            logger.info(f"[GCS] Downloaded {GCS_FILLS_BLOB} -> {FILL_LOG}")
+    except Exception as e:
+        logger.warning(f"[GCS] Could not download {GCS_FILLS_BLOB}: {e}")
+
+
+def _sync_fills_to_gcs() -> None:
+    """Upload flatbase_fills.csv to GCS at container shutdown."""
+    bucket = fb_state._gcs_bucket()
+    if bucket is None:
+        return
+    if not os.path.exists(FILL_LOG):
+        return
+    try:
+        bucket.blob(GCS_FILLS_BLOB).upload_from_filename(FILL_LOG)
+        logger.info(f"[GCS] Uploaded {FILL_LOG} -> {GCS_FILLS_BLOB}")
+    except Exception as e:
+        logger.warning(f"[GCS] Could not upload {GCS_FILLS_BLOB}: {e}")
 
 
 def _build_cfg() -> dict:
@@ -129,7 +203,12 @@ def _detect_breakout(client: AlpacaClient, symbol: str, cfg: dict, macro_sig) ->
 
 
 def _place_moc_order(client: AlpacaClient, symbol: str, qty: float, side: str = "buy") -> dict:
-    """Submit a market order (MOC proxy) with TIF=day."""
+    """Submit a market order (MOC proxy) with TIF=day and poll for the fill.
+
+    Returns the order dict including the actual ``filled_avg_price`` so the
+    entry fill is logged empirically (not the theoretical entry_ref).
+    """
+    import time
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
     side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
@@ -138,17 +217,33 @@ def _place_moc_order(client: AlpacaClient, symbol: str, qty: float, side: str = 
     )
     try:
         order = client.trading_client.submit_order(order_data=req)
-        logger.info(f"[MOC] Submitted {side} {qty} {symbol} (market, DAY)")
-        return {"symbol": symbol, "qty": qty, "side": side, "status": "submitted",
-                "order_id": getattr(order, "id", None)}
+        order_id = str(getattr(order, "id", ""))
+        logger.info(f"[MOC] Submitted {side} {qty} {symbol} (market, DAY) order_id={order_id}")
+        # Poll for the fill to capture the empirical execution price.
+        filled_price = None
+        status_str = str(getattr(order, "status", ""))
+        for _ in range(10):
+            try:
+                updated = client.trading_client.get_order_by_id(order_id=order_id)
+                status_str = str(getattr(updated, "status", ""))
+                if getattr(updated, "filled_avg_price", None) is not None:
+                    filled_price = float(updated.filled_avg_price)
+                if status_str.lower() in ("filled", "partially_filled"):
+                    break
+            except Exception as poll_err:
+                logger.warning(f"[MOC] Poll error for {symbol}: {poll_err}")
+            time.sleep(0.5)
+        return {"symbol": symbol, "qty": qty, "side": side, "status": status_str,
+                "order_id": order_id, "filled_avg_price": filled_price}
     except Exception as e:
         logger.error(f"[MOC] Failed to submit {symbol}: {e}")
         return {"symbol": symbol, "qty": qty, "side": side, "status": "failed",
-                "error": str(e)}
+                "order_id": None, "filled_avg_price": None, "error": str(e)}
 
 
 def _sell(client: AlpacaClient, symbol: str, qty: float) -> dict:
-    """Submit a market SELL order (TIF=day)."""
+    """Submit a market SELL order (TIF=day) and poll for the fill."""
+    import time
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
     req = MarketOrderRequest(
@@ -156,13 +251,27 @@ def _sell(client: AlpacaClient, symbol: str, qty: float) -> dict:
     )
     try:
         order = client.trading_client.submit_order(order_data=req)
-        logger.info(f"[SELL] Submitted {qty} {symbol} (market, DAY)")
-        return {"symbol": symbol, "qty": qty, "side": "sell", "status": "submitted",
-                "order_id": getattr(order, "id", None)}
+        order_id = str(getattr(order, "id", ""))
+        logger.info(f"[SELL] Submitted {qty} {symbol} (market, DAY) order_id={order_id}")
+        filled_price = None
+        status_str = str(getattr(order, "status", ""))
+        for _ in range(10):
+            try:
+                updated = client.trading_client.get_order_by_id(order_id=order_id)
+                status_str = str(getattr(updated, "status", ""))
+                if getattr(updated, "filled_avg_price", None) is not None:
+                    filled_price = float(updated.filled_avg_price)
+                if status_str.lower() in ("filled", "partially_filled"):
+                    break
+            except Exception as poll_err:
+                logger.warning(f"[SELL] Poll error for {symbol}: {poll_err}")
+            time.sleep(0.5)
+        return {"symbol": symbol, "qty": qty, "side": "sell", "status": status_str,
+                "order_id": order_id, "filled_avg_price": filled_price}
     except Exception as e:
         logger.error(f"[SELL] Failed to submit {symbol}: {e}")
         return {"symbol": symbol, "qty": qty, "side": "sell", "status": "failed",
-                "error": str(e)}
+                "order_id": None, "filled_avg_price": None, "error": str(e)}
 
 
 def run_scan(client: AlpacaClient, dry_run: bool = False) -> None:
@@ -200,11 +309,14 @@ def run_scan(client: AlpacaClient, dry_run: bool = False) -> None:
                         f"(stop {setup['stop']:.2f}, 3R {setup['target_3r']:.2f})")
             continue
         result = _place_moc_order(client, symbol, qty)
-        if result["status"] == "submitted":
-            fb_state.open_position(
+        if result["status"] in ("submitted", "filled", "partially_filled"):
+            pos = fb_state.open_position(
                 symbol, setup["entry_ref"], qty, setup["stop"],
                 setup["target_3r"], setup["target_5r"],
             )
+            # Log the entry fill (empirical fill price vs entry_ref proxy).
+            fill_px = result.get("filled_avg_price") or setup["entry_ref"]
+            _log_fill(pos["cluster_id"], symbol, "buy", qty, fill_px, setup["entry_ref"])
     logger.info(f"[Scan] Staged {len(staged)} candidates.")
 
 
@@ -245,7 +357,9 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
             if dry_run:
                 logger.info(f"[Dry-run] Scale 1: sell {qty:.2f} {symbol} @ +3R")
             else:
-                _sell(client, symbol, qty)
+                res = _sell(client, symbol, qty)
+                fill_px = res.get("filled_avg_price") or pos["target_3r"]
+                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_3r"])
                 fb_state.update_position(symbol, scale_1_filled=True,
                                          remaining_shares=remaining - qty)
             logger.info(f"[Monitor] {symbol}: Scale 1 filled @ +3R")
@@ -256,7 +370,9 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
             if dry_run:
                 logger.info(f"[Dry-run] Scale 2: sell {qty:.2f} {symbol} @ +5R")
             else:
-                _sell(client, symbol, qty)
+                res = _sell(client, symbol, qty)
+                fill_px = res.get("filled_avg_price") or pos["target_5r"]
+                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_5r"])
                 fb_state.update_position(symbol, scale_2_filled=True,
                                          remaining_shares=remaining - qty)
             logger.info(f"[Monitor] {symbol}: Scale 2 filled @ +5R")
@@ -267,8 +383,10 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
             if dry_run:
                 logger.info(f"[Dry-run] Trail exit: sell {qty:.2f} {symbol} (Close<SMA20)")
             else:
-                _sell(client, symbol, qty)
-                pnl = (close - entry) * qty
+                res = _sell(client, symbol, qty)
+                fill_px = res.get("filled_avg_price") or close
+                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, sma20)
+                pnl = (fill_px - entry) * qty
                 fb_state.close_position(symbol, pnl)
             logger.info(f"[Monitor] {symbol}: trail exit (Close<SMA20)")
 
@@ -278,8 +396,10 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
             if dry_run:
                 logger.info(f"[Dry-run] Time stop: sell {qty:.2f} {symbol} (held {pos['bars_held']}d)")
             else:
-                _sell(client, symbol, qty)
-                pnl = (close - entry) * qty
+                res = _sell(client, symbol, qty)
+                fill_px = res.get("filled_avg_price") or close
+                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, close)
+                pnl = (fill_px - entry) * qty
                 fb_state.close_position(symbol, pnl)
             logger.info(f"[Monitor] {symbol}: time stop (held {pos['bars_held']}d)")
 
@@ -296,6 +416,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Flat base breakout production runner")
     parser.add_argument("--scan", action="store_true", help="Scan for breakouts, stage MOC orders")
     parser.add_argument("--monitor", action="store_true", help="Manage open positions (exits/scaling)")
+    parser.add_argument("--auto", action="store_true",
+                        help="Auto-select mode by time-of-day (3:45 PM ET = scan, else monitor)")
+    parser.add_argument("--force", action="store_true", help="Bypass market-hours gate")
     parser.add_argument("--dry-run", action="store_true", help="Compute, no orders/writes")
     parser.add_argument("--no-discord", action="store_true")
     args = parser.parse_args()
@@ -304,9 +427,27 @@ def main() -> None:
     setup_jira_logging(app_name="agent-trade-sideload-flatbase-runner")
     client = AlpacaClient()
 
+    # Auto mode: pick scan vs monitor by time-of-day. The MOC scan fires at
+    # 3:45 PM ET (before the 4:00 PM close); everything else is a monitor run.
+    if args.auto:
+        now = _now_et()
+        args.scan = (now.hour == fb_cfg.MOC_HOUR and now.minute >= fb_cfg.MOC_MINUTE - 5
+                     and now.minute <= fb_cfg.MOC_MINUTE + 5)
+        args.monitor = not args.scan
+
+    # The market-hours gate applies ONLY to intraday monitoring. The MOC scan
+    # runs at 3:45 PM ET (during market hours), so it must bypass the gate —
+    # otherwise the scan is skipped as "Post-market" if it runs a few minutes late.
+    if not args.force and not args.scan:
+        is_open, reason = _is_equity_market_hours()
+        if not is_open:
+            logger.info(f"Skipping flat base runner: {reason}")
+            return
+
     try:
-        # Pull state from GCS at startup (ephemeral container).
+        # Pull state + fills from GCS at startup (ephemeral container).
         fb_state.sync_down_from_gcs()
+        _sync_fills_from_gcs()
 
         if args.scan:
             run_scan(client, dry_run=args.dry_run)
@@ -315,8 +456,9 @@ def main() -> None:
         else:
             parser.print_help()
 
-        # Push state to GCS at shutdown.
+        # Push state + fills to GCS at shutdown.
         fb_state.sync_up_to_gcs()
+        _sync_fills_to_gcs()
 
         if not args.no_discord and not args.dry_run:
             try:
