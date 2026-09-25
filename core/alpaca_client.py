@@ -1566,8 +1566,16 @@ class AlpacaClient:
             )
             news_response = self.news_client.get_news(request_params)
             
+            # The NewsSet response wraps articles under .data["news"] (a dict
+            # with a "news" key), not a top-level .news attribute.
+            news_items = []
+            if hasattr(news_response, "data") and isinstance(news_response.data, dict):
+                news_items = news_response.data.get("news", [])
+            elif hasattr(news_response, "news"):
+                news_items = getattr(news_response, "news", [])
+            
             news_list = []
-            for item in getattr(news_response, "news", []):
+            for item in news_items:
                 news_list.append({
                     "headline": getattr(item, "headline", ""),
                     "source": getattr(item, "source", ""),

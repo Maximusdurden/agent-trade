@@ -76,6 +76,12 @@ sideload/anchor_intraday_*.csv
 sideload/anchor_options_backtest.json
 sideload/anchor_stock_backtest.json
 
+# Options latch-on strategy runtime outputs (regenerated each run, not source)
+sideload/backtest_options_latch.json
+sideload/backtest_options_latch_stop_sweep.json
+sideload/options_circuit_breaker_state.json
+sideload/options_*_2026-*.json
+
 # Generated env-vars YAML for Cloud Run (contains secrets from .env)
 deploy/env_vars.yaml
 
