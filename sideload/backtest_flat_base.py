@@ -53,6 +53,9 @@ END_DATE = "2026-09-24"
 # Non-tech / commodity pool + tech control.
 NONTECH_SYMBOLS = ["DIA", "CAT", "XOM", "JPM", "UNH", "FCX", "GLD", "USO"]
 TECH_SYMBOLS = ["AMD", "NVDA"]
+# High-beta tech/growth momentum universe (Phase 1c).
+GROWTH_SYMBOLS = ["NVDA", "AMD", "AVGO", "DELL", "HPE", "MU", "META", "TSLA",
+                  "PLTR", "ARM", "SMH", "QQQ"]
 
 # --- Default config (directive section 2) ---
 DEFAULT_CFG = {
@@ -74,6 +77,26 @@ DEFAULT_CFG = {
     "trail_sma": 20,              # trail remainder with SMA(20)
     "max_hold_days": 45,          # time stop (trading days)
     "risk_pct": 0.01,             # 1% equity risked per trade
+    "equity": 10000.0,
+}
+
+# --- Growth momentum config (Phase 1c: restored O'Neil/Minervini spec) ---
+GROWTH_CFG = {
+    "uptrend_gain_pct": 30.0,     # prior uptrend: +30% within last 60 bars
+    "uptrend_lookback": 60,
+    "base_min_bars": 15,          # base duration 15-40 bars
+    "base_max_bars": 40,
+    "base_tightness": 0.20,       # (HH-LL)/LL <= 20%
+    "base_sma": 50,               # base lows above SMA(50)
+    "breakout_rvol": 1.5,         # Volume >= 1.5 * SMA(Vol,20)
+    "macro_sma": 20,              # QQQ Close > QQQ SMA(20)
+    "slippage": 0.05,
+    "atr_stop_mult": 1.5,         # stop = breakout - 1.5*ATR14
+    "tp1_r": 3.0,                 # 50% scale-out at +3R
+    "tp2_r": 6.0,                 # remaining 50% at +6R or SMA20 trail
+    "trail_sma": 20,
+    "max_hold_days": 45,
+    "risk_usd": 150.0,            # fixed risk $150 per trade (1R = $150)
     "equity": 10000.0,
 }
 
@@ -196,7 +219,8 @@ def simulate(df: pd.DataFrame, cfg: dict, spy_sig: pd.DataFrame | None = None) -
                 "sma50", "atr14", "trail_sma"]
     sig = df[sig_cols].shift(1)
 
-    risk_pct = float(cfg["risk_pct"])
+    risk_pct = float(cfg.get("risk_pct", 0.0))
+    risk_usd = float(cfg.get("risk_usd", 0.0))
     equity = float(cfg["equity"])
     tp1_r = float(cfg["tp1_r"])
     tp2_r = float(cfg["tp2_r"])
@@ -250,7 +274,11 @@ def simulate(df: pd.DataFrame, cfg: dict, spy_sig: pd.DataFrame | None = None) -
             continue
         risk_per_share = entry - stop
         r = risk_per_share
-        qty = (risk_pct * equity) / risk_per_share
+        # Sizing: fixed risk USD (risk_usd) OR % of equity (risk_pct).
+        if risk_usd > 0:
+            qty = risk_usd / risk_per_share
+        else:
+            qty = (risk_pct * equity) / risk_per_share
         if qty <= 0:
             i += 1
             continue
@@ -409,16 +437,22 @@ def aggregate(results: list[dict]) -> dict:
     wins = sum(int(r["trades"] * r["win_rate"]) for r in results)
     win_rate = wins / total_trades if total_trades else 0.0
     max_dd = max((r["max_drawdown_pct"] for r in results), default=0.0)
+    # Annualized PnL over the window (2021-01-01 to 2026-09-24 = ~5.73 years).
+    years = 5.73
+    annualized = total_pnl / years
     return {
         "trades": total_trades, "win_rate": win_rate, "total_pnl_usd": total_pnl,
-        "avg_r_mult": avg_r, "profit_factor": pf, "max_drawdown_pct": max_dd,
+        "annualized_pnl_usd": annualized, "avg_r_mult": avg_r,
+        "profit_factor": pf, "max_drawdown_pct": max_dd,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Non-tech flat base breakout backtest")
+    parser = argparse.ArgumentParser(description="Flat base breakout backtest")
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols (default: non-tech pool)")
     parser.add_argument("--tech", action="store_true", help="Run tech control group (AMD, NVDA)")
+    parser.add_argument("--growth", action="store_true",
+                        help="Run high-beta tech/growth universe with growth momentum rules")
     parser.add_argument("--no-discord", action="store_true")
     args = parser.parse_args()
 
@@ -427,31 +461,45 @@ def main() -> None:
     client = AlpacaClient()
 
     try:
-        # Load SPY for macro filter.
-        spy = load_daily(client, "SPY")
-        spy = spy[(spy.index >= START_DATE) & (spy.index <= END_DATE)]
-        spy_sig = None
-        if not spy.empty:
-            spy = add_indicators(spy, DEFAULT_CFG)
-            spy_sig = spy[["close", "sma20"]].shift(1)
-            logger.info(f"SPY macro filter: {len(spy)} bars")
-
-        if args.symbols:
-            symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        elif args.tech:
-            symbols = TECH_SYMBOLS
+        # Choose config + macro symbol.
+        if args.growth:
+            cfg = dict(GROWTH_CFG)
+            macro_symbol = "QQQ"
+            symbols = GROWTH_SYMBOLS
         else:
-            symbols = NONTECH_SYMBOLS
+            cfg = dict(DEFAULT_CFG)
+            macro_symbol = "SPY"
+            if args.symbols:
+                symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            elif args.tech:
+                symbols = TECH_SYMBOLS
+            else:
+                symbols = NONTECH_SYMBOLS
 
-        results = run_pool(client, symbols, dict(DEFAULT_CFG), spy_sig)
+        # Load macro index for filter.
+        macro = load_daily(client, macro_symbol)
+        macro = macro[(macro.index >= START_DATE) & (macro.index <= END_DATE)]
+        macro_sig = None
+        if not macro.empty:
+            macro = add_indicators(macro, cfg)
+            macro_sig = macro[["close", "sma20"]].shift(1)
+            logger.info(f"{macro_symbol} macro filter: {len(macro)} bars")
+
+        results = run_pool(client, symbols, cfg, macro_sig)
         agg = aggregate(results)
         print("\n=== POOL AGGREGATE ===")
         print(f"  symbols: {len(results)} | trades: {agg['trades']} | win: {agg['win_rate']:.1%} "
-              f"| PnL: ${agg['total_pnl_usd']:.2f} | avgR: {agg['avg_r_mult']:.2f} "
-              f"| PF: {agg['profit_factor']:.2f} | maxDD: {agg['max_drawdown_pct']:.1f}%")
+              f"| PnL: ${agg['total_pnl_usd']:.2f} | annualized: ${agg['annualized_pnl_usd']:.2f}/yr "
+              f"| avgR: {agg['avg_r_mult']:.2f} | PF: {agg['profit_factor']:.2f} "
+              f"| maxDD: {agg['max_drawdown_pct']:.1f}%")
 
-        # Go/No-Go gate (non-tech only).
-        if not args.tech and not args.symbols:
+        # Go/No-Go gate.
+        if args.growth:
+            passed = (agg["annualized_pnl_usd"] >= 2500.0 and agg["profit_factor"] >= 2.0)
+            print("\n=== PRODUCTION GATE (growth) ===")
+            print("Go criteria: annualized PnL >= $2,500/yr AND PF >= 2.0")
+            print(f"VERDICT: {'GO' if passed else 'NO-GO'}")
+        elif not args.tech and not args.symbols:
             passed = (agg["trades"] >= 30 and agg["profit_factor"] >= 1.50
                       and agg["avg_r_mult"] > 0.25)
             print("\n=== GO / NO-GO GATE (non-tech) ===")
