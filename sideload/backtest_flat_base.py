@@ -56,6 +56,11 @@ TECH_SYMBOLS = ["AMD", "NVDA"]
 # High-beta tech/growth momentum universe (Phase 1c).
 GROWTH_SYMBOLS = ["NVDA", "AMD", "AVGO", "DELL", "HPE", "MU", "META", "TSLA",
                   "PLTR", "ARM", "SMH", "QQQ"]
+# Expanded momentum leaders universe (Phase 1d, 30 names, PLTR dropped).
+EXPANDED_SYMBOLS = ["NVDA", "AMD", "AVGO", "DELL", "HPE", "MU", "META", "TSLA",
+                    "SMH", "QQQ", "AMZN", "GOOGL", "MSFT", "NFLX", "APP", "ANET",
+                    "CRWD", "NOW", "PANW", "COIN", "MSTR", "HOOD", "SHOP", "UBER",
+                    "VRT", "CAT", "GLD", "GE"]
 
 # --- Default config (directive section 2) ---
 DEFAULT_CFG = {
@@ -97,6 +102,29 @@ GROWTH_CFG = {
     "trail_sma": 20,
     "max_hold_days": 45,
     "risk_usd": 150.0,            # fixed risk $150 per trade (1R = $150)
+    "equity": 10000.0,
+}
+
+# --- Phase 1d config: relaxed base + 3-tranche exit scaling ---
+EXPANDED_CFG = {
+    "uptrend_gain_pct": 30.0,     # prior uptrend: +30% within last 60 bars
+    "uptrend_lookback": 60,
+    "base_min_bars": 12,          # relaxed: base duration 12-35 bars
+    "base_max_bars": 35,
+    "base_tightness": 0.20,       # (HH-LL)/LL <= 20%
+    "base_sma": 50,               # base lows above SMA(50)
+    "breakout_rvol": 1.5,         # Volume >= 1.5 * SMA(Vol,20)
+    "macro_sma": 20,              # QQQ Close > QQQ SMA(20)
+    "slippage": 0.05,
+    "atr_stop_mult": 1.5,         # stop = breakout - 1.5*ATR14
+    # 3-tranche exit scaling: 33% @ +3R, 33% @ +5R, 34% trailed SMA20 (no 6R cap).
+    "exit_mode": "tranche3",
+    "tp1_r": 3.0,                 # 33% scale-out at +3R
+    "tp2_r": 5.0,                 # 33% scale-out at +5R
+    "be_r": 2.0,                  # move stop to breakeven once +2R hit
+    "trail_sma": 20,              # trail remaining 34% with SMA(20)
+    "max_hold_days": 45,
+    "risk_usd": 150.0,            # fixed risk per trade (overridden per run)
     "equity": 10000.0,
 }
 
@@ -224,6 +252,7 @@ def simulate(df: pd.DataFrame, cfg: dict, spy_sig: pd.DataFrame | None = None) -
     equity = float(cfg["equity"])
     tp1_r = float(cfg["tp1_r"])
     tp2_r = float(cfg["tp2_r"])
+    be_r = float(cfg.get("be_r", 0.0))
     max_hold = int(cfg["max_hold_days"])
     slippage = float(cfg["slippage"])
     atr_mult = float(cfg["atr_stop_mult"])
@@ -284,38 +313,62 @@ def simulate(df: pd.DataFrame, cfg: dict, spy_sig: pd.DataFrame | None = None) -
             continue
 
         # Walk forward to find exit.
+        exit_mode = cfg.get("exit_mode", "half")
         exit_reason = None
         exit_px = None
         exit_ts = None
         half_taken = False
+        tp1_taken = False
+        tp2_taken = False
+        be_armed = False
+        active_stop = stop
         for j in range(i + 1, n):
             bar = df.iloc[j]
             low = float(bar["low"])
             high = float(bar["high"])
             close = float(bar["close"])
             ts = df.index[j]
-            # Stop hit (intraday low).
-            if low <= stop:
+            # Stop hit (intraday low) — uses active_stop (may be breakeven).
+            if low <= active_stop:
                 exit_reason = "stop"
-                exit_px = stop
+                exit_px = active_stop
                 exit_ts = ts
                 break
-            # 2.5R scale-out: take 50% off.
-            if not half_taken and high >= entry + tp1_r * r:
-                half_taken = True
-            # Remainder: exit at +5R OR trail with SMA20.
-            if half_taken:
-                if high >= entry + tp2_r * r:
-                    exit_reason = "tp2"
-                    exit_px = entry + tp2_r * r
-                    exit_ts = ts
-                    break
-                trail = float(sig["trail_sma"].iloc[j]) if j < len(sig) else close
-                if low <= trail:
-                    exit_reason = "trail_sma"
-                    exit_px = trail
-                    exit_ts = ts
-                    break
+            if exit_mode == "tranche3":
+                # Move stop to breakeven once +2R hit.
+                if not be_armed and high >= entry + be_r * r:
+                    be_armed = True
+                    active_stop = entry
+                # 33% @ +3R.
+                if not tp1_taken and high >= entry + tp1_r * r:
+                    tp1_taken = True
+                # 33% @ +5R.
+                if tp1_taken and not tp2_taken and high >= entry + tp2_r * r:
+                    tp2_taken = True
+                # Remaining 34% trailed with SMA20 (no 6R cap).
+                if tp1_taken:
+                    trail = float(sig["trail_sma"].iloc[j]) if j < len(sig) else close
+                    if low <= trail:
+                        exit_reason = "trail_sma"
+                        exit_px = trail
+                        exit_ts = ts
+                        break
+            else:
+                # half mode: 50% @ +tp1, remainder @ +tp2 or SMA20 trail.
+                if not half_taken and high >= entry + tp1_r * r:
+                    half_taken = True
+                if half_taken:
+                    if high >= entry + tp2_r * r:
+                        exit_reason = "tp2"
+                        exit_px = entry + tp2_r * r
+                        exit_ts = ts
+                        break
+                    trail = float(sig["trail_sma"].iloc[j]) if j < len(sig) else close
+                    if low <= trail:
+                        exit_reason = "trail_sma"
+                        exit_px = trail
+                        exit_ts = ts
+                        break
             # Time stop (trading days).
             if (ts - entry_ts).days > max_hold:
                 exit_reason = "time_stop"
@@ -328,13 +381,22 @@ def simulate(df: pd.DataFrame, cfg: dict, spy_sig: pd.DataFrame | None = None) -
             exit_px = float(df["close"].iloc[n - 1])
             exit_ts = df.index[n - 1]
 
-        # PnL: half at tp1 (if taken) + remainder at exit.
+        # PnL by exit mode.
         pnl = 0.0
-        if half_taken:
-            pnl += 0.5 * qty * (entry + tp1_r * r - entry)
-            pnl += 0.5 * qty * (exit_px - entry)
+        if exit_mode == "tranche3":
+            # 33% @ +3R, 33% @ +5R, 34% at exit.
+            if tp1_taken:
+                pnl += 0.33 * qty * (entry + tp1_r * r - entry)
+            if tp2_taken:
+                pnl += 0.33 * qty * (entry + tp2_r * r - entry)
+            remaining = 1.0 - (0.33 if tp1_taken else 0.0) - (0.33 if tp2_taken else 0.0)
+            pnl += remaining * qty * (exit_px - entry)
         else:
-            pnl = qty * (exit_px - entry)
+            if half_taken:
+                pnl += 0.5 * qty * (entry + tp1_r * r - entry)
+                pnl += 0.5 * qty * (exit_px - entry)
+            else:
+                pnl = qty * (exit_px - entry)
         ret_pct = (exit_px - entry) / entry * 100.0
         r_mult = (exit_px - entry) / r if r > 0 else 0.0
         trades.append({
@@ -453,6 +515,12 @@ def main() -> None:
     parser.add_argument("--tech", action="store_true", help="Run tech control group (AMD, NVDA)")
     parser.add_argument("--growth", action="store_true",
                         help="Run high-beta tech/growth universe with growth momentum rules")
+    parser.add_argument("--expanded", action="store_true",
+                        help="Run expanded 30-symbol universe with Phase 1d rules")
+    parser.add_argument("--risk", type=float, default=None,
+                        help="Override fixed risk USD per trade (sizing ablation)")
+    parser.add_argument("--ablate", action="store_true",
+                        help="Run sizing ablation ($150/$350/$500) on expanded universe")
     parser.add_argument("--no-discord", action="store_true")
     args = parser.parse_args()
 
@@ -461,8 +529,57 @@ def main() -> None:
     client = AlpacaClient()
 
     try:
+        # Sizing ablation mode.
+        if args.ablate:
+            cfg = dict(EXPANDED_CFG)
+            macro_symbol = "QQQ"
+            symbols = EXPANDED_SYMBOLS
+            macro = load_daily(client, macro_symbol)
+            macro = macro[(macro.index >= START_DATE) & (macro.index <= END_DATE)]
+            macro_sig = None
+            if not macro.empty:
+                macro = add_indicators(macro, cfg)
+                macro_sig = macro[["close", "sma20"]].shift(1)
+            print("\n=== SIZING ABLATION (expanded universe) ===")
+            print(f"{'Run':<12} {'Trades':>7} {'Win%':>6} {'PnL$':>10} {'Ann$/yr':>9} "
+                  f"{'PF':>6} {'MaxDD%':>7} {'AvgR':>6}")
+            print("-" * 72)
+            ablation = {}
+            for risk in [150.0, 350.0, 500.0]:
+                c = dict(cfg)
+                c["risk_usd"] = risk
+                results = run_pool(client, symbols, c, macro_sig)
+                agg = aggregate(results)
+                ablation[f"Run {risk}"] = {"risk": risk, **agg}
+                print(f"Run {risk:<8} {agg['trades']:>7} {agg['win_rate']*100:>5.1f}% "
+                      f"{agg['total_pnl_usd']:>10.2f} {agg['annualized_pnl_usd']:>9.2f} "
+                      f"{agg['profit_factor']:>6.2f} {agg['max_drawdown_pct']:>7.1f}% "
+                      f"{agg['avg_r_mult']:>6.2f}")
+            # Decision gate.
+            print("\n=== DECISION GATE ===")
+            print("Go criteria: annualized >= $2,500/yr AND PF >= 2.50 AND MaxDD <= 15%")
+            best = None
+            for risk, agg in ablation.items():
+                passed = (agg["annualized_pnl_usd"] >= 2500.0 and agg["profit_factor"] >= 2.50
+                          and agg["max_drawdown_pct"] <= 15.0)
+                print(f"  {risk}: ann=${agg['annualized_pnl_usd']:.2f}/yr PF={agg['profit_factor']:.2f} "
+                      f"maxDD={agg['max_drawdown_pct']:.1f}% -> {'GO' if passed else 'NO-GO'}")
+                if passed and (best is None or agg["annualized_pnl_usd"] > best["annualized_pnl_usd"]):
+                    best = agg
+            print(f"VERDICT: {'GO' if best else 'NO-GO'}")
+            path = os.path.join(DATA_DIR, "flat_base_ablation.json")
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(ablation, fh, indent=2, default=str)
+            logger.info(f"Wrote {path}")
+            return
+
         # Choose config + macro symbol.
-        if args.growth:
+        if args.expanded:
+            cfg = dict(EXPANDED_CFG)
+            macro_symbol = "QQQ"
+            symbols = EXPANDED_SYMBOLS
+        elif args.growth:
             cfg = dict(GROWTH_CFG)
             macro_symbol = "QQQ"
             symbols = GROWTH_SYMBOLS
@@ -475,6 +592,9 @@ def main() -> None:
                 symbols = TECH_SYMBOLS
             else:
                 symbols = NONTECH_SYMBOLS
+
+        if args.risk is not None:
+            cfg["risk_usd"] = args.risk
 
         # Load macro index for filter.
         macro = load_daily(client, macro_symbol)
@@ -494,7 +614,13 @@ def main() -> None:
               f"| maxDD: {agg['max_drawdown_pct']:.1f}%")
 
         # Go/No-Go gate.
-        if args.growth:
+        if args.expanded:
+            passed = (agg["annualized_pnl_usd"] >= 2500.0 and agg["profit_factor"] >= 2.50
+                      and agg["max_drawdown_pct"] <= 15.0)
+            print("\n=== PRODUCTION GATE (expanded) ===")
+            print("Go criteria: annualized >= $2,500/yr AND PF >= 2.50 AND MaxDD <= 15%")
+            print(f"VERDICT: {'GO' if passed else 'NO-GO'}")
+        elif args.growth:
             passed = (agg["annualized_pnl_usd"] >= 2500.0 and agg["profit_factor"] >= 2.0)
             print("\n=== PRODUCTION GATE (growth) ===")
             print("Go criteria: annualized PnL >= $2,500/yr AND PF >= 2.0")
