@@ -164,19 +164,29 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
     if window.empty:
         return None
 
-    for ts, bar in window.iterrows():
-        high = float(bar["high"])
-        low = float(bar["low"])
-        close = float(bar["close"])
-        vwap = _vwap_at(vwap_series, ts)
+    # Bar freshness: evaluate ONLY the most recently completed 1-minute bar.
+    # Re-iterating from 09:30 every poll can re-trigger stale setups that
+    # occurred minutes earlier (e.g. after a failed entry or a mid-session
+    # reconnect). The entry must fire strictly on the bar that just closed.
+    latest_ts = window.index[-1]
+    latest_bar = window.iloc[-1]
 
-        # Bearish sweep: High > PMH, Close < PMH, Close < VWAP.
-        if high > pmh and close < pmh and vwap is not None and close < vwap:
-            return {"direction": "BEARISH", "entry_ts": ts, "entry_price": close}
+    # Only trigger if the latest bar completed within the last 120 seconds.
+    if (now_et - latest_ts).total_seconds() > 120:
+        return None
 
-        # Bullish sweep: Low < PML, Close > PML, Close > VWAP.
-        if low < pml and close > pml and vwap is not None and close > vwap:
-            return {"direction": "BULLISH", "entry_ts": ts, "entry_price": close}
+    high = float(latest_bar["high"])
+    low = float(latest_bar["low"])
+    close = float(latest_bar["close"])
+    vwap = _vwap_at(vwap_series, latest_ts)
+
+    # Bearish sweep: High > PMH, Close < PMH, Close < VWAP.
+    if high > pmh and close < pmh and vwap is not None and close < vwap:
+        return {"direction": "BEARISH", "entry_ts": latest_ts, "entry_price": close}
+
+    # Bullish sweep: Low < PML, Close > PML, Close > VWAP.
+    if low < pml and close > pml and vwap is not None and close > vwap:
+        return {"direction": "BULLISH", "entry_ts": latest_ts, "entry_price": close}
 
     return None
 
