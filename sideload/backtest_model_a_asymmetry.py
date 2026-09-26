@@ -69,8 +69,16 @@ PM_VOL_MIN = 0.0035           # (PMH - PML) / PML >= 0.35%
 
 # Corrected premium model.
 DELTA = 0.45
-ENTRY_PREMIUM = 1.50
 THETA_DECAY_PER_15MIN = 0.015
+
+# Dynamic contract pricing per ticker (Phase 1f).
+TICKER_CONFIG = {
+    "QQQ": {"entry_premium": 1.50, "delta": 0.45},
+    "NVDA": {"entry_premium": 2.50, "delta": 0.45},
+    "TSLA": {"entry_premium": 3.50, "delta": 0.45},
+}
+# Default entry premium (fallback).
+ENTRY_PREMIUM = 1.50
 
 INTRADAY_INTERVAL = "1min"
 
@@ -132,15 +140,16 @@ def _vwap_at(vwap_series: pd.Series, ts) -> float | None:
 
 
 def _premium_at(entry_price: float, current_price: float, direction: str,
-                minutes: float) -> float:
+                minutes: float, entry_premium: float = ENTRY_PREMIUM,
+                delta: float = DELTA) -> float:
     """Compute the option premium at a given underlying price (corrected model)."""
     if direction == "BEARISH":
         dollar_move = entry_price - current_price
     else:
         dollar_move = current_price - entry_price
-    option_delta_gain = dollar_move * DELTA
-    decay_loss = (minutes / 15.0) * THETA_DECAY_PER_15MIN * ENTRY_PREMIUM
-    return max(0.01, ENTRY_PREMIUM + option_delta_gain - decay_loss)
+    option_delta_gain = dollar_move * delta
+    decay_loss = (minutes / 15.0) * THETA_DECAY_PER_15MIN * entry_premium
+    return max(0.01, entry_premium + option_delta_gain - decay_loss)
 
 
 def _model_a_setup(day_bars: pd.DataFrame, day: pd.Timestamp,
@@ -173,7 +182,9 @@ def _model_a_setup(day_bars: pd.DataFrame, day: pd.Timestamp,
 
 
 def _simulate_single(day_bars: pd.DataFrame, entry_ts, direction: str,
-                     entry_price: float, tp_pct: float) -> dict:
+                     entry_price: float, tp_pct: float,
+                     entry_premium: float = ENTRY_PREMIUM,
+                     delta: float = DELTA) -> dict:
     """Run 1: single target with intrabar stop precision.
 
     - Take-profit at +tp_pct.
@@ -201,16 +212,18 @@ def _simulate_single(day_bars: pd.DataFrame, entry_ts, direction: str,
             stop_px = low
         else:
             stop_px = high
-        stop_premium = _premium_at(entry_price, stop_px, direction, minutes)
-        if stop_premium <= ENTRY_PREMIUM * (1.0 - HARD_STOP_CAP):
+        stop_premium = _premium_at(entry_price, stop_px, direction, minutes,
+                                   entry_premium, delta)
+        if stop_premium <= entry_premium * (1.0 - HARD_STOP_CAP):
             # Cap the realized loss at exactly -22% (hard cap), regardless of
             # how far the intrabar extreme actually moved.
-            exit_premium, exit_reason = ENTRY_PREMIUM * (1.0 - HARD_STOP_CAP), "stop_22pct"
+            exit_premium, exit_reason = entry_premium * (1.0 - HARD_STOP_CAP), "stop_22pct"
             break
 
         # Take-profit on close.
-        close_premium = _premium_at(entry_price, close, direction, minutes)
-        if close_premium >= ENTRY_PREMIUM * (1.0 + tp_pct):
+        close_premium = _premium_at(entry_price, close, direction, minutes,
+                                    entry_premium, delta)
+        if close_premium >= entry_premium * (1.0 + tp_pct):
             exit_premium, exit_reason = close_premium, "take_profit"
             break
 
@@ -219,13 +232,15 @@ def _simulate_single(day_bars: pd.DataFrame, entry_ts, direction: str,
     if exit_premium is None:
         return {"traded": False, "reason": "no_data"}
 
-    pnl_pct = (exit_premium - ENTRY_PREMIUM) / ENTRY_PREMIUM
+    pnl_pct = (exit_premium - entry_premium) / entry_premium
     return {"traded": True, "direction": direction, "exit_reason": exit_reason,
             "pnl_pct": round(pnl_pct * 100.0, 2), "hold_minutes": round(hold_minutes, 1)}
 
 
 def _simulate_two_tranche(day_bars: pd.DataFrame, entry_ts, direction: str,
-                          entry_price: float) -> dict:
+                          entry_price: float,
+                          entry_premium: float = ENTRY_PREMIUM,
+                          delta: float = DELTA) -> dict:
     """Run 2: two-tranche scaled target with breakeven ratchet.
 
     - Tranche 1 (50%): exit at +25%.
@@ -253,24 +268,26 @@ def _simulate_two_tranche(day_bars: pd.DataFrame, entry_ts, direction: str,
 
         # Intrabar stop check.
         stop_px = low if direction == "BULLISH" else high
-        stop_premium = _premium_at(entry_price, stop_px, direction, minutes)
-        if stop_premium <= ENTRY_PREMIUM * (1.0 - tranche2_stop):
+        stop_premium = _premium_at(entry_price, stop_px, direction, minutes,
+                                   entry_premium, delta)
+        if stop_premium <= entry_premium * (1.0 - tranche2_stop):
             # Cap the realized loss at the stop level (hard cap).
-            exit_premium, exit_reason = ENTRY_PREMIUM * (1.0 - tranche2_stop), "stop_22pct"
+            exit_premium, exit_reason = entry_premium * (1.0 - tranche2_stop), "stop_22pct"
             break
 
-        close_premium = _premium_at(entry_price, close, direction, minutes)
+        close_premium = _premium_at(entry_price, close, direction, minutes,
+                                    entry_premium, delta)
 
         # Tranche 1: fill at +25%.
-        if not tranche1_filled and close_premium >= ENTRY_PREMIUM * (1.0 + TRANCH1_PCT):
+        if not tranche1_filled and close_premium >= entry_premium * (1.0 + TRANCH1_PCT):
             tranche1_filled = True
             tranche2_stop = 0.0  # breakeven ratchet
             # Continue holding Tranche 2.
 
         # Tranche 2: fill at +50%.
-        if tranche1_filled and close_premium >= ENTRY_PREMIUM * (1.0 + TRANCH2_PCT):
+        if tranche1_filled and close_premium >= entry_premium * (1.0 + TRANCH2_PCT):
             # Both tranches filled: weighted average.
-            avg = (TRANCH1_FRACTION * ENTRY_PREMIUM * (1.0 + TRANCH1_PCT)
+            avg = (TRANCH1_FRACTION * entry_premium * (1.0 + TRANCH1_PCT)
                    + (1 - TRANCH1_FRACTION) * close_premium)
             exit_premium, exit_reason = avg, "two_tranche_full"
             break
@@ -283,11 +300,11 @@ def _simulate_two_tranche(day_bars: pd.DataFrame, entry_ts, direction: str,
     # If only Tranche 1 filled, weight it; else full close.
     if tranche1_filled and exit_reason != "two_tranche_full":
         # Tranche 1 locked at +25%, Tranche 2 at current premium.
-        t1 = ENTRY_PREMIUM * (1.0 + TRANCH1_PCT)
+        t1 = entry_premium * (1.0 + TRANCH1_PCT)
         t2 = exit_premium
         exit_premium = TRANCH1_FRACTION * t1 + (1 - TRANCH1_FRACTION) * t2
 
-    pnl_pct = (exit_premium - ENTRY_PREMIUM) / ENTRY_PREMIUM
+    pnl_pct = (exit_premium - entry_premium) / entry_premium
     return {"traded": True, "direction": direction, "exit_reason": exit_reason,
             "pnl_pct": round(pnl_pct * 100.0, 2), "hold_minutes": round(hold_minutes, 1)}
 
@@ -333,12 +350,18 @@ def run_model_a(client: AlpacaClient, symbol: str, days_back: int,
         if setup is None:
             continue
 
+        # Per-ticker contract pricing.
+        cfg = TICKER_CONFIG.get(symbol, {"entry_premium": ENTRY_PREMIUM, "delta": DELTA})
+        ep = cfg["entry_premium"]
+        dl = cfg["delta"]
+
         if run == "Run1":
             sim = _simulate_single(day_bars, setup["entry_ts"], setup["direction"],
-                                   setup["entry_price"], tp_pct=0.35)
+                                   setup["entry_price"], tp_pct=0.35,
+                                   entry_premium=ep, delta=dl)
         else:  # Run2
             sim = _simulate_two_tranche(day_bars, setup["entry_ts"], setup["direction"],
-                                        setup["entry_price"])
+                                        setup["entry_price"], entry_premium=ep, delta=dl)
         if sim["traded"]:
             sim["date"] = str(day.date())
             sim["symbol"] = symbol
@@ -374,14 +397,43 @@ def run_model_a(client: AlpacaClient, symbol: str, days_back: int,
 
 def run_matrix(client: AlpacaClient, days_back: int,
                pm_vol_min: float = PM_VOL_MIN) -> dict:
-    """Run the test matrix for QQQ and SPY."""
+    """Run the test matrix for the expanded universe (NVDA, TSLA, QQQ)."""
     results = {}
-    for sym in ["QQQ", "SPY"]:
+    for sym in ["QQQ", "NVDA", "TSLA"]:
         for run in ["Run1", "Run2"]:
             logger.info(f"Running {run} for {sym} over {days_back} days...")
             results[f"{run}_{sym}"] = run_model_a(client, sym, days_back, run,
                                                   pm_vol_min=pm_vol_min)
     return results
+
+
+def _combine_portfolio(results: dict, run: str) -> dict:
+    """Combine all tickers for a given run into a portfolio summary."""
+    all_trades = []
+    for key, res in results.items():
+        if key.startswith(run + "_"):
+            all_trades.extend(res.get("trades_detail", []))
+    if not all_trades:
+        return {"trades": 0, "summary": {}}
+    df = pd.DataFrame(all_trades)
+    wins = df[df["pnl_pct"] > 0]
+    losses = df[df["pnl_pct"] <= 0]
+    gross_win = float(wins["pnl_pct"].sum()) if len(wins) else 0.0
+    gross_loss = abs(float(losses["pnl_pct"].sum())) if len(losses) else 0.0
+    total_pnl = float(df["pnl_pct"].sum())
+    cum = df["pnl_pct"].cumsum()
+    peak = cum.cummax()
+    max_dd = float((cum - peak).min())
+    return {
+        "trades": len(df),
+        "summary": {
+            "trades": len(df),
+            "win_rate": round(len(wins) / len(df) * 100.0, 1) if len(df) else 0.0,
+            "total_pnl_pct": round(total_pnl, 2),
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else float("inf"),
+            "max_dd_pct": round(max_dd, 2),
+        },
+    }
 
 
 def main() -> None:
@@ -414,6 +466,15 @@ def main() -> None:
                   f"{s.get('profit_factor',0):<8} {s.get('max_dd_pct',0):<8} "
                   f"{s.get('avg_hold_minutes',0):<8}")
 
+        # Combined portfolio stats.
+        print("\nCombined Portfolio:")
+        for run in ["Run1", "Run2"]:
+            combo = _combine_portfolio(results, run)
+            cs = combo.get("summary", {})
+            print(f"  {run}: trades={cs.get('trades',0)} win={cs.get('win_rate',0)}% "
+                  f"PnL={cs.get('total_pnl_pct',0)}% PF={cs.get('profit_factor',0)} "
+                  f"MaxDD={cs.get('max_dd_pct',0)}%")
+
         if not args.no_discord:
             try:
                 lines = [f"**Model A Asymmetry ({args.days}d)**"]
@@ -424,6 +485,14 @@ def main() -> None:
                         f"`{run}-{sym}` trades={s.get('trades',0)} "
                         f"Win={s.get('win_rate',0)}% PnL={s.get('total_pnl_pct',0)}% "
                         f"PF={s.get('profit_factor',0)} DD={s.get('max_dd_pct',0)}%"
+                    )
+                for run in ["Run1", "Run2"]:
+                    combo = _combine_portfolio(results, run)
+                    cs = combo.get("summary", {})
+                    lines.append(
+                        f"`{run}-PORTFOLIO` trades={cs.get('trades',0)} "
+                        f"Win={cs.get('win_rate',0)}% PnL={cs.get('total_pnl_pct',0)}% "
+                        f"PF={cs.get('profit_factor',0)} DD={cs.get('max_dd_pct',0)}%"
                     )
                 send_discord_message("\n".join(lines))
             except Exception as e:
