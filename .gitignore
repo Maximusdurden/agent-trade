@@ -78,6 +78,7 @@ sideload/anchor_stock_backtest.json
 
 # Options latch-on strategy runtime outputs (regenerated each run, not source)
 sideload/backtest_options_latch.json
+sideload/backtest_model_a_phase1h.json
 sideload/backtest_options_latch_stop_sweep.json
 sideload/backtest_entry_ablation.json
 sideload/backtest_model_a_calibration.json
