@@ -80,8 +80,9 @@ ET = ZoneInfo("America/New_York")
 # entry_premium / delta per ticker. Only tickers with PF >= 1.50 are retained.
 TICKER_CONFIG = {
     "TSLA": {"entry_premium": 3.50, "delta": 0.45},
-    # AMD/COIN/AMZN failed the PF >= 1.50 gate in the Phase 3 screen and are
-    # excluded from the active universe. Add them back here only if they pass.
+    "META": {"entry_premium": 4.50, "delta": 0.45},
+    # AMD/COIN/AMZN/PLTR failed the PF >= 1.50 gate in the Phase 3 screen and
+    # are excluded from the active universe. Add them back only if they pass.
 }
 # Active universe = tickers retained above.
 ACTIVE_UNIVERSE = list(TICKER_CONFIG.keys())

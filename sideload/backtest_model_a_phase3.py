@@ -59,8 +59,10 @@ TICKER_CONFIG = {
     "AMD":  {"entry_premium": 2.20, "delta": 0.45},
     "COIN": {"entry_premium": 3.80, "delta": 0.45},
     "AMZN": {"entry_premium": 2.40, "delta": 0.45},
+    "META": {"entry_premium": 4.50, "delta": 0.45},
+    "PLTR": {"entry_premium": 1.20, "delta": 0.45},
 }
-CANDIDATES = ["AMD", "COIN", "AMZN"]
+CANDIDATES = ["AMD", "COIN", "AMZN", "META", "PLTR"]
 
 # Acceptance tier.
 ACCEPT_PF = 1.50
