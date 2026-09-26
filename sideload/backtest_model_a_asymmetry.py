@@ -192,7 +192,8 @@ def _simulate_single(day_bars: pd.DataFrame, entry_ts, direction: str,
     - 30-min max hold.
     """
     max_exit_ts = entry_ts + timedelta(minutes=MAX_HOLD_MINUTES)
-    window = day_bars[(day_bars.index >= entry_ts) & (day_bars.index <= max_exit_ts)]
+    # Only evaluate bars AFTER entry_ts (no entry-bar self-stop lookahead).
+    window = day_bars[(day_bars.index > entry_ts) & (day_bars.index <= max_exit_ts)]
     if window.empty:
         return {"traded": False, "reason": "no_data"}
 
@@ -207,27 +208,28 @@ def _simulate_single(day_bars: pd.DataFrame, entry_ts, direction: str,
         high = float(bar["high"])
         low = float(bar["low"])
 
-        # Intrabar stop check: use the extreme against us.
-        if direction == "BULLISH":
-            stop_px = low
-        else:
-            stop_px = high
-        stop_premium = _premium_at(entry_price, stop_px, direction, minutes,
+        # Define extremes (symmetric execution).
+        favorable_px = high if direction == "BULLISH" else low
+        adverse_px = low if direction == "BULLISH" else high
+
+        stop_premium = _premium_at(entry_price, adverse_px, direction, minutes,
                                    entry_premium, delta)
+        target_premium = _premium_at(entry_price, favorable_px, direction, minutes,
+                                     entry_premium, delta)
+
+        # 1. Stop priority (if both hit on same bar, assume stopped out).
         if stop_premium <= entry_premium * (1.0 - HARD_STOP_CAP):
-            # Cap the realized loss at exactly -22% (hard cap), regardless of
-            # how far the intrabar extreme actually moved.
             exit_premium, exit_reason = entry_premium * (1.0 - HARD_STOP_CAP), "stop_22pct"
             break
 
-        # Take-profit on close.
-        close_premium = _premium_at(entry_price, close, direction, minutes,
-                                    entry_premium, delta)
-        if close_premium >= entry_premium * (1.0 + tp_pct):
-            exit_premium, exit_reason = close_premium, "take_profit"
+        # 2. Limit take-profit on favorable intrabar extreme.
+        if target_premium >= entry_premium * (1.0 + tp_pct):
+            exit_premium, exit_reason = entry_premium * (1.0 + tp_pct), "take_profit"
             break
 
-        exit_premium = close_premium
+        # 3. Otherwise mark-to-market on close.
+        exit_premium = _premium_at(entry_price, close, direction, minutes,
+                                   entry_premium, delta)
 
     if exit_premium is None:
         return {"traded": False, "reason": "no_data"}
@@ -249,7 +251,8 @@ def _simulate_two_tranche(day_bars: pd.DataFrame, entry_ts, direction: str,
     - Hard stop at -22% (intrabar).
     """
     max_exit_ts = entry_ts + timedelta(minutes=MAX_HOLD_MINUTES)
-    window = day_bars[(day_bars.index >= entry_ts) & (day_bars.index <= max_exit_ts)]
+    # Only evaluate bars AFTER entry_ts (no entry-bar self-stop lookahead).
+    window = day_bars[(day_bars.index > entry_ts) & (day_bars.index <= max_exit_ts)]
     if window.empty:
         return {"traded": False, "reason": "no_data"}
 
@@ -266,39 +269,47 @@ def _simulate_two_tranche(day_bars: pd.DataFrame, entry_ts, direction: str,
         high = float(bar["high"])
         low = float(bar["low"])
 
-        # Intrabar stop check.
-        stop_px = low if direction == "BULLISH" else high
-        stop_premium = _premium_at(entry_price, stop_px, direction, minutes,
+        # Define extremes (symmetric execution).
+        favorable_px = high if direction == "BULLISH" else low
+        adverse_px = low if direction == "BULLISH" else high
+
+        stop_premium = _premium_at(entry_price, adverse_px, direction, minutes,
                                    entry_premium, delta)
+        target_premium = _premium_at(entry_price, favorable_px, direction, minutes,
+                                     entry_premium, delta)
+
+        # 1. Stop priority (if both hit on same bar, assume stopped out).
         if stop_premium <= entry_premium * (1.0 - tranche2_stop):
-            # Cap the realized loss at the stop level (hard cap).
-            exit_premium, exit_reason = entry_premium * (1.0 - tranche2_stop), "stop_22pct"
+            if tranche1_filled and tranche2_stop == 0.0:
+                # Tranche 2 stopped at breakeven after Tranche 1 filled.
+                exit_premium, exit_reason = entry_premium, "breakeven_stop"
+            else:
+                exit_premium, exit_reason = entry_premium * (1.0 - tranche2_stop), "stop_22pct"
             break
 
-        close_premium = _premium_at(entry_price, close, direction, minutes,
-                                    entry_premium, delta)
-
-        # Tranche 1: fill at +25%.
-        if not tranche1_filled and close_premium >= entry_premium * (1.0 + TRANCH1_PCT):
+        # 2. Tranche 1: fill at +25% on favorable extreme.
+        if not tranche1_filled and target_premium >= entry_premium * (1.0 + TRANCH1_PCT):
             tranche1_filled = True
             tranche2_stop = 0.0  # breakeven ratchet
             # Continue holding Tranche 2.
 
-        # Tranche 2: fill at +50%.
-        if tranche1_filled and close_premium >= entry_premium * (1.0 + TRANCH2_PCT):
+        # 3. Tranche 2: fill at +50% on favorable extreme.
+        if tranche1_filled and target_premium >= entry_premium * (1.0 + TRANCH2_PCT):
             # Both tranches filled: weighted average.
             avg = (TRANCH1_FRACTION * entry_premium * (1.0 + TRANCH1_PCT)
-                   + (1 - TRANCH1_FRACTION) * close_premium)
+                   + (1 - TRANCH1_FRACTION) * entry_premium * (1.0 + TRANCH2_PCT))
             exit_premium, exit_reason = avg, "two_tranche_full"
             break
 
-        exit_premium = close_premium
+        # 4. Otherwise mark-to-market on close.
+        exit_premium = _premium_at(entry_price, close, direction, minutes,
+                                   entry_premium, delta)
 
     if exit_premium is None:
         return {"traded": False, "reason": "no_data"}
 
     # If only Tranche 1 filled, weight it; else full close.
-    if tranche1_filled and exit_reason != "two_tranche_full":
+    if tranche1_filled and exit_reason not in ("two_tranche_full", "breakeven_stop"):
         # Tranche 1 locked at +25%, Tranche 2 at current premium.
         t1 = entry_premium * (1.0 + TRANCH1_PCT)
         t2 = exit_premium
