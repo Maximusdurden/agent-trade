@@ -61,9 +61,10 @@ TICKERS = ["SPY", "QQQ", "IWM"]
 STOP_LOSS_PCT = 0.20          # 20% premium stop (per directive)
 HARD_EXIT_TIME = dtime(11, 30, 0)  # hard time stop
 
-# Option premium model.
+# Option premium model (corrected first-order Taylor expansion).
 DELTA_PROXY = 0.45
-THETA_BLEED_PER_MIN = 0.0004
+ENTRY_PREMIUM = 1.50          # ~$1.50 for SPY first-OTM 0DTE
+THETA_DECAY_PER_15MIN = 0.015  # ~0.015 per 15 min of hold
 
 # Model A window.
 MODEL_A_START = dtime(9, 30, 0)
@@ -163,7 +164,7 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
     if window.empty:
         return {"traded": False, "reason": "no_data"}
 
-    entry_premium = 1.0
+    entry_premium = ENTRY_PREMIUM
     premium = entry_premium
     peak_premium = entry_premium
     exit_premium = None
@@ -177,12 +178,16 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
 
     for ts, bar in window.iterrows():
         px = float(bar["close"])
-        move = (px - entry_price) / entry_price
+        # Dollar move (signed by direction).
         if direction == "BEARISH":
-            move = -move
+            dollar_move = entry_price - px
+        else:
+            dollar_move = px - entry_price
         minutes = (ts - entry_ts).total_seconds() / 60.0
-        premium = entry_premium * (1.0 + DELTA_PROXY * move - THETA_BLEED_PER_MIN * minutes)
-        premium = max(0.01, premium)
+        # Correct premium model: dollar_move * delta - theta decay.
+        option_delta_gain = dollar_move * DELTA_PROXY
+        decay_loss = (minutes / 15.0) * THETA_DECAY_PER_15MIN * entry_premium
+        premium = max(0.01, entry_premium + option_delta_gain - decay_loss)
         exit_underlying = px
 
         # EMA for trailing.

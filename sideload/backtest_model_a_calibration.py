@@ -63,9 +63,10 @@ STOP_LOSS_PCT = 0.20          # -20% premium stop
 TAKE_PROFIT_PCT = 0.25        # +25% premium target
 MAX_HOLD_MINUTES = 30         # 30-min max hold
 
-# Calibrated premium model.
+# Calibrated premium model (corrected first-order Taylor expansion).
 DELTA = 0.45
-DECAY_RATE_PER_MIN = 0.001    # 1.5% per 15 min = 0.1%/min
+ENTRY_PREMIUM = 1.50          # ~$1.50 for SPY first-OTM 0DTE
+THETA_DECAY_PER_15MIN = 0.015  # ~0.015 per 15 min of hold
 
 INTRADAY_INTERVAL = "1min"
 
@@ -171,7 +172,7 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
     if window.empty:
         return {"traded": False, "reason": "no_data"}
 
-    entry_premium = 1.0
+    entry_premium = ENTRY_PREMIUM
     premium = entry_premium
     exit_premium = None
     exit_reason = "time_stop"
@@ -181,14 +182,17 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
 
     for ts, bar in window.iterrows():
         px = float(bar["close"])
-        move = (px - entry_price) / entry_price
+        # Dollar move (signed by direction).
         if direction == "BEARISH":
-            move = -move
+            dollar_move = entry_price - px
+        else:
+            dollar_move = px - entry_price
         minutes = (ts - entry_ts).total_seconds() / 60.0
         hold_minutes = minutes
-        # Calibrated premium: delta * move - decay * minutes.
-        premium = entry_premium * (1.0 + DELTA * move - DECAY_RATE_PER_MIN * minutes)
-        premium = max(0.01, premium)
+        # Correct premium model: dollar_move * delta - theta decay.
+        option_delta_gain = dollar_move * DELTA
+        decay_loss = (minutes / 15.0) * THETA_DECAY_PER_15MIN * entry_premium
+        premium = max(0.01, entry_premium + option_delta_gain - decay_loss)
         exit_underlying = px
 
         # Stop-loss.

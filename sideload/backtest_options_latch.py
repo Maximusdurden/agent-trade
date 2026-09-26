@@ -59,10 +59,16 @@ TRAIL_BARS = 5                # 5-min trailing stop
 STOP_SWEEP = [0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
 
 # Option premium model: delta proxy for the first-OTM strike.
-# For 0DTE, first-OTM delta is roughly 0.40-0.50. We model premium as
-# delta * underlying_move + small theta bleed.
+# For 0DTE, first-OTM delta is roughly 0.40-0.50. We model premium using the
+# standard first-order Taylor expansion:
+#   option_delta_gain = dollar_move * delta
+#   decay_loss = (minutes_held / 15) * 0.015 * entry_premium
+#   current_option_price = entry_premium + option_delta_gain - decay_loss
 DELTA_PROXY = 0.45
-THETA_BLEED_PER_MIN = 0.0004  # ~0.04%/min theta bleed on premium
+# Realistic 0DTE morning base premium (per contract).
+ENTRY_PREMIUM = 1.50          # ~$1.50 for SPY first-OTM 0DTE
+# Theta decay: ~0.015 per 15 minutes of hold during 09:30-10:30.
+THETA_DECAY_PER_15MIN = 0.015
 TRAIL_GIVEBACK_PCT = 0.15     # trailing stop giveback from peak premium
 
 INTRADAY_INTERVAL = "1min"
@@ -225,6 +231,48 @@ def _atr14(daily: pd.DataFrame) -> float:
     return float(tr.tail(14).mean())
 
 
+def _momentum_confirmation(day_bars: pd.DataFrame, day: pd.Timestamp,
+                           direction: str) -> bool:
+    """Momentum confirmation filter.
+
+    At least 2 of the first 3 five-minute bars must close in the signal
+    direction (up for BULLISH, down for BEARISH), AND the latest bar must be
+    positive (in the signal direction).
+
+    Uses only completed 5-min bars within the 09:30-09:45 latch window.
+    """
+    latch_start = day.replace(hour=LATCH_START.hour, minute=LATCH_START.minute)
+    latch_end = day.replace(hour=LATCH_END.hour, minute=LATCH_END.minute)
+    window = day_bars[(day_bars.index >= latch_start) & (day_bars.index <= latch_end)]
+    if len(window) < 3:
+        return False
+
+    # Resample 1-min bars into 5-min bars (completed only).
+    five_min = window["close"].resample("5min").last().dropna()
+    if len(five_min) < 3:
+        return False
+
+    # Direction of each 5-min bar (close vs previous close).
+    closes = five_min.to_numpy()
+    moves = []
+    for i in range(1, len(closes)):
+        moves.append(closes[i] - closes[i - 1])
+
+    if len(moves) < 3:
+        return False
+
+    # First 3 moves.
+    first3 = moves[:3]
+    if direction == "BULLISH":
+        up_count = sum(1 for m in first3 if m > 0)
+        latest_positive = moves[-1] > 0
+    else:  # BEARISH
+        up_count = sum(1 for m in first3 if m < 0)
+        latest_positive = moves[-1] < 0
+
+    return up_count >= 2 and latest_positive
+
+
 def _sentiment_confluence(symbol: str, direction: str, session_date: str,
                           client: AlpacaClient) -> bool:
     """Sentiment confluence gate: the selected ticker must independently clear
@@ -283,7 +331,7 @@ def _simulate_exit(day_bars: pd.DataFrame, day: pd.Timestamp, direction: str,
     if window.empty:
         return {"traded": False, "reason": "no_data"}
 
-    entry_premium = 1.0  # normalized premium
+    entry_premium = ENTRY_PREMIUM
     premium = entry_premium
     peak_premium = entry_premium
     exit_premium = None
@@ -294,13 +342,16 @@ def _simulate_exit(day_bars: pd.DataFrame, day: pd.Timestamp, direction: str,
 
     for ts, bar in window.iterrows():
         px = float(bar["close"])
-        move = (px - entry_price) / entry_price
+        # Dollar move (signed by direction).
         if direction == "BEARISH":
-            move = -move
-        # Premium model: delta * move, minus theta bleed.
+            dollar_move = entry_price - px
+        else:
+            dollar_move = px - entry_price
         minutes = (ts - entry_ts).total_seconds() / 60.0
-        premium = entry_premium * (1.0 + DELTA_PROXY * move - THETA_BLEED_PER_MIN * minutes)
-        premium = max(0.01, premium)
+        # Correct premium model: dollar_move * delta - theta decay.
+        option_delta_gain = dollar_move * DELTA_PROXY
+        decay_loss = (minutes / 15.0) * THETA_DECAY_PER_15MIN * entry_premium
+        premium = max(0.01, entry_premium + option_delta_gain - decay_loss)
         exit_underlying = px
 
         # Hard stop.
@@ -336,7 +387,8 @@ def _simulate_exit(day_bars: pd.DataFrame, day: pd.Timestamp, direction: str,
 
 def run_backtest(client: AlpacaClient, symbol: str, days_back: int,
                  stop_loss_pct: float = STOP_LOSS_PCT,
-                 use_sentiment: bool = True) -> dict:
+                 use_sentiment: bool = True,
+                 use_momentum: bool = False) -> dict:
     """Run the latch-on backtest for a symbol over N days.
 
     Args:
@@ -344,6 +396,8 @@ def run_backtest(client: AlpacaClient, symbol: str, days_back: int,
             to validate the price-action filters independently (the Alpaca News
             API only has ~5 days of history, so sentiment can't be validated
             on long windows).
+        use_momentum: If True, apply the momentum confirmation filter (>=2 of
+            first 3 five-min bars in direction + latest bar positive).
     """
     daily = _load_daily(client, symbol, limit=days_back + 5)
     intraday = _load_intraday(client, symbol, days_back)
@@ -372,6 +426,11 @@ def run_backtest(client: AlpacaClient, symbol: str, days_back: int,
 
         # Sentiment confluence gate: selected ticker must clear threshold.
         if use_sentiment and not _sentiment_confluence(symbol, direction, str(day.date()), client):
+            continue
+
+        # Momentum confirmation: >=2 of first 3 five-min bars in direction +
+        # latest bar positive.
+        if use_momentum and not _momentum_confirmation(day_bars, day, direction):
             continue
 
         # S/R headroom & resistance-overhead filter.
@@ -411,13 +470,15 @@ def run_backtest(client: AlpacaClient, symbol: str, days_back: int,
             "summary": summary, "trades_detail": results}
 
 
-def run_all(client: AlpacaClient, days_back: int, use_sentiment: bool = True) -> dict:
+def run_all(client: AlpacaClient, days_back: int, use_sentiment: bool = True,
+            use_momentum: bool = False) -> dict:
     """Run the backtest for all tickers."""
     all_results = {}
     for sym in TICKERS:
         logger.info(f"Backtesting {sym} over {days_back} days...")
         all_results[sym] = run_backtest(client, sym, days_back,
-                                        use_sentiment=use_sentiment)
+                                        use_sentiment=use_sentiment,
+                                        use_momentum=use_momentum)
     return all_results
 
 
@@ -447,6 +508,8 @@ def main() -> None:
                         help="Sweep stop-loss percentages to find the realistic level.")
     parser.add_argument("--no-sentiment", action="store_true",
                         help="Skip the sentiment confluence gate (validate price-action filters only).")
+    parser.add_argument("--momentum", action="store_true",
+                        help="Apply the momentum confirmation filter (>=2 of first 3 five-min bars in direction + latest bar positive).")
     parser.add_argument("--no-discord", action="store_true",
                         help="Skip the Discord notification.")
     args = parser.parse_args()
@@ -455,6 +518,7 @@ def main() -> None:
     try:
         client = AlpacaClient()
         use_sentiment = not args.no_sentiment
+        use_momentum = args.momentum
         if args.sweep_stop:
             results = sweep_stop_loss(client, args.days)
             out_path = os.path.join(OUT_DIR, "backtest_options_latch_stop_sweep.json")
@@ -473,9 +537,11 @@ def main() -> None:
 
         if args.symbol:
             results = {args.symbol: run_backtest(client, args.symbol, args.days,
-                                                 use_sentiment=use_sentiment)}
+                                                 use_sentiment=use_sentiment,
+                                                 use_momentum=use_momentum)}
         else:
-            results = run_all(client, args.days, use_sentiment=use_sentiment)
+            results = run_all(client, args.days, use_sentiment=use_sentiment,
+                              use_momentum=use_momentum)
 
         out_path = os.path.join(OUT_DIR, "backtest_options_latch.json")
         with open(out_path, "w", encoding="utf-8") as f:
