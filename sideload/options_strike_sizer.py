@@ -33,7 +33,7 @@ import math
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -65,6 +65,35 @@ DELTA_MAX = 0.50
 ROUND_NUMBER_BUFFER = 0.50
 # Round-number step (major psychological levels).
 ROUND_NUMBER_STEP = 10.0
+
+# Front-week expiry resolution (Phase 2).
+FRIDAY_CUTOFF_TIME = dtime(12, 0, 0)  # After 12:00 PM ET on Friday -> next Friday.
+# Contract sizing elasticity (Phase 2): allow 1 contract up to this notional.
+ELASTIC_MAX_NOTIONAL = 650.0
+
+
+def resolve_front_week_expiry(now_et: datetime | None = None) -> str:
+    """Resolve the front-week (nearest Friday) option expiry.
+
+    Rules:
+      - Monday-Friday: target the current week's Friday.
+      - Friday after 12:00 PM ET, or a weekend: target next Friday.
+
+    Returns:
+        Expiry date as 'YYYY-MM-DD' (ET).
+    """
+    now = now_et or datetime.now(ET)
+    weekday = now.weekday()  # Mon=0 ... Sun=6
+    # Days until this week's Friday (weekday 4).
+    days_until_friday = (4 - weekday) % 7
+    target = now.date() + timedelta(days=days_until_friday)
+
+    # If today is Friday and it's after the cutoff, roll to next Friday.
+    if weekday == 4 and now.time() >= FRIDAY_CUTOFF_TIME:
+        target = target + timedelta(days=7)
+    # If today is Saturday/Sunday, the modulo already rolled to next Friday.
+
+    return target.strftime("%Y-%m-%d")
 
 
 def _to_et(ts) -> pd.Timestamp:
@@ -202,11 +231,23 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
     otm.sort(key=lambda c: (c["dist"], abs((c["delta"] or 0.45) - 0.45)))
     selected = otm[0]
 
-    # 6. Compute position size (§6.6).
+    # 6. Compute position size (§6.6) with Phase 2 elasticity.
     contracts = int(math.floor(BASE_ALLOCATION / (selected["ask"] * 100.0)))
     if contracts < 1:
-        logger.warning(f"Contract ask ${selected['ask']:.2f} too expensive for ${BASE_ALLOCATION} allocation.")
-        contracts = 0
+        notional = selected["ask"] * 100.0
+        if notional <= ELASTIC_MAX_NOTIONAL:
+            # Prevent allocation starvation on TSLA options: allow 1 contract.
+            contracts = 1
+            logger.info(
+                f"Contract ask ${selected['ask']:.2f} exceeds ${BASE_ALLOCATION} "
+                f"allocation but <= ${ELASTIC_MAX_NOTIONAL:.0f}; allowing 1 contract."
+            )
+        else:
+            logger.warning(
+                f"Contract ask ${selected['ask']:.2f} too expensive "
+                f"(notional ${notional:.2f} > ${ELASTIC_MAX_NOTIONAL:.0f}); no entry."
+            )
+            contracts = 0
 
     return {
         "symbol": symbol,

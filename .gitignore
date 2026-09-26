@@ -80,6 +80,10 @@ sideload/anchor_stock_backtest.json
 sideload/backtest_options_latch.json
 sideload/backtest_model_a_phase1h.json
 sideload/backtest_model_a_phase1i.json
+
+# TSLA options runner state + audit trail (regenerated, not source)
+sideload/data/options_tsla_positions.json
+sideload/data/options_tsla_fills.csv
 sideload/backtest_options_latch_stop_sweep.json
 sideload/backtest_entry_ablation.json
 sideload/backtest_model_a_calibration.json
