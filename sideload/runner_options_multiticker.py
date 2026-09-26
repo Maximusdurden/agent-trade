@@ -87,7 +87,12 @@ TICKER_CONFIG = {
 ACTIVE_UNIVERSE = list(TICKER_CONFIG.keys())
 
 # Intraday evaluation loop cadence.
-EVAL_INTERVAL_SECONDS = 2
+# Set to 5s to reduce REST API load (was 2s -> 60-120 req/min, triggering 429s).
+EVAL_INTERVAL_SECONDS = 5
+
+# Entry fill confirmation.
+FILL_CONFIRM_SECONDS = 5   # Max seconds to poll for a fill.
+FILL_POLL_INTERVAL = 1.0   # Poll cadence (seconds).
 
 
 def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str) -> dict:
@@ -127,8 +132,13 @@ def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str) -> 
 
 def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
                        pmh: float, pml: float) -> dict | None:
-    """Detect a Model A setup for a specific ticker on 1-min bar close."""
-    intraday = _load_intraday(client, symbol, days_back=5)
+    """Detect a Model A setup for a specific ticker on 1-min bar close.
+
+    Only completed 1-minute candles are evaluated (never the in-flight bar).
+    Fetches only today's bars (days_back=1) to avoid REST API flooding.
+    """
+    # Fetch only today's bars (PM anchors already computed at 09:29:50).
+    intraday = _load_intraday(client, symbol, days_back=1)
     if intraday.empty:
         return None
 
@@ -143,6 +153,14 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
     a_start = day.replace(hour=MODEL_A_START.hour, minute=MODEL_A_START.minute)
     a_end = day.replace(hour=MODEL_A_END.hour, minute=MODEL_A_END.minute)
     window = day_bars[(day_bars.index >= a_start) & (day_bars.index <= a_end)]
+    if window.empty:
+        return None
+
+    # Defect 3: only evaluate strictly completed candles. The currently forming
+    # 1-minute bar is excluded (its close is just the latest tick, not a close).
+    now_et = datetime.now(ET)
+    completed_cutoff = now_et.replace(second=0, microsecond=0)
+    window = window[window.index < completed_cutoff]
     if window.empty:
         return None
 
@@ -210,10 +228,43 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
             symbol=occ, qty=contracts, side="buy", limit_price=ask)
         fill_price = result.get("filled_avg_price")
 
+        # Defect 4: confirm the limit order actually fills before tracking it.
+        # place_option_order may return before the fill (status new/accepted) or
+        # the order may be canceled if the ask moves. Poll up to 5s for a fill.
+        order_id = result.get("id")
+        status = str(result.get("status", "")).lower()
+        if order_id and status not in ("filled", "partially_filled"):
+            logger.info(f"[{symbol}] Order {order_id} status={status}; "
+                        f"polling up to {FILL_CONFIRM_SECONDS}s for fill...")
+            for _ in range(int(FILL_CONFIRM_SECONDS / FILL_POLL_INTERVAL)):
+                time.sleep(FILL_POLL_INTERVAL)
+                try:
+                    updated = client.trading_client.get_order_by_id(order_id=order_id)
+                    status = str(getattr(updated, "status", "")).lower()
+                    if getattr(updated, "filled_avg_price", None) is not None:
+                        fill_price = float(updated.filled_avg_price)
+                    if status in ("filled", "partially_filled"):
+                        break
+                except Exception as poll_err:
+                    logger.warning(f"[{symbol}] Fill poll error for {order_id}: {poll_err}")
+
+        if status not in ("filled", "partially_filled"):
+            logger.error(f"[{symbol}] Entry order {order_id} not filled after "
+                         f"{FILL_CONFIRM_SECONDS}s (status={status}); canceling.")
+            try:
+                if order_id:
+                    client.trading_client.cancel_order_by_id(order_id=order_id)
+            except Exception as cancel_err:
+                logger.warning(f"[{symbol}] Cancel failed for {order_id}: {cancel_err}")
+            return None
+
+        if fill_price is None:
+            fill_price = ask
+
     pos = {
         "contract_symbol": occ,
         "entry_time": datetime.now(ET).isoformat(),
-        "entry_premium": entry_premium,
+        "entry_premium": fill_price,
         "contracts": contracts,
         "target_premium": target_premium,
         "stop_premium": stop_premium,
@@ -257,6 +308,21 @@ def run_session(session_date: str, dry_run: bool = True,
     client = AlpacaClient()
     sync_down_from_gcs()
     state = load_state()
+
+    # Defect 1: crash recovery. If an active position exists on boot (container
+    # restarted/redeployed while a position was open), re-attach directly to the
+    # monitoring loop BEFORE the circuit breaker (which would otherwise see a
+    # recorded trade and skip, orphaning the position).
+    if state.get("active_position"):
+        logger.warning("Found unclosed active position on startup; "
+                       "re-attaching monitor loop...")
+        pos = state["active_position"]
+        exit_info = _monitor_position(client, pos, dry_run=dry_run)
+        state["active_position"] = None
+        save_state(state)
+        sync_up_to_gcs()
+        return {"status": "recovered_and_closed", "position": pos,
+                "exit": exit_info}
 
     # Circuit breaker: max 1 trade/day.
     can_trade = check_can_trade(session_date)
