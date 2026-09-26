@@ -81,6 +81,7 @@ sideload/backtest_options_latch.json
 sideload/backtest_options_latch_stop_sweep.json
 sideload/backtest_entry_ablation.json
 sideload/backtest_model_a_calibration.json
+sideload/backtest_model_a_asymmetry.json
 sideload/options_circuit_breaker_state.json
 sideload/options_*_2026-*.json
 
