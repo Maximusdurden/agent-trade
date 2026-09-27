@@ -165,13 +165,13 @@ if (-not $JobExists) {
         --command "python" --args "sideload/runner_options_multiticker.py,--live" `
         --flags-file $FlagsFile `
         --set-secrets ($SecretReferences -join ",") `
-        --cpu $Cpu --memory $Memory --timeout $Timeout --max-retries $MaxRetries
+        --cpu $Cpu --memory $Memory --task-timeout $Timeout --max-retries $MaxRetries
 } else {
     & $GCloud run jobs update $JobName --image $ImageTag --region $Region `
         --command "python" --args "sideload/runner_options_multiticker.py,--live" `
         --flags-file $FlagsFile `
         --set-secrets ($SecretReferences -join ",") `
-        --cpu $Cpu --memory $Memory --timeout $Timeout --max-retries $MaxRetries
+        --cpu $Cpu --memory $Memory --task-timeout $Timeout --max-retries $MaxRetries
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to deploy job $JobName (exit $LASTEXITCODE)."
