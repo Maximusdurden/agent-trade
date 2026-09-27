@@ -19,6 +19,12 @@
 # benign stderr output into a NativeCommandError that would abort the deploy.
 $ErrorActionPreference = "Continue"
 
+# Accept -Auto (non-interactive) flag. The script is already non-interactive;
+# this parameter is accepted for compatibility with automated invocation.
+param(
+    [switch]$Auto
+)
+
 # 1. Load Configurations from .env
 $EnvPath = "Z:\python\projects\agent-trade\.env"
 if (-not (Test-Path $EnvPath)) {
