@@ -264,9 +264,12 @@ def compute_sr_anchors(client: AlpacaClient, symbol: str, session_date: str) -> 
         daily = daily.reset_index(level=0, drop=True)
     daily.index = pd.to_datetime(daily.index)
     daily = daily.sort_index()
-    # Normalize the daily index to ET (naive) for consistent date comparison.
+    # Normalize the daily index to ET dates (naive) for consistent date
+    # comparison. Converting UTC midnight to ET shifts to the prior evening
+    # (e.g. 2026-09-25 00:00 UTC -> 2026-09-24 20:00 ET), so we must normalize
+    # to the date to correctly exclude the session date's own bar.
     if daily.index.tzinfo is not None:
-        daily.index = daily.index.tz_convert(ET).tz_localize(None)
+        daily.index = daily.index.tz_convert(ET).tz_localize(None).normalize()
     # Find the last trading day strictly before the session date.
     prior = daily[daily.index < pd.Timestamp(day)]
     if prior.empty:
