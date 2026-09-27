@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from datetime import datetime
@@ -303,20 +304,31 @@ def run_scan(client: AlpacaClient, dry_run: bool = False) -> None:
     staged = candidates[:slots]
     for setup in staged:
         symbol = setup["symbol"]
-        qty = fb_cfg.RISK_PER_TRADE_USD / setup["r"]
+        # Floor to whole shares (Alpaca rejects fractional equity qty).
+        qty = math.floor(fb_cfg.RISK_PER_TRADE_USD / setup["r"])
+        if qty < 1:
+            logger.warning(f"[Scan] {symbol} risk sizing yields <1 share; skipping.")
+            continue
         if dry_run:
-            logger.info(f"[Dry-run] Would buy {qty:.2f} {symbol} @ MOC "
+            logger.info(f"[Dry-run] Would buy {qty} {symbol} @ MOC "
                         f"(stop {setup['stop']:.2f}, 3R {setup['target_3r']:.2f})")
             continue
         result = _place_moc_order(client, symbol, qty)
-        if result["status"] in ("submitted", "filled", "partially_filled"):
+        # Only open a position if the order FULLY filled (status filled with a
+        # fill price). A partial fill would track the full qty while the broker
+        # holds fewer shares, causing later over-sells.
+        status = str(result.get("status", "")).lower()
+        fill_px = result.get("filled_avg_price")
+        if status == "filled" and fill_px is not None:
             pos = fb_state.open_position(
                 symbol, setup["entry_ref"], qty, setup["stop"],
                 setup["target_3r"], setup["target_5r"],
             )
             # Log the entry fill (empirical fill price vs entry_ref proxy).
-            fill_px = result.get("filled_avg_price") or setup["entry_ref"]
             _log_fill(pos["cluster_id"], symbol, "buy", qty, fill_px, setup["entry_ref"])
+        else:
+            logger.warning(f"[Scan] {symbol} MOC order not fully filled (status={status}); "
+                           f"not opening position.")
     logger.info(f"[Scan] Staged {len(staged)} candidates.")
 
 
@@ -353,55 +365,83 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
 
         # Scale 1: sell 33% at +3R.
         if not pos["scale_1_filled"] and high >= pos["target_3r"]:
-            qty = 0.33 * initial
-            if dry_run:
-                logger.info(f"[Dry-run] Scale 1: sell {qty:.2f} {symbol} @ +3R")
+            qty = math.floor(0.33 * initial)
+            if qty < 1:
+                logger.warning(f"[Monitor] {symbol}: scale-1 qty <1 share; skipping.")
+            elif dry_run:
+                logger.info(f"[Dry-run] Scale 1: sell {qty} {symbol} @ +3R")
             else:
                 res = _sell(client, symbol, qty)
-                fill_px = res.get("filled_avg_price") or pos["target_3r"]
-                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_3r"])
-                fb_state.update_position(symbol, scale_1_filled=True,
-                                         remaining_shares=remaining - qty)
-            logger.info(f"[Monitor] {symbol}: Scale 1 filled @ +3R")
+                status = str(res.get("status", "")).lower()
+                fill_px = res.get("filled_avg_price")
+                if status == "filled" and fill_px is not None:
+                    _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_3r"])
+                    fb_state.update_position(symbol, scale_1_filled=True,
+                                             remaining_shares=remaining - qty)
+                    remaining -= qty
+                    logger.info(f"[Monitor] {symbol}: Scale 1 filled @ +3R")
+                else:
+                    logger.warning(f"[Monitor] {symbol}: scale-1 sell not fully filled (status={status}); "
+                                   f"state unchanged.")
 
         # Scale 2: sell 33% at +5R.
         if pos["scale_1_filled"] and not pos["scale_2_filled"] and high >= pos["target_5r"]:
-            qty = 0.33 * initial
-            if dry_run:
-                logger.info(f"[Dry-run] Scale 2: sell {qty:.2f} {symbol} @ +5R")
+            qty = math.floor(0.33 * initial)
+            if qty < 1:
+                logger.warning(f"[Monitor] {symbol}: scale-2 qty <1 share; skipping.")
+            elif dry_run:
+                logger.info(f"[Dry-run] Scale 2: sell {qty} {symbol} @ +5R")
             else:
                 res = _sell(client, symbol, qty)
-                fill_px = res.get("filled_avg_price") or pos["target_5r"]
-                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_5r"])
-                fb_state.update_position(symbol, scale_2_filled=True,
-                                         remaining_shares=remaining - qty)
-            logger.info(f"[Monitor] {symbol}: Scale 2 filled @ +5R")
+                status = str(res.get("status", "")).lower()
+                fill_px = res.get("filled_avg_price")
+                if status == "filled" and fill_px is not None:
+                    _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_5r"])
+                    fb_state.update_position(symbol, scale_2_filled=True,
+                                             remaining_shares=remaining - qty)
+                    remaining -= qty
+                    logger.info(f"[Monitor] {symbol}: Scale 2 filled @ +5R")
+                else:
+                    logger.warning(f"[Monitor] {symbol}: scale-2 sell not fully filled (status={status}); "
+                                   f"state unchanged.")
 
         # Runner exit: trail remaining 34% with Close < SMA20.
+        # Use elif so trail and time-stop are mutually exclusive in one pass
+        # (both firing would double-sell the full remaining position -> short).
         if pos["scale_1_filled"] and close < sma20:
             qty = pos["remaining_shares"]
             if dry_run:
                 logger.info(f"[Dry-run] Trail exit: sell {qty:.2f} {symbol} (Close<SMA20)")
             else:
                 res = _sell(client, symbol, qty)
-                fill_px = res.get("filled_avg_price") or close
-                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, sma20)
-                pnl = (fill_px - entry) * qty
-                fb_state.close_position(symbol, pnl)
-            logger.info(f"[Monitor] {symbol}: trail exit (Close<SMA20)")
+                status = str(res.get("status", "")).lower()
+                fill_px = res.get("filled_avg_price")
+                if status == "filled" and fill_px is not None:
+                    _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, sma20)
+                    pnl = (fill_px - entry) * qty
+                    fb_state.close_position(symbol, pnl)
+                    logger.info(f"[Monitor] {symbol}: trail exit (Close<SMA20)")
+                else:
+                    logger.warning(f"[Monitor] {symbol}: trail sell not fully filled (status={status}); "
+                                   f"position kept.")
 
         # Time stop: liquidate if held >= 45 trading days.
-        if pos["bars_held"] >= fb_cfg.MAX_HOLD_DAYS:
+        elif pos["bars_held"] >= fb_cfg.MAX_HOLD_DAYS:
             qty = pos["remaining_shares"]
             if dry_run:
                 logger.info(f"[Dry-run] Time stop: sell {qty:.2f} {symbol} (held {pos['bars_held']}d)")
             else:
                 res = _sell(client, symbol, qty)
-                fill_px = res.get("filled_avg_price") or close
-                _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, close)
-                pnl = (fill_px - entry) * qty
-                fb_state.close_position(symbol, pnl)
-            logger.info(f"[Monitor] {symbol}: time stop (held {pos['bars_held']}d)")
+                status = str(res.get("status", "")).lower()
+                fill_px = res.get("filled_avg_price")
+                if status == "filled" and fill_px is not None:
+                    _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, close)
+                    pnl = (fill_px - entry) * qty
+                    fb_state.close_position(symbol, pnl)
+                    logger.info(f"[Monitor] {symbol}: time stop (held {pos['bars_held']}d)")
+                else:
+                    logger.warning(f"[Monitor] {symbol}: time-stop sell not fully filled (status={status}); "
+                                   f"position kept.")
 
     # Increment bars_held for all open positions.
     fb_state.increment_bars_held()

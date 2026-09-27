@@ -174,10 +174,20 @@ def count_open_positions() -> int:
 
 
 def increment_bars_held() -> None:
-    """Increment bars_held for all open positions (called once per trading day)."""
+    """Increment bars_held for all open positions (once per trading day).
+
+    The monitor scheduler runs multiple times per day (hourly 10:00-15:00 ET),
+    so guard on the last-increment date to avoid counting the same day multiple
+    times (which would fire the 45-day time stop ~7.5 calendar days early).
+    """
+    from datetime import datetime
     state = load_state()
+    today = datetime.now(ET).date().isoformat()
+    if state.get("bars_held_last_date") == today:
+        return
     for pos in state["active_positions"].values():
         pos["bars_held"] = pos.get("bars_held", 0) + 1
+    state["bars_held_last_date"] = today
     save_state(state)
 
 

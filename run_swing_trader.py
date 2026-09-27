@@ -325,7 +325,11 @@ def run_eod_scan(dry_run: bool = False) -> dict:
             # Approximate qty from the signal close (fill at open may differ).
             # Cast to INTEGER (math.floor) to avoid 422 errors if fractional
             # share trading is not enabled on the account.
-            qty = max(1, math.floor(notional / s.get("close", 1.0)))
+            close_px = s.get("close")
+            if not close_px or close_px <= 0:
+                logger.warning(f"[STAGE] {s['symbol']} missing close price; skipping sizing.")
+                continue
+            qty = max(1, math.floor(notional / float(close_px)))
             res = place_market_on_open_order(client, s["symbol"], qty, "buy")
             s["order_result"] = res
             # Record staged position (paper-trade) ONLY if the order was accepted.

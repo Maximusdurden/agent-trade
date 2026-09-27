@@ -394,6 +394,17 @@ def _monitor_position(client: AlpacaClient, pos: dict, dry_run: bool = False) ->
                         f"limit sell at {bid:.2f}")
             result = _dispatch_exit(client, occ, qty, "take_profit",
                                     limit_price=bid, dry_run=dry_run)
+            # If the take-profit limit did not fill, cancel the open DAY limit
+            # order so a later run does not double-sell against a still-live
+            # order. The position stays tracked (closed=False) for re-attach.
+            if not dry_run and result.get("filled_avg_price") is None:
+                oid = result.get("id")
+                if oid:
+                    try:
+                        client.trading_client.cancel_order_by_id(order_id=oid)
+                        logger.info(f"[TAKE PROFIT] {occ} unfilled; canceled open limit {oid}.")
+                    except Exception as cancel_err:
+                        logger.warning(f"[TAKE PROFIT] Cancel failed for {oid}: {cancel_err}")
             return _finalize_exit(pos, result, "take_profit", dry_run)
 
         # Stop-loss (-22%).
@@ -412,10 +423,13 @@ def _monitor_position(client: AlpacaClient, pos: dict, dry_run: bool = False) ->
             except Exception as e:
                 logger.error(f"[STOP] IOC limit sell failed for {occ}: {e}")
                 result = {"status": "failed", "error": str(e)}
-            # If not filled after 2s, escalate to market sell.
+            # If filled, return. place_option_order returns status + filled_avg_price
+            # but no filled_qty; for whole-contract options a 'filled' status means
+            # the full qty filled. A 'partially_filled' status leaves residual
+            # contracts, so escalate to a market sell to close the remainder.
             status = str(result.get("status", "")).lower()
-            filled_qty = float(result.get("filled_qty", 0) or 0)
-            if status in ("filled", "accepted") and filled_qty >= qty:
+            filled_avg = result.get("filled_avg_price")
+            if status == "filled" and filled_avg is not None:
                 return _finalize_exit(pos, result, "stop_loss", dry_run)
             time.sleep(STOP_ESCALATE_SECONDS)
             logger.warning(f"[STOP] IOC partial/no fill for {occ}; escalating to market sell.")
@@ -440,6 +454,10 @@ def _finalize_exit(pos: dict, result: dict, reason: str, dry_run: bool) -> dict:
             fill_price = float(pos["target_premium"])
         elif reason in ("stop_loss", "stop_loss_escalated"):
             fill_price = float(pos["stop_premium"])
+        elif reason == "time_stop":
+            # Estimate the mark at the 30-min time stop from the last known
+            # quote if available, else fall back to entry premium.
+            fill_price = float(pos.get("last_mark", pos["entry_premium"]))
         else:
             fill_price = entry_premium
 
@@ -468,8 +486,13 @@ def _finalize_exit(pos: dict, result: dict, reason: str, dry_run: bool) -> dict:
     _append_fill(record)
     logger.info(f"[EXIT] {pos['contract_symbol']} reason={reason} "
                 f"fill={fill_price} pnl={pnl_pct}%")
+    # closed=True only when the exit actually filled (or dry-run). If the exit
+    # order did not fill (e.g. take-profit limit unfilled, or emergency market
+    # sell failed), the broker still holds the position and state must NOT be
+    # cleared, or the position is orphaned.
+    closed = dry_run or (fill_price is not None)
     return {"reason": reason, "fill_price": fill_price, "pnl_pct": pnl_pct,
-            "result": result}
+            "closed": closed, "result": result}
 
 
 # ---------------------------------------------------------------------------
@@ -521,10 +544,49 @@ def _enter_position(client: AlpacaClient, session_date: str, setup: dict,
             symbol=occ, qty=contracts, side="buy", limit_price=ask)
         fill_price = result.get("filled_avg_price")
 
+        # Confirm the entry fill before tracking the position. place_option_order
+        # may return before the fill (status new/accepted) or the order may be
+        # canceled if the ask moves. Poll up to 5s for a fill; if unfilled, cancel
+        # and return None so we never monitor a phantom position.
+        order_id = result.get("id")
+        status = str(result.get("status", "")).lower()
+        filled_qty = contracts
+        if order_id and status != "filled":
+            logger.info(f"Order {order_id} status={status}; polling up to 5s for fill...")
+            for _ in range(5):
+                time.sleep(1.0)
+                try:
+                    updated = client.trading_client.get_order_by_id(order_id=order_id)
+                    status = str(getattr(updated, "status", "")).lower()
+                    if getattr(updated, "filled_avg_price", None) is not None:
+                        fill_price = float(updated.filled_avg_price)
+                    fq = getattr(updated, "filled_qty", None)
+                    if fq is not None:
+                        filled_qty = int(float(fq))
+                    if status == "filled":
+                        break
+                except Exception as poll_err:
+                    logger.warning(f"Fill poll error for {order_id}: {poll_err}")
+
+        if status not in ("filled", "partially_filled"):
+            logger.error(f"Entry order {order_id} not filled after 5s (status={status}); canceling.")
+            try:
+                if order_id:
+                    client.trading_client.cancel_order_by_id(order_id=order_id)
+            except Exception as cancel_err:
+                logger.warning(f"Cancel failed for {order_id}: {cancel_err}")
+            return None
+
+        if fill_price is None:
+            fill_price = ask
+        # Track the actually-filled qty (a partial fill leaves fewer contracts
+        # than requested; tracking the full qty would over-sell on exit).
+        contracts = filled_qty if filled_qty >= 1 else contracts
+
     pos = {
         "contract_symbol": occ,
         "entry_time": datetime.now(ET).isoformat(),
-        "entry_premium": entry_premium,
+        "entry_premium": fill_price,
         "contracts": contracts,
         "target_premium": target_premium,
         "stop_premium": stop_premium,
@@ -583,10 +645,13 @@ def run_session(session_date: str, dry_run: bool = True) -> dict:
     # 5. Monitor position until exit.
     exit_info = _monitor_position(client, pos, dry_run=dry_run)
 
-    # 6. Clear state.
-    state["active_position"] = None
-    save_state(state)
-    sync_up_to_gcs()
+    # 6. Clear state ONLY if the exit actually filled. If the exit order did not
+    #    fill (take-profit limit unfilled, emergency market sell failed), keep
+    #    the active_position so a later run re-attaches and closes it.
+    if exit_info.get("closed", True):
+        state["active_position"] = None
+        save_state(state)
+        sync_up_to_gcs()
 
     return {"status": "completed", "pm": pm, "setup": setup, "position": pos,
             "exit": exit_info}

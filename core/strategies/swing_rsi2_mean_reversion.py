@@ -172,6 +172,7 @@ def stage_orders(candidates: list[dict], open_slots: int, dry_run: bool = False)
             "size_pct": SLOT_SIZE_PCT,
             "cat_stop_atr_mult": CAT_STOP_ATR_MULT,
             "max_hold_days": MAX_HOLD_DAYS,
+            "close": c.get("close"),
         }
         staged.append(order)
         if not dry_run:
@@ -208,8 +209,15 @@ def monitor_exits(client: AlpacaClient, positions: dict, dry_run: bool = False,
         elif close_window:
             if close > sma5:
                 reason, exit_px = "sma5_touch", close
-            elif (pd.Timestamp.now(tz=ET).tz_localize(None).normalize() - pos["day0"]).days >= MAX_HOLD_DAYS:
-                reason, exit_px = "time_stop", close
+            else:
+                # day0 is stored as an ISO date string; parse it before the
+                # Timestamp subtraction to avoid a TypeError.
+                day0 = pd.Timestamp(pos["day0"]).tz_localize(None).normalize() \
+                    if isinstance(pos.get("day0"), str) else pos["day0"]
+                held_days = (pd.Timestamp.now(tz=ET).tz_localize(None).normalize()
+                             - day0).days
+                if held_days >= MAX_HOLD_DAYS:
+                    reason, exit_px = "time_stop", close
         if reason:
             exits.append({"symbol": sym, "reason": reason, "exit_px": exit_px})
             if not dry_run:

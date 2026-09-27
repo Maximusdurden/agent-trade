@@ -281,11 +281,16 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
               side: str, qty: float, filled_avg_price: float | None, status: str,
               option_type: str | None = None, option_dte: int | None = None,
               strike: float | None = None, contract_symbol: str | None = None) -> int:
-    """Logs an executed trade to the SQLite database."""
+    """Logs an executed trade to the SQLite database.
+
+    Uses INSERT OR IGNORE so re-logging the same alpaca_order_id does NOT
+    destroy the original row (which would corrupt FIFO cost-basis and lose the
+    original decision_id/timestamp).
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO trades (
+            INSERT OR IGNORE INTO trades (
                 decision_id, alpaca_order_id, timestamp, symbol, side, qty, filled_avg_price, status,
                 option_type, option_dte, strike, contract_symbol
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -304,6 +309,14 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
             contract_symbol
         ))
         conn.commit()
+        # If the row was ignored (duplicate alpaca_order_id), return the existing
+        # row's id rather than a stale lastrowid.
+        if cursor.rowcount == 0 and alpaca_order_id:
+            cursor.execute(
+                "SELECT id FROM trades WHERE alpaca_order_id = ?", (alpaca_order_id,))
+            row = cursor.fetchone()
+            if row is not None:
+                return int(row["id"])
         return get_last_insert_id(cursor)
 
 
@@ -326,6 +339,8 @@ def reconcile_broker_orders(broker_orders: list[dict]) -> int:
     """
     if not broker_orders:
         return 0
+    import re as _re
+    occ_re = _re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
     inserted = 0
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -336,20 +351,26 @@ def reconcile_broker_orders(broker_orders: list[dict]) -> int:
             if not oid or oid in existing:
                 continue
             ts = order.get("timestamp") or datetime.utcnow().isoformat()
+            symbol = str(order.get("symbol", "")).upper().replace(" ", "")
+            # Detect OCC option symbols so FIFO PnL applies the 100x multiplier.
+            option_type = None
+            if occ_re.match(symbol):
+                option_type = "CALL" if symbol[-9] == "C" else "PUT"
             cursor.execute("""
                 INSERT INTO trades (
                     decision_id, alpaca_order_id, timestamp, symbol, side, qty,
-                    filled_avg_price, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    filled_avg_price, status, option_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 None,
                 oid,
                 ts,
-                str(order.get("symbol", "")).upper(),
+                symbol,
                 str(order.get("side", "")).lower(),
                 float(order.get("qty", 0.0) or 0.0),
                 float(order.get("filled_avg_price")) if order.get("filled_avg_price") is not None else None,
                 str(order.get("status", "filled")).lower(),
+                option_type,
             ))
             existing.add(oid)
             inserted += 1
@@ -441,7 +462,10 @@ def get_recent_decisions_since(hours: float = 5.0, limit: int = 500) -> list[dic
     the most recent N rows, which can be dominated by one ticker's cycle.
     """
     from datetime import datetime, timedelta, timezone
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    # Stored timestamps are naive UTC (datetime.utcnow().isoformat()), so the
+    # cutoff must also be naive UTC — a +00:00 suffix would sort after the
+    # stored strings and skew the window.
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(tzinfo=None).isoformat()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -706,32 +730,35 @@ def get_performance_summary() -> dict:
             side = t["side"].lower()
             qty = float(t["qty"])
             price = float(t["filled_avg_price"]) if t["filled_avg_price"] else 0.0
-            
+            # Option contracts settle at 100x the premium per contract.
+            multiplier = 100.0 if t.get("option_type") else 1.0
+
             if side == "buy":
-                buy_queues[symbol].append({"qty": qty, "price": price})
+                buy_queues[symbol].append({"qty": qty, "price": price, "mult": multiplier})
             elif side == "sell":
                 temp_qty = qty
                 trade_realized_pnl = 0.0
                 matched_any = False
-                
+
                 while temp_qty > 0 and buy_queues[symbol]:
                     oldest_buy = buy_queues[symbol][0]
                     buy_qty = oldest_buy["qty"]
                     buy_price = oldest_buy["price"]
-                    
+                    mult = oldest_buy.get("mult", 1.0)
+
                     if buy_qty <= temp_qty:
-                        realized = buy_qty * (price - buy_price)
+                        realized = buy_qty * mult * (price - buy_price)
                         trade_realized_pnl += realized
                         temp_qty -= buy_qty
                         buy_queues[symbol].pop(0)
                         matched_any = True
                     else:
-                        realized = temp_qty * (price - buy_price)
+                        realized = temp_qty * mult * (price - buy_price)
                         trade_realized_pnl += realized
                         oldest_buy["qty"] -= temp_qty
                         temp_qty = 0
                         matched_any = True
-                
+
                 if matched_any:
                     total_trades_count += 1
                     total_realized_pnl += trade_realized_pnl

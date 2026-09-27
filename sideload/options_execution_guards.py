@@ -144,9 +144,12 @@ def route_stop_exit(client: AlpacaClient, occ_symbol: str, qty: int,
         result = {"status": "failed", "error": str(e)}
 
     # 2. Check for partial fill / no fill; escalate to market after 2s.
+    #    place_option_order returns status + filled_avg_price but no filled_qty.
+    #    For whole-contract options, only a full 'filled' status means the full
+    #    qty filled; 'partially_filled' leaves residual contracts to close.
     status = str(result.get("status", "")).lower()
-    filled_qty = float(result.get("filled_qty", 0) or 0)
-    if status in ("filled", "accepted") and filled_qty >= qty:
+    filled_avg = result.get("filled_avg_price")
+    if status == "filled" and filled_avg is not None:
         return {"status": "filled_ioc", "occ": occ_symbol, "result": result}
 
     # Escalate: wait up to 2s, then market sell.

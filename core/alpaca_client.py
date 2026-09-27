@@ -1,6 +1,6 @@
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 # Try importing alpaca-py clients. If not installed or fails, we provide a warning.
@@ -642,7 +642,9 @@ class AlpacaClient:
             pd.DataFrame of concatenated bars (deduplicated, sorted by time).
         """
         tf, _ = self._get_timeframe(timeframe_str)
-        end = datetime.now()
+        # Use timezone-aware UTC so Alpaca interprets the window correctly
+        # (a naive local datetime can be read as UTC and cut off recent bars).
+        end = datetime.now(timezone.utc)
         start = end - timedelta(days=days_back)
         # Route crypto symbols (e.g. SOL/USD) to the crypto client; stocks to
         # the stock client. Crypto symbols contain '/' or end in a quote.
