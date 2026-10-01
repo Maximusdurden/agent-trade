@@ -38,6 +38,29 @@ from sideload import config_sideload_flatbase as fb_cfg
 
 logger = logging.getLogger("FlatBaseState")
 
+
+def load_daily(client, symbol: str, days_back: int):
+    """Fetch daily bars + indicators for a symbol (used by reconcile)."""
+    try:
+        from sideload.runner_flat_base import load_daily as _ld
+        return _ld(client, symbol, days_back)
+    except Exception:
+        try:
+            df = client.get_historical_bars(symbol, limit=days_back, timeframe_str="day")
+            if df is None or df.empty:
+                return None
+            if hasattr(df, "index") and isinstance(df.index, type(df.index)):
+                df = df.copy()
+            # Add ATR14 if missing.
+            if "atr" not in df.columns:
+                from sideload.backtest_swing_mean_reversion import add_indicators
+                from sideload.backtest_swing_mean_reversion import BASELINE_CFG
+                df = add_indicators(df, dict(BASELINE_CFG))
+            return df
+        except Exception as e:
+            logger.warning(f"[Reconcile] load_daily failed for {symbol}: {e}")
+            return None
+
 ET = ZoneInfo("America/New_York")
 
 # Local state file path (sideload/data/flatbase_positions.json).
@@ -196,3 +219,85 @@ def prune_30d_pnl() -> None:
     state = load_state()
     state["realized_pnl_30d"] = 0.0
     save_state(state)
+
+
+def reconcile_with_broker(client, entry_ref_price: dict | None = None) -> list[str]:
+    """Adopt broker positions that are missing from local flat-base state.
+
+    Cloud Run containers are ephemeral and the state file is only persisted to
+    GCS at shutdown. If a container dies between the order fill and the state
+    write (or the state write silently fails), the broker holds a position that
+    the monitor does not know about — an ORPHAN. This function finds those
+    orphans and adopts them into the state machine so the monitor can manage
+    their exits (stops / scaling / time stop).
+
+    For each broker position NOT already in ``active_positions``:
+      - entry_price  = broker avg_entry_price (authoritative)
+      - stop_loss    = entry - 1.5 * ATR14 (computed from daily bars)
+      - target_3r/5r = entry + 3R / +5R where R = entry - stop
+      - initial/remaining shares = broker qty
+
+    Returns the list of adopted symbols.
+    """
+    try:
+        positions = client.get_positions()
+    except Exception as e:
+        logger.warning(f"[Reconcile] Could not fetch broker positions: {e}")
+        return []
+
+    state = load_state()
+    adopted = []
+    for symbol, pos in positions.items():
+        # Only adopt equity positions (skip options / crypto).
+        if "/" in symbol or getattr(pos, "is_option", False) or pos.get("is_option"):
+            continue
+        if symbol in state["active_positions"]:
+            continue
+        qty = float(pos.get("qty", 0.0) or 0.0)
+        if qty <= 0:
+            continue
+        entry = float(pos.get("avg_entry_price", 0.0) or 0.0)
+        if entry <= 0:
+            continue
+
+        # Compute ATR14 for the stop distance.
+        atr = None
+        try:
+            df = load_daily(client, symbol, fb_cfg.LOOKBACK_BARS)
+            if df is not None and not df.empty and "atr" in df.columns:
+                atr = float(df["atr"].iloc[-1])
+        except Exception as e:
+            logger.warning(f"[Reconcile] ATR fetch failed for {symbol}: {e}")
+
+        if atr is None or atr <= 0:
+            # Fall back to a 6% stop if ATR is unavailable.
+            atr = entry * 0.06
+        stop = entry - fb_cfg.ATR_STOP_MULT * atr
+        r = entry - stop
+        if r <= 0:
+            logger.warning(f"[Reconcile] {symbol}: invalid R ({r:.2f}); skipping adoption.")
+            continue
+
+        pos_rec = {
+            "cluster_id": f"FB-{symbol}-{datetime.now(ET).strftime('%Y%m%d')}-ADOPT",
+            "entry_date": datetime.now(ET).strftime("%Y-%m-%d"),
+            "bars_held": 0,
+            "entry_price": entry,
+            "initial_shares": qty,
+            "remaining_shares": qty,
+            "stop_loss": stop,
+            "target_3r": entry + fb_cfg.TP1_R * r,
+            "target_5r": entry + fb_cfg.TP2_R * r,
+            "breakeven_active": False,
+            "scale_1_filled": False,
+            "scale_2_filled": False,
+            "adopted": True,
+        }
+        state["active_positions"][symbol] = pos_rec
+        adopted.append(symbol)
+        logger.warning(f"[Reconcile] ADOPTED orphaned broker position {symbol}: "
+                       f"qty={qty:.2f} entry={entry:.2f} stop={stop:.2f}")
+
+    if adopted:
+        save_state(state)
+    return adopted

@@ -64,7 +64,12 @@ SECTOR_BY_SYMBOL = dict(UNIVERSE)
 MAX_SLOTS = 3
 SLOT_SIZE_PCT = 0.33
 SLIPPAGE = 0.05
-RSI_BUY_BELOW = 10.0
+# RSI_2 buy threshold. Default 10 (validated Connors RSI-2). Can be raised via
+# SWING_RSI_BUY_BELOW to generate more signals in trending regimes (analysis
+# 2026-09-30: RSI<10 fires 0-8x/yr per symbol; RSI<12-15 fires 2-3x more with
+# similar win rates). Kept conservative at 12 to add action without degrading
+# the edge.
+RSI_BUY_BELOW = float(os.environ.get("SWING_RSI_BUY_BELOW", "12"))
 CAT_STOP_ATR_MULT = 2.0
 MAX_HOLD_DAYS = 5
 LOOKBACK_DAYS = 365 * 8

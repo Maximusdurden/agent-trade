@@ -256,6 +256,98 @@ def _market_research(date_str: str, tickers) -> str:
         return "Market context available for the day."
 
 
+def _strategy_status_summary(db_path: str, target_date: str) -> str:
+    """Build a factual per-strategy status summary for quiet days.
+
+    Reads the shared DB (decisions + trades) to describe what each lane did
+    today: swing RSI-2, flat-base breakout, options Model A. Returns a plain
+    text block the LLM can turn into Dexter's voice. Never blocks publishing.
+    """
+    import sqlite3 as _sq
+    lines = []
+    try:
+        conn = _sq.connect(db_path)
+        conn.row_factory = _sq.Row
+        day_start = f"{target_date}T00:00:00"
+        day_end = f"{target_date}T23:59:59"
+
+        # --- Swing RSI-2 lane ---
+        swing_rows = conn.execute("""
+            SELECT proposed_symbol, proposed_action, is_approved, rejection_reason
+            FROM decisions
+            WHERE cycle_id LIKE 'swing_rsi2%' AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp DESC LIMIT 10
+        """, (day_start, day_end)).fetchall()
+        swing_buys = [r for r in swing_rows if r["proposed_action"] == "BUY" and r["is_approved"]]
+        swing_cands = [r for r in swing_rows if r["proposed_action"] == "BUY" and not r["is_approved"]]
+        if swing_buys:
+            syms = ", ".join(sorted({r["proposed_symbol"] for r in swing_buys}))
+            lines.append(f"Swing RSI-2: staged buys in {syms} (mean-reversion buys on oversold dips).")
+        elif swing_cands:
+            syms = ", ".join(sorted({r["proposed_symbol"] for r in swing_cands}))
+            lines.append(f"Swing RSI-2: scanned {len(swing_cands)} candidate(s) ({syms}) but none "
+                         f"qualified for a fill — the strategy only buys when a stock is deeply "
+                         f"oversold (RSI-2 < threshold) inside an uptrend, which is rare in a "
+                         f"strong tape.")
+        else:
+            lines.append("Swing RSI-2: no oversold setups today — the strategy waits for deep "
+                         "dips (RSI-2 < threshold) in uptrending names, and the market didn't "
+                         "give us any.")
+
+        # --- Flat-base lane ---
+        fb_rows = conn.execute("""
+            SELECT proposed_symbol, proposed_action, is_approved, rejection_reason
+            FROM decisions
+            WHERE cycle_id LIKE 'sideload_flatbase%' AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp DESC LIMIT 10
+        """, (day_start, day_end)).fetchall()
+        fb_buys = [r for r in fb_rows if r["proposed_action"] == "BUY" and r["is_approved"]]
+        fb_cands = [r for r in fb_rows if r["proposed_action"] == "BUY" and not r["is_approved"]]
+        if fb_buys:
+            syms = ", ".join(sorted({r["proposed_symbol"] for r in fb_buys}))
+            lines.append(f"Flat-base breakout: bought {syms} (Stage 2 base breakout with volume).")
+        elif fb_cands:
+            syms = ", ".join(sorted({r["proposed_symbol"] for r in fb_cands}))
+            lines.append(f"Flat-base breakout: watched {syms} but no clean Stage 2 breakout "
+                         f"confirmed — the pattern needs a tight base + volume surge, and "
+                         f"today's tape didn't print one.")
+        else:
+            lines.append("Flat-base breakout: no Stage 2 breakouts today — the strategy hunts "
+                         "tight bases breaking out on volume, and nothing qualified.")
+
+        # --- Options Model A lane ---
+        opt_rows = conn.execute("""
+            SELECT proposed_symbol, proposed_action, is_approved, rejection_reason
+            FROM decisions
+            WHERE (cycle_id LIKE 'options%' OR cycle_id LIKE 'sideload_options%')
+              AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp DESC LIMIT 10
+        """, (day_start, day_end)).fetchall()
+        opt_buys = [r for r in opt_rows if r["proposed_action"] == "BUY" and r["is_approved"]]
+        opt_cands = [r for r in opt_rows if r["proposed_action"] == "BUY" and not r["is_approved"]]
+        if opt_buys:
+            syms = ", ".join(sorted({r["proposed_symbol"] for r in opt_buys}))
+            lines.append(f"Options Model A: entered {syms} (pre-market range + sweep setup).")
+        elif opt_cands:
+            syms = ", ".join(sorted({r["proposed_symbol"] for r in opt_cands}))
+            lines.append(f"Options Model A: watched {syms} but the pre-market range gate or "
+                         f"sweep setup didn't confirm — it needs a wide pre-market range and a "
+                         f"liquidity sweep through the PM high/low.")
+        else:
+            lines.append("Options Model A: no setups today — the strategy needs a wide "
+                         "pre-market range and a sweep through the PM high/low within the "
+                         "first 45 minutes; today's pre-market was too quiet.")
+
+        conn.close()
+    except Exception as e:
+        logger.warning("strategy status summary failed: %s", e)
+        return ""
+
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
 def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
                        update_post_id: int | None = None) -> int:
     """Grade + build the post (intro, blurbs, card, calendar) + publish.
@@ -422,8 +514,30 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
                 {chart_html}
             </div>"""
     else:
-        html_body += ("<p style='color:#8d6e63;'>No round-trips closed today. "
-                      "The tape was quiet — more tomorrow.</p>")
+        # Quiet day: generate a per-strategy discussion so the post is not just
+        # "the tape was quiet". The LLM turns the factual status into Dexter's
+        # voice (high-level, fun, no dry technical detail).
+        strategy_summary = _strategy_status_summary(db_path, target_date)
+        if strategy_summary:
+            quiet_task = (
+                "SPECIAL INSTRUCTIONS / DAILY NOTES:\n"
+                "No round-trips closed today. Instead of a generic 'quiet day' line, "
+                "discuss EACH of our three strategies at a high level and why we did or "
+                "didn't buy anything for each one today. Keep it fun, conversational, "
+                "and high-level — no dry technical jargon. Elaborate a bit (3-6 sentences "
+                "total across all strategies) but stay in the persona's voice.\n\n"
+                f"STRATEGY STATUS:\n{strategy_summary}"
+            )
+            quiet_intro = create_intro_content(target_date, total_pnl, news,
+                                               "No new buys.", tickers,
+                                               daily_notes=quiet_task)
+            quiet_body = quiet_intro["body"]
+            quiet_body = verify_pnl_in_body(quiet_body, total_pnl, target_date)
+            html_body += (f"<p style='color:#5d4037; line-height:1.7; font-size:17px;'>"
+                          f"{quiet_body}</p>")
+        else:
+            html_body += ("<p style='color:#8d6e63;'>No round-trips closed today. "
+                          "The tape was quiet — more tomorrow.</p>")
 
     html_body += (f"<p style='text-align:center;'><a href='{config.WP_URL}/trading-performance/' "
                   "style='color:#2271b1; font-weight:bold;'>[CALENDAR] View Performance</a></p>")

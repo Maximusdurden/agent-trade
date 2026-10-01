@@ -82,7 +82,11 @@ BASE_TIGHTNESS = _env_float("FLATBASE_BASE_TIGHTNESS", 0.20)
 BASE_SMA = _env_int("FLATBASE_BASE_SMA", 50)
 
 # Execution trigger
-BREAKOUT_RVOL = _env_float("FLATBASE_BREAKOUT_RVOL", 1.5)
+# RVOL threshold for breakout volume confirmation. Default 1.5 (validated).
+# Lowered to 1.2 via FLATBASE_BREAKOUT_RVOL to generate ~2x more signals in
+# trending regimes (analysis 2026-09-30: rvol1.5 fires 0-14x/yr per symbol,
+# rvol1.2 fires 2-20x with similar setup quality).
+BREAKOUT_RVOL = _env_float("FLATBASE_BREAKOUT_RVOL", 1.2)
 MACRO_SMA = _env_int("FLATBASE_MACRO_SMA", 20)
 MACRO_SYMBOL = os.getenv("FLATBASE_MACRO_SYMBOL", "QQQ")
 

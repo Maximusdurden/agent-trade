@@ -296,6 +296,54 @@ def _ensure_cat_stop(client, pos: dict) -> float | None:
     return entry_fill - CAT_STOP_ATR_MULT * atr
 
 
+def _log_decision_to_db(symbol: str, action: str, qty: float, approved: bool,
+                        rejection_reason: str | None = None, cycle_id: str | None = None,
+                        reasoning: str | None = None) -> int | None:
+    """Log a swing decision to the shared DB (blog/dashboard visibility)."""
+    try:
+        from core import database
+        account = None
+        try:
+            acct = AlpacaClient().get_account_state()
+            account = {"equity": acct.get("equity"), "cash": acct.get("cash")}
+        except Exception:
+            account = None
+        decision_id = database.log_decision(
+            ticker_indicators={},
+            portfolio_state=account or {},
+            thought_process=reasoning or f"Swing RSI-2 {action.lower()} for {symbol}",
+            proposed_action=action,
+            proposed_symbol=symbol,
+            proposed_qty=qty,
+            is_approved=approved,
+            rejection_reason=rejection_reason,
+            direction="long",
+            conviction=0.7 if approved else 0.0,
+            instrument="stock",
+            cycle_id=cycle_id or f"swing_rsi2-{_now_et().strftime('%Y%m%d-%H%M%S')}",
+            reasoning=reasoning,
+            model="swing_rsi2_rule",
+            entry_gate="rsi2_oversold",
+        )
+        return decision_id
+    except Exception as e:
+        logger.warning(f"[DB] log_decision failed for {symbol}: {e}")
+        return None
+
+
+def _log_trade_to_db(decision_id: int | None, order_id: str, symbol: str, side: str,
+                     qty: float, fill_price: float | None, status: str) -> None:
+    """Log a swing fill to the shared DB trades table."""
+    try:
+        from core import database
+        database.log_trade(
+            decision_id=decision_id, alpaca_order_id=order_id, symbol=symbol,
+            side=side, qty=qty, filled_avg_price=fill_price, status=status,
+        )
+    except Exception as e:
+        logger.warning(f"[DB] log_trade failed for {symbol}: {e}")
+
+
 def run_eod_scan(dry_run: bool = False) -> dict:
     """EOD 4:05 PM signal scan + stage MOO orders for open slots."""
     from core.strategies.swing_rsi2_mean_reversion import (
@@ -309,6 +357,16 @@ def run_eod_scan(dry_run: bool = False) -> dict:
     open_slots = max(0, MAX_SLOTS - len(positions))
     logger.info(f"EOD scan: {len(candidates)} candidates, {len(positions)} open, "
                 f"{open_slots} slots available")
+
+    # Log every candidate to the DB so the blog can discuss the swing lane even
+    # on days with no fills.
+    for c in candidates:
+        _log_decision_to_db(
+            c["symbol"], "BUY", 0.0, False,
+            rejection_reason="candidate only (EOD scan)",
+            reasoning=f"Swing RSI-2 candidate: rsi={c['rsi']:.1f} stretch={c['stretch']:.2f} "
+                      f"close={c['close']:.2f}",
+        )
 
     if open_slots <= 0:
         logger.info("No open slots; skipping staging.")
@@ -343,8 +401,18 @@ def run_eod_scan(dry_run: bool = False) -> dict:
                     "cat_stop": None,  # filled at open, computed in monitor
                     "day0": _now_et().date().isoformat(),
                 }
+                _log_decision_to_db(
+                    s["symbol"], "BUY", qty, True,
+                    cycle_id=f"swing_rsi2-{_now_et().strftime('%Y%m%d-%H%M%S')}",
+                    reasoning=f"Swing RSI-2 staged MOO: rsi={s['rsi']:.1f} qty={qty}",
+                )
             else:
                 logger.warning(f"[STAGE] Order for {s['symbol']} not accepted; not recording position.")
+                _log_decision_to_db(
+                    s["symbol"], "BUY", qty, False,
+                    rejection_reason=f"Order not accepted (status={res.get('status')})",
+                    reasoning="Swing RSI-2 MOO order rejected",
+                )
         _save_positions(positions)
     return {"candidates": len(candidates), "staged": len(staged), "open_slots": open_slots}
 
@@ -450,6 +518,8 @@ def run_monitor(dry_run: bool = False) -> dict:
                 # Log the ACTUAL fill price vs the theoretical trigger price.
                 fill_px = res.get("filled_avg_price") or e["exit_px"]
                 _log_fill(sym, fill_px, e["exit_px"], side="sell")
+                _log_trade_to_db(None, res.get("order_id"), sym, "sell",
+                                 qty, fill_px, "filled")
             else:
                 logger.warning(f"[SELL] Order for {sym} not accepted; keeping position.")
         _save_positions(positions)
@@ -507,6 +577,15 @@ def main() -> None:
         # Persist the swing state back to GCS so the next ephemeral run can
         # pick up where this one left off.
         _sync_up_to_gcs()
+        # Upload the DB to GCS so the blog/dashboard stay fresh even though the
+        # main agent-trade lane is paused. The merge logic in upload_to_gcs()
+        # preserves rows from other lanes.
+        if not args.dry_run:
+            try:
+                from core.gcs_sync import upload_to_gcs
+                upload_to_gcs()
+            except Exception as up_err:
+                logger.warning(f"[GCS] DB upload failed: {up_err}")
 
 
 if __name__ == "__main__":

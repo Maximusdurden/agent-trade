@@ -80,7 +80,12 @@ STOP_PCT = 0.22        # -22% stop-loss.
 MAX_HOLD_MINUTES = 30  # Time stop.
 
 # Pre-market volatility gate.
-PM_VOL_MIN = 0.0035
+# Default 0.0035 (0.35%). Lowered to 0.0020 (0.20%) via OPTIONS_PM_VOL_MIN to
+# generate more action in quiet pre-markets (analysis 2026-09-30: META hit
+# 0.34% on 9/30 and was disarmed at 0.35%; TSLA 0.18% on 9/29). The Model A
+# sweep setup still requires a PMH/PML sweep + VWAP confirmation, so lowering
+# the gate only admits more candidates — it does not force entries.
+PM_VOL_MIN = float(os.environ.get("OPTIONS_PM_VOL_MIN", "0.0020"))
 
 # Model A setup window.
 MODEL_A_START = dtime(9, 30, 0)

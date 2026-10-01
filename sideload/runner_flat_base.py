@@ -275,6 +275,56 @@ def _sell(client: AlpacaClient, symbol: str, qty: float) -> dict:
                 "order_id": None, "filled_avg_price": None, "error": str(e)}
 
 
+def _log_decision_to_db(symbol: str, action: str, qty: float, approved: bool,
+                        rejection_reason: str | None = None, cycle_id: str | None = None,
+                        reasoning: str | None = None) -> int | None:
+    """Log a flat-base decision to the shared DB (blog/dashboard visibility)."""
+    try:
+        from core import database
+        from core import config as core_cfg
+        account = None
+        try:
+            from core.alpaca_client import AlpacaClient
+            acct = AlpacaClient().get_account_state()
+            account = {"equity": acct.get("equity"), "cash": acct.get("cash")}
+        except Exception:
+            account = None
+        decision_id = database.log_decision(
+            ticker_indicators={},
+            portfolio_state=account or {},
+            thought_process=reasoning or f"Flat-base {action.lower()} for {symbol}",
+            proposed_action=action,
+            proposed_symbol=symbol,
+            proposed_qty=qty,
+            is_approved=approved,
+            rejection_reason=rejection_reason,
+            direction="long",
+            conviction=0.7 if approved else 0.0,
+            instrument="stock",
+            cycle_id=cycle_id or f"{fb_cfg.FLATBASE_CYCLE_PREFIX}-{_now_et().strftime('%Y%m%d-%H%M%S')}",
+            reasoning=reasoning,
+            model="flatbase_rule",
+            entry_gate="flatbase_breakout",
+        )
+        return decision_id
+    except Exception as e:
+        logger.warning(f"[DB] log_decision failed for {symbol}: {e}")
+        return None
+
+
+def _log_trade_to_db(decision_id: int | None, order_id: str, symbol: str, side: str,
+                     qty: float, fill_price: float | None, status: str) -> None:
+    """Log a flat-base fill to the shared DB trades table."""
+    try:
+        from core import database
+        database.log_trade(
+            decision_id=decision_id, alpaca_order_id=order_id, symbol=symbol,
+            side=side, qty=qty, filled_avg_price=fill_price, status=status,
+        )
+    except Exception as e:
+        logger.warning(f"[DB] log_trade failed for {symbol}: {e}")
+
+
 def run_scan(client: AlpacaClient, dry_run: bool = False) -> None:
     """Scan the universe for flat base breakouts and stage MOC orders."""
     cfg = _build_cfg()
@@ -326,9 +376,23 @@ def run_scan(client: AlpacaClient, dry_run: bool = False) -> None:
             )
             # Log the entry fill (empirical fill price vs entry_ref proxy).
             _log_fill(pos["cluster_id"], symbol, "buy", qty, fill_px, setup["entry_ref"])
+            # Log to the shared DB so the blog/dashboard see the trade.
+            decision_id = _log_decision_to_db(
+                symbol, "BUY", qty, True,
+                cycle_id=pos["cluster_id"],
+                reasoning=f"Flat-base breakout: entry_ref={setup['entry_ref']:.2f} "
+                          f"stop={setup['stop']:.2f} R={setup['r']:.2f}",
+            )
+            _log_trade_to_db(decision_id, result.get("order_id"), symbol, "buy",
+                             qty, fill_px, "filled")
         else:
             logger.warning(f"[Scan] {symbol} MOC order not fully filled (status={status}); "
                            f"not opening position.")
+            _log_decision_to_db(
+                symbol, "BUY", qty, False,
+                rejection_reason=f"Order not fully filled (status={status})",
+                reasoning=f"Flat-base breakout candidate but order not filled",
+            )
     logger.info(f"[Scan] Staged {len(staged)} candidates.")
 
 
@@ -380,6 +444,8 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                                              remaining_shares=remaining - qty)
                     remaining -= qty
                     logger.info(f"[Monitor] {symbol}: Scale 1 filled @ +3R")
+                    _log_trade_to_db(None, res.get("order_id"), symbol, "sell",
+                                     qty, fill_px, "filled")
                 else:
                     logger.warning(f"[Monitor] {symbol}: scale-1 sell not fully filled (status={status}); "
                                    f"state unchanged.")
@@ -401,6 +467,8 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                                              remaining_shares=remaining - qty)
                     remaining -= qty
                     logger.info(f"[Monitor] {symbol}: Scale 2 filled @ +5R")
+                    _log_trade_to_db(None, res.get("order_id"), symbol, "sell",
+                                     qty, fill_px, "filled")
                 else:
                     logger.warning(f"[Monitor] {symbol}: scale-2 sell not fully filled (status={status}); "
                                    f"state unchanged.")
@@ -421,6 +489,8 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                     pnl = (fill_px - entry) * qty
                     fb_state.close_position(symbol, pnl)
                     logger.info(f"[Monitor] {symbol}: trail exit (Close<SMA20)")
+                    _log_trade_to_db(None, res.get("order_id"), symbol, "sell",
+                                     qty, fill_px, "filled")
                 else:
                     logger.warning(f"[Monitor] {symbol}: trail sell not fully filled (status={status}); "
                                    f"position kept.")
@@ -439,6 +509,8 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                     pnl = (fill_px - entry) * qty
                     fb_state.close_position(symbol, pnl)
                     logger.info(f"[Monitor] {symbol}: time stop (held {pos['bars_held']}d)")
+                    _log_trade_to_db(None, res.get("order_id"), symbol, "sell",
+                                     qty, fill_px, "filled")
                 else:
                     logger.warning(f"[Monitor] {symbol}: time-stop sell not fully filled (status={status}); "
                                    f"position kept.")
@@ -489,6 +561,18 @@ def main() -> None:
         fb_state.sync_down_from_gcs()
         _sync_fills_from_gcs()
 
+        # RECONCILE: adopt any broker positions missing from local state
+        # (orphan recovery — e.g. the 9/28 MSFT buy whose state write was lost).
+        # Runs on every cycle so a position adopted mid-day is managed from
+        # that point on (stops / scaling / time stop).
+        if not args.dry_run:
+            try:
+                adopted = fb_state.reconcile_with_broker(client)
+                if adopted:
+                    logger.warning(f"[Reconcile] Adopted orphaned position(s): {adopted}")
+            except Exception as rec_err:
+                logger.warning(f"[Reconcile] Failed: {rec_err}")
+
         if args.scan:
             run_scan(client, dry_run=args.dry_run)
         elif args.monitor:
@@ -499,6 +583,16 @@ def main() -> None:
         # Push state + fills to GCS at shutdown.
         fb_state.sync_up_to_gcs()
         _sync_fills_to_gcs()
+
+        # Upload the DB to GCS so the blog/dashboard stay fresh even though the
+        # main agent-trade lane is paused. The merge logic in upload_to_gcs()
+        # preserves rows from other lanes.
+        if not args.dry_run:
+            try:
+                from core.gcs_sync import upload_to_gcs
+                upload_to_gcs()
+            except Exception as up_err:
+                logger.warning(f"[GCS] DB upload failed: {up_err}")
 
         if not args.no_discord and not args.dry_run:
             try:
