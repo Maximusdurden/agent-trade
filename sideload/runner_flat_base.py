@@ -561,6 +561,17 @@ def main() -> None:
         fb_state.sync_down_from_gcs()
         _sync_fills_from_gcs()
 
+        # Pull the shared DB from GCS so this lane's decisions/trades merge into
+        # the freshest snapshot (and so upload_to_gcs() has a local DB to work
+        # with). The merge logic in upload_to_gcs() preserves rows from other
+        # lanes, so this is safe even when the main lane is paused.
+        if not args.dry_run:
+            try:
+                from core.gcs_sync import download_from_gcs
+                download_from_gcs()
+            except Exception as dl_err:
+                logger.warning(f"[GCS] DB download failed: {dl_err}")
+
         # RECONCILE: adopt any broker positions missing from local state
         # (orphan recovery — e.g. the 9/28 MSFT buy whose state write was lost).
         # Runs on every cycle so a position adopted mid-day is managed from

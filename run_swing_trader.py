@@ -560,6 +560,17 @@ def main() -> None:
     # GCS at startup so this run starts from the last-known positions/fills.
     _sync_down_from_gcs()
 
+    # Pull the shared DB from GCS so this lane's decisions/trades merge into
+    # the freshest snapshot (and so upload_to_gcs() has a local DB to work
+    # with). The merge logic in upload_to_gcs() preserves rows from other
+    # lanes, so this is safe even when the main lane is paused.
+    if not args.dry_run:
+        try:
+            from core.gcs_sync import download_from_gcs
+            download_from_gcs()
+        except Exception as dl_err:
+            logger.warning(f"[GCS] DB download failed: {dl_err}")
+
     try:
         if args.scan:
             r = run_eod_scan(dry_run=args.dry_run)
