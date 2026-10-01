@@ -228,7 +228,10 @@ def main() -> int:
         except Exception as e:
             logger.warning(f"Discord send failed: {e}")
 
-    return 1 if issues else 0
+    # Always exit 0: this is a monitoring job — the Discord alert IS the
+    # notification. Exit 1 would trigger Cloud Run retries (maxRetries) and
+    # spam duplicate alerts.
+    return 0
 
 
 if __name__ == "__main__":
