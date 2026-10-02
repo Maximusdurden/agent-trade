@@ -8,11 +8,16 @@
 # Pre-requisites: .env with GOOGLE_CLOUD_PROJECT, GCS_BUCKET_NAME, and (for
 # error->Jira logging) JIRA_* credentials.
 #
-# Deploys ONE job (run_swing_trader.py) with THREE schedulers per the production
+# Deploys ONE job (run_swing_trader.py) with FOUR schedulers per the production
 # cadence:
 #   - swing-eod-scheduler   : 4:05 PM ET Mon-Fri  -> run_swing_trader.py --scan
+#   - swing-opg-staging-scheduler : 7:05 PM ET Mon-Fri -> --scan (OPG window)
 #   - swing-open-scheduler  : 9:35 AM ET Mon-Fri  -> run_swing_trader.py --monitor
 #   - swing-intraday-scheduler : every 15 min 9-16 ET Mon-Fri -> --monitor
+#
+# NOTE: Alpaca rejects OPG orders between 9:28 AM and 7:00 PM ET (code
+# 40310000), so the 4:05 PM scan only logs candidates and the 7:05 PM run does
+# the actual staging.
 #
 # NOTE: All schedulers pin --time-zone="America/New_York" so the execution
 # window stays on US market hours year-round with NO DST drift. Schedules are
@@ -200,9 +205,17 @@ function Register-Scheduler {
 # Production cadence, pinned to America/New_York so the window stays on US
 # market hours year-round (no DST drift). Schedules are ET-local. The job runs
 # in --auto mode: it self-selects scan (4:05 PM ET) vs monitor (all other times).
-# EOD signal scan: 4:05 PM ET Mon-Fri.
+# EOD signal scan: 4:05 PM ET Mon-Fri. This run only scans and logs candidates;
+# it defers order staging because Alpaca rejects OPG orders between 9:28 AM and
+# 7:00 PM ET.
 Register-Scheduler -SchedulerName "swing-eod-scheduler" -JobName $JobName `
     -Schedule "5 16 * * 1-5" -TimeZone "America/New_York"
+
+# OPG staging: 7:05 PM ET Mon-Fri. Alpaca accepts OPG orders from 7:00 PM ET;
+# this run re-scans and submits the market-on-open orders for the next opening
+# auction. Without it the 4:05 PM scan would always be rejected (code 40310000).
+Register-Scheduler -SchedulerName "swing-opg-staging-scheduler" -JobName $JobName `
+    -Schedule "5 19 * * 1-5" -TimeZone "America/New_York"
 
 # Opening monitor: 9:35 AM ET Mon-Fri.
 Register-Scheduler -SchedulerName "swing-open-scheduler" -JobName $JobName `
@@ -235,6 +248,7 @@ Register-Scheduler -SchedulerName "swing-fill-audit-scheduler" -JobName $AuditJo
 
 Write-Host "`nDone: swing jobs deployed."
 Write-Host "  EOD scan   : swing-eod-scheduler       (4:05 PM ET Mon-Fri)"
+Write-Host "  OPG staging: swing-opg-staging-scheduler (7:05 PM ET Mon-Fri)"
 Write-Host "  Open check : swing-open-scheduler      (9:35 AM ET Mon-Fri)"
 Write-Host "  Intraday   : swing-intraday-scheduler  (every 15 min 9-16 ET Mon-Fri)"
 Write-Host "  Fill audit : swing-fill-audit-scheduler (Fri 4:30 PM ET)"

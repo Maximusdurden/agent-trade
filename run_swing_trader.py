@@ -4,9 +4,11 @@
 Wires the validated swing strategy into the operational pipeline. A single
 Cloud Scheduler trigger (every 15 min Mon-Fri) starts this job, which:
 
-  - 4:05 PM ET (EOD): runs the daily signal scan across the refined universe,
-    computes available cash slots (3 - open positions), and stages
-    Market-On-Open orders for the top open slots.
+  - 4:05 PM ET (EOD): runs the daily signal scan across the refined universe and
+    logs candidates. Order staging is DEFERRED here because Alpaca rejects OPG
+    orders between 9:28 AM and 7:00 PM ET.
+  - 7:05 PM ET (OPG staging): re-scans and stages Market-On-Open orders for the
+    top open slots, inside Alpaca's 7:00 PM - 9:28 AM ET OPG window.
   - 9:35 AM - 3:55 PM ET (intraday): monitors open positions for exits
     (Close > SMA5, Catastrophic Stop at Entry - 2.0*ATR14, or Day-5 Time Exit).
   - Logs every fill price vs prior-day close and open print to validate the
@@ -26,7 +28,7 @@ import logging
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = __file__.rsplit("\\", 2)[0] if "\\" in __file__ else __file__.rsplit("/", 2)[0]
@@ -127,6 +129,33 @@ def _is_equity_market_hours() -> tuple[bool, str]:
     return True, "Market open."
 
 
+# Alpaca's OPG (market-on-open) submission window, in ET. Orders submitted after
+# 9:28 AM but before 7:00 PM ET are REJECTED with code 40310000; orders
+# submitted after 7:00 PM ET are queued for the next opening auction.
+OPG_WINDOW_START_HOUR = 19   # 7:00 PM ET
+OPG_WINDOW_END_HOUR = 9      # 9:28 AM ET
+OPG_WINDOW_END_MINUTE = 28
+
+
+def _opg_window_state(now: datetime | None = None) -> tuple[bool, str]:
+    """Return ``(is_open, reason)`` for Alpaca's OPG submission window.
+
+    Alpaca accepts OPG orders only between 7:00 PM ET and 9:28 AM ET. Outside
+    that window the order is rejected with code 40310000, so the EOD scan must
+    defer staging until 7:00 PM ET rather than submitting at 4:05 PM ET.
+    """
+    now = now or _now_et()
+    if now.weekday() == 5:  # Saturday: no opening auction to queue for.
+        return False, "Saturday (no opening auction)."
+    minutes = now.hour * 60 + now.minute
+    if minutes >= OPG_WINDOW_START_HOUR * 60:
+        return True, "OPG window open (after 7:00 PM ET)."
+    if minutes < OPG_WINDOW_END_HOUR * 60 + OPG_WINDOW_END_MINUTE:
+        return True, "OPG window open (before 9:28 AM ET)."
+    return False, (f"OPG window closed (ET {now.strftime('%H:%M')}); Alpaca "
+                   "rejects OPG orders between 9:28 AM and 7:00 PM ET.")
+
+
 def _load_positions() -> dict:
     if os.path.exists(POSITIONS_FILE):
         try:
@@ -167,25 +196,34 @@ def _log_fill(symbol: str, fill_price: float, ref_price: float, side: str = "buy
 
 
 def place_market_on_open_order(client, symbol: str, qty: float, side: str = "buy") -> dict:
-    """Submit a Market-On-Open (OPG) order via Alpaca.
+    """Submit a market order that fills at the next regular-session open.
 
-    Uses TimeInForce.OPG so the fill executes in the 9:30 AM NYSE/Nasdaq opening
-    auction cross, NOT pre-market extended hours. This matches the backtested
-    'fill at open + $0.05 slippage' assumption.
+    Prefers Alpaca's OPG time-in-force, which routes the order to the 9:30 AM
+    NYSE/Nasdaq opening auction cross (NOT pre-market extended hours) and so
+    matches the backtested 'fill at open + $0.05 slippage' assumption.
+
+    OPG is only accepted between 7:00 PM and 9:28 AM ET; outside that window
+    Alpaca rejects it with code 40310000. When the window is closed we fall back
+    to a DAY market order, which Alpaca queues after hours and releases at the
+    next core-session open — the same fill-at-open behavior without the window
+    restriction.
     """
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
 
     side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+    opg_open, _ = _opg_window_state()
+    tif = TimeInForce.OPG if opg_open else TimeInForce.DAY
     req = MarketOrderRequest(
         symbol=symbol,
         qty=qty,
         side=side_enum,
-        time_in_force=TimeInForce.OPG,
+        time_in_force=tif,
     )
     try:
         order = client.trading_client.submit_order(order_data=req)
-        logger.info(f"[OPG] Submitted {side} {qty} {symbol} (time_in_force=OPG)")
+        logger.info(f"[OPG] Submitted {side} {qty} {symbol} "
+                    f"(time_in_force={getattr(tif, 'value', tif)})")
         return {"symbol": symbol, "qty": qty, "side": side, "status": "submitted",
                 "order_id": getattr(order, "id", None)}
     except Exception as e:
@@ -372,6 +410,16 @@ def run_eod_scan(dry_run: bool = False) -> dict:
         logger.info("No open slots; skipping staging.")
         return {"candidates": len(candidates), "staged": 0, "open_slots": 0}
 
+    # Alpaca rejects OPG orders between 9:28 AM and 7:00 PM ET (code 40310000).
+    # The EOD scan fires at 4:05 PM ET, so submitting here would always fail.
+    # Defer staging to the 7:00 PM ET run, which lands inside the OPG window and
+    # queues the order for the next opening auction.
+    opg_open, opg_reason = _opg_window_state()
+    if not opg_open:
+        logger.info(f"Deferring OPG staging: {opg_reason}")
+        return {"candidates": len(candidates), "staged": 0, "open_slots": open_slots,
+                "deferred": True, "reason": opg_reason}
+
     staged = stage_orders(candidates, open_slots, dry_run=dry_run)
     if not dry_run:
         # Submit OPG market-on-open orders for the top slots.
@@ -392,6 +440,14 @@ def run_eod_scan(dry_run: bool = False) -> dict:
             s["order_result"] = res
             # Record staged position (paper-trade) ONLY if the order was accepted.
             if res.get("status") in ("submitted", "accepted", "held"):
+                # day0 anchors the Day-5 time exit. The order fills at the NEXT
+                # opening auction, so when staging after the close (>= 7:00 PM
+                # ET) the fill lands on the next trading day, not today.
+                fill_date = _now_et().date()
+                if _now_et().hour >= OPG_WINDOW_START_HOUR:
+                    fill_date += timedelta(days=1)
+                    while fill_date.weekday() >= 5:
+                        fill_date += timedelta(days=1)
                 positions[s["symbol"]] = {
                     "entry_ts": _now_et().isoformat(),
                     "signal_date": s["signal_date"],
@@ -399,7 +455,7 @@ def run_eod_scan(dry_run: bool = False) -> dict:
                     "order_id": res.get("order_id"),
                     "qty": qty,  # staged qty; actual fill verified at sell time
                     "cat_stop": None,  # filled at open, computed in monitor
-                    "day0": _now_et().date().isoformat(),
+                    "day0": fill_date.isoformat(),
                 }
                 _log_decision_to_db(
                     s["symbol"], "BUY", qty, True,
@@ -531,7 +587,7 @@ def main() -> None:
     parser.add_argument("--scan", action="store_true", help="EOD 4:05 PM signal scan")
     parser.add_argument("--monitor", action="store_true", help="Intraday exit monitor")
     parser.add_argument("--auto", action="store_true",
-                        help="Auto-select mode by time-of-day (4:05 PM ET = scan, else monitor)")
+                        help="Auto-select mode by time-of-day (4:05 PM / 7:05 PM ET = scan, else monitor)")
     parser.add_argument("--dry-run", action="store_true", help="Compute, no orders/writes")
     parser.add_argument("--force", action="store_true", help="Bypass market-hours gate")
     parser.add_argument("--no-discord", action="store_true")
@@ -540,11 +596,16 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     setup_jira_logging(app_name="agent-trade-swing-trader")
 
-    # Auto mode: pick scan vs monitor by time-of-day. The EOD scan fires at
-    # 4:05 PM ET (after the 4:00 PM close); everything else is a monitor run.
+    # Auto mode: pick scan vs monitor by time-of-day. Two scan windows exist:
+    #   - 4:05 PM ET: EOD signal scan (logs candidates; staging is deferred).
+    #   - 7:05 PM ET: OPG staging run, inside Alpaca's 7:00 PM - 9:28 AM ET
+    #     OPG window, which submits the market-on-open orders.
+    # Everything else is a monitor run.
     if args.auto:
         now = _now_et()
-        args.scan = (now.hour == 16 and now.minute >= 0 and now.minute <= 10)
+        eod_scan = now.hour == 16 and 0 <= now.minute <= 10
+        opg_staging = now.hour == 19 and 0 <= now.minute <= 10
+        args.scan = eod_scan or opg_staging
         args.monitor = not args.scan
 
     # The market-hours gate applies ONLY to intraday monitoring. The EOD scan
