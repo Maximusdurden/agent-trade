@@ -185,7 +185,7 @@ Write-Host "Scheduler service account: $SchedulerSa"
 & $GCloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
 & $GCloud scheduler jobs create http $SchedulerName --schedule="30 20 * * 1-5" `
     --location $Region `
-    --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/$JobName:run" `
+    --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/${JobName}:run" `
     --http-method=POST `
     --oauth-service-account-email=$SchedulerSa `
     --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"

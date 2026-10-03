@@ -174,7 +174,7 @@ function Register-Scheduler {
     $ErrorActionPreference = $OldPreference
     & $GCloud scheduler jobs create http $SchedulerName --schedule=$Schedule `
         --location $Region `
-        --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/$JobName:run" `
+        --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/${JobName}:run" `
         --http-method=POST `
         --oauth-service-account-email=$DefaultComputeSa `
         --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"
