@@ -26,7 +26,8 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -192,7 +193,11 @@ def grade_trades(db_path, date_str) -> None:
 def run(use_local_db: bool, dry: bool, date_override: str | None,
         update_post_id: int | None = None) -> int:
     setup_dexter_logging()
-    target_date = date_override or datetime.now().strftime("%Y-%m-%d")
+    # Use Eastern time for the trading day: the container clock is UTC, so a
+    # run after 8 PM ET (00:00 UTC next day) would otherwise publish a post
+    # dated in the future (WordPress hides scheduled posts from the homepage).
+    target_date = date_override or datetime.now(
+        ZoneInfo(EASTER_TZ)).strftime("%Y-%m-%d")
 
     # 1. Obtain the DB (GCS, or local for dev).
     # The canonical gcs_sync.download_from_gcs() writes to config.DATABASE_PATH
