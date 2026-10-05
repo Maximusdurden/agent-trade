@@ -144,6 +144,33 @@ def _get_greeks_delta(snapshot) -> float | None:
     return float(delta)
 
 
+def _delta_target_fallback(candidates: list[dict], opt_type: str,
+                           max_notional: float) -> dict | None:
+    """Find a delta 0.40-0.50 strike that fits within max_notional.
+
+    Used when the first-OTM strike's premium is too expensive (notional >
+    ELASTIC_MAX_NOTIONAL). A delta 0.40-0.50 strike is further OTM and
+    cheaper, so it often fits where the first-OTM does not.
+
+    Prefers OTM strikes, then delta closest to 0.45, then lowest ask.
+    Returns None when no candidate fits (greeks unavailable or all too
+    expensive).
+    """
+    target = [
+        c for c in candidates
+        if c["delta"] is not None
+        and 0.40 <= abs(c["delta"]) <= 0.50
+        and c["ask"] * 100.0 <= max_notional
+    ]
+    if not target:
+        return None
+    # Prefer OTM (dist >= 0), then delta closest to 0.45, then lowest ask.
+    target.sort(key=lambda c: (0 if c["dist"] >= 0 else 1,
+                               abs(abs(c["delta"]) - 0.45),
+                               c["ask"]))
+    return target[0]
+
+
 def select_strike(client: AlpacaClient, symbol: str, direction: str,
                   session_date: str, current_price: float | None = None) -> dict:
     """Select the target 0DTE strike for a symbol/direction.
@@ -233,9 +260,11 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
 
     # 6. Compute position size (§6.6) with Phase 2 elasticity.
     contracts = int(math.floor(BASE_ALLOCATION / (selected["ask"] * 100.0)))
+    reject_reason = None
+    selection_note = None
     if contracts < 1:
-        notional = selected["ask"] * 100.0
-        if notional <= ELASTIC_MAX_NOTIONAL:
+        primary_notional = selected["ask"] * 100.0
+        if primary_notional <= ELASTIC_MAX_NOTIONAL:
             # Prevent allocation starvation on TSLA options: allow 1 contract.
             contracts = 1
             logger.info(
@@ -243,11 +272,27 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
                 f"allocation but <= ${ELASTIC_MAX_NOTIONAL:.0f}; allowing 1 contract."
             )
         else:
-            logger.warning(
-                f"Contract ask ${selected['ask']:.2f} too expensive "
-                f"(notional ${notional:.2f} > ${ELASTIC_MAX_NOTIONAL:.0f}); no entry."
-            )
-            contracts = 0
+            # First-OTM strike too expensive. Fall back to a delta 0.40-0.50
+            # strike (further OTM, cheaper premium) when one fits the cap.
+            fallback = _delta_target_fallback(filtered, opt_type, ELASTIC_MAX_NOTIONAL)
+            if fallback is not None:
+                selection_note = (
+                    f"First-OTM {selected['occ']} too expensive "
+                    f"(notional ${primary_notional:.2f} > ${ELASTIC_MAX_NOTIONAL:.0f}); "
+                    f"fell back to delta-target {fallback['occ']} "
+                    f"ask=${fallback['ask']:.2f} delta={fallback['delta']:.3f}."
+                )
+                logger.info(selection_note)
+                selected = fallback
+                contracts = 1
+            else:
+                reject_reason = (
+                    f"Contract ask ${selected['ask']:.2f} too expensive "
+                    f"(notional ${primary_notional:.2f} > ${ELASTIC_MAX_NOTIONAL:.0f}); "
+                    f"no delta 0.40-0.50 fallback within ${ELASTIC_MAX_NOTIONAL:.0f}."
+                )
+                logger.warning(reject_reason)
+                contracts = 0
 
     return {
         "symbol": symbol,
@@ -263,6 +308,8 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
         "notional": round(selected["ask"] * 100.0 * contracts, 2),
         "max_loss_20pct": round(selected["ask"] * 100.0 * contracts * 0.20, 2),
         "round_number_checked": True,
+        "reject_reason": reject_reason,
+        "selection_note": selection_note,
     }
 
 

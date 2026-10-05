@@ -228,7 +228,8 @@ def _merge_local_into_gcs_db(local_db_path: str, gcs_db_path: str) -> bool:
                 "executions": ("id",),
                 "strategy_history": ("id",),
                 "ticker_conviction": ("id",),
-            }
+                            "rejections": ("id",),
+                        }
             for table, key_cols in merge_tables.items():
                 # Ensure the table exists in both DBs.
                 local_cols = {r[1] for r in conn_local.execute(f"PRAGMA table_info({table})")}

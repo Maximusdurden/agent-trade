@@ -69,6 +69,7 @@ from sideload.runner_options_tsla import (
 )
 from core.alpaca_client import AlpacaClient
 from core.discord_notifier import send_discord_message
+from core.database import record_rejection
 
 logger = logging.getLogger("RunnerOptionsMultiTicker")
 
@@ -199,6 +200,17 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
     opt_type = "call" if direction == "BULLISH" else "put"
     cfg = TICKER_CONFIG[symbol]
 
+    def _reject(stage: str, reason: str, details: dict | None = None) -> None:
+        """Persist a rejection row to the shared DB (synced to GCS)."""
+        record_rejection(
+            lane="options_multiticker",
+            session_date=session_date,
+            symbol=symbol,
+            stage=stage,
+            reason=reason,
+            details=details,
+        )
+
     # 1. Resolve front-week expiry.
     expiry = resolve_front_week_expiry()
     logger.info(f"[{symbol}] Resolved front-week expiry: {expiry}")
@@ -207,20 +219,41 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
     strike_info = select_strike(client, symbol, direction, expiry,
                                 current_price=setup["entry_price"])
     if not strike_info or not strike_info.get("selected_occ"):
-        logger.warning(f"[{symbol}] No tradeable {opt_type} contract on {expiry}.")
+        reason = f"No tradeable {opt_type} contract on {expiry}."
+        logger.warning(f"[{symbol}] {reason}")
+        _reject("strike_selection", reason, {"expiry": expiry, "direction": direction})
         return None
 
     occ = strike_info["selected_occ"]
     contracts = int(strike_info.get("contracts", 0))
     if contracts < 1:
-        logger.warning(f"[{symbol}] Contract sizing rejected {occ} (contracts=0).")
+        reason = strike_info.get("reject_reason") or f"Contract sizing rejected {occ} (contracts=0)."
+        logger.warning(f"[{symbol}] {reason}")
+        _reject("sizing", reason, {
+            "occ": occ,
+            "ask": strike_info.get("ask"),
+            "bid": strike_info.get("bid"),
+            "strike": strike_info.get("strike"),
+            "delta": strike_info.get("delta"),
+            "expiry": expiry,
+            "direction": direction,
+            "selection_note": strike_info.get("selection_note"),
+        })
         return None
 
     ask = float(strike_info["ask"])
     # Spread gate.
     spread = check_spread(float(strike_info["bid"]), ask)
     if not spread["pass"]:
-        logger.warning(f"[{symbol}] Spread gate failed for {occ}: {spread['reason']}")
+        reason = f"Spread gate failed for {occ}: {spread['reason']}"
+        logger.warning(f"[{symbol}] {reason}")
+        _reject("spread_gate", reason, {
+            "occ": occ,
+            "bid": strike_info.get("bid"),
+            "ask": ask,
+            "spread": spread.get("spread"),
+            "rule": spread.get("rule"),
+        })
         return None
 
     entry_premium = ask
@@ -264,14 +297,22 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
                     logger.warning(f"[{symbol}] Fill poll error for {order_id}: {poll_err}")
 
         if status not in ("filled", "partially_filled"):
-            logger.error(f"[{symbol}] Entry order {order_id} not filled after "
-                         f"{FILL_CONFIRM_SECONDS}s (status={status}); canceling.")
-            try:
-                if order_id:
-                    client.trading_client.cancel_order_by_id(order_id=order_id)
-            except Exception as cancel_err:
-                logger.warning(f"[{symbol}] Cancel failed for {order_id}: {cancel_err}")
-            return None
+                    reason = (f"Entry order {order_id} not filled after "
+                              f"{FILL_CONFIRM_SECONDS}s (status={status}); canceled.")
+                    logger.error(f"[{symbol}] {reason}")
+                    try:
+                        if order_id:
+                            client.trading_client.cancel_order_by_id(order_id=order_id)
+                    except Exception as cancel_err:
+                        logger.warning(f"[{symbol}] Cancel failed for {order_id}: {cancel_err}")
+                    _reject("order_fill", reason, {
+                        "occ": occ,
+                        "contracts": contracts,
+                        "order_id": order_id,
+                        "status": status,
+                        "ask": ask,
+                    })
+                    return None
 
         if fill_price is None:
             fill_price = ask
@@ -330,6 +371,30 @@ def run_session(session_date: str, dry_run: bool = True,
     sync_down_from_gcs()
     state = load_state()
 
+    # Pull the shared DB from GCS so rejection rows merge into the freshest
+    # snapshot (and so upload_to_gcs() has a local DB to work with). The merge
+    # logic in upload_to_gcs() preserves rows from other lanes.
+    try:
+        from core.gcs_sync import download_from_gcs
+        download_from_gcs()
+    except Exception as dl_err:
+        logger.warning(f"[GCS] DB download failed: {dl_err}")
+
+    try:
+        return _run_session_inner(client, state, session_date, dry_run, active)
+    finally:
+        # Persist the DB back to GCS so rejection rows survive the ephemeral
+        # container. The merge logic preserves rows from other lanes.
+        try:
+            from core.gcs_sync import upload_to_gcs
+            upload_to_gcs()
+        except Exception as up_err:
+            logger.warning(f"[GCS] DB upload failed: {up_err}")
+
+
+def _run_session_inner(client: AlpacaClient, state: dict, session_date: str,
+                       dry_run: bool, active: list[str]) -> dict:
+    """Core session logic (wrapped by run_session for GCS DB sync)."""
     # Defect 1: crash recovery. If an active position exists on boot (container
     # restarted/redeployed while a position was open), re-attach directly to the
     # monitoring loop BEFORE the circuit breaker (which would otherwise see a

@@ -166,6 +166,28 @@ def init_db():
             ON ticker_convictions (cycle_id, symbol)
         """)
 
+        # 8. Rejections Table (append-only log of rejected entry attempts)
+        # Every guard that blocks an entry (PM gate, strike selection, sizing,
+        # spread gate, order fill) writes a row here so "why was I rejected?"
+        # is always answerable from the DB — no digging through ephemeral
+        # Cloud Run logs. Synced to GCS with the rest of the DB.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,      -- UTC ISO when the rejection happened
+                session_date TEXT NOT NULL,   -- trading session date (ET, YYYY-MM-DD)
+                lane TEXT NOT NULL,           -- e.g. options_multiticker
+                symbol TEXT NOT NULL,         -- ticker that was rejected
+                stage TEXT NOT NULL,          -- pm_gate | strike_selection | sizing | spread_gate | order_fill
+                reason TEXT NOT NULL,         -- human-readable rejection reason
+                details TEXT                  -- JSON context (occ, ask, bid, contracts, notional, ...)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rejections_session
+            ON rejections (session_date, lane)
+        """)
+
         # --- Migrations for pre-existing databases ---
         def add_column_if_missing(table: str, column: str, decl: str) -> None:
             cols = [r[1] for r in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -953,6 +975,42 @@ def get_system_state(key: str) -> Optional[str]:
             return result[0] if result else None
         except sqlite3.OperationalError:
             return None
+
+
+def record_rejection(lane: str, session_date: str, symbol: str, stage: str,
+                     reason: str, details: dict | None = None) -> None:
+    """Append a rejected entry attempt to the rejections table.
+
+    Every guard that blocks an entry (PM gate, strike selection, sizing,
+    spread gate, order fill) should call this so "why was I rejected?" is
+    always answerable from the DB. Safe to call even if the table is missing
+    (older DBs) — the row is skipped rather than crashing the runner.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO rejections (timestamp, session_date, lane, symbol,
+                                        stage, reason, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    session_date,
+                    lane,
+                    symbol,
+                    stage,
+                    reason,
+                    json.dumps(details) if details else None,
+                )
+            )
+            conn.commit()
+    except sqlite3.OperationalError:
+        # Table missing (pre-migration DB) — never crash the runner over a log row.
+        pass
+    except Exception:
+        pass
 
 
 HEARTBEAT_KEYS = (
