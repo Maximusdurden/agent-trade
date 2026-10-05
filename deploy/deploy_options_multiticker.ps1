@@ -15,15 +15,15 @@
 #   - 09:29 EDT (Mar-Nov) == 13:29 UTC -> "29 13 * * 1-5"
 #   - 09:29 EST (Nov-Mar) == 14:29 UTC -> "29 14 * * 1-5"
 
-# Use "Continue" (not "Stop") because the gcloud.ps1 PowerShell wrapper converts
-# benign stderr output into a NativeCommandError that would abort the deploy.
-$ErrorActionPreference = "Continue"
-
 # Accept -Auto (non-interactive) flag. The script is already non-interactive;
 # this parameter is accepted for compatibility with automated invocation.
 param(
     [switch]$Auto
 )
+
+# Use "Continue" (not "Stop") because the gcloud.ps1 PowerShell wrapper converts
+# benign stderr output into a NativeCommandError that would abort the deploy.
+$ErrorActionPreference = "Continue"
 
 # 1. Load Configurations from .env
 $EnvPath = "Z:\python\projects\agent-trade\.env"
