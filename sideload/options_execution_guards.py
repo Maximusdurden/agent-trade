@@ -203,17 +203,25 @@ def get_circuit_breaker_state(session_date: str) -> dict:
     return state
 
 
-def check_can_trade(session_date: str) -> dict:
-    """Check whether a new trade is allowed today (max 1 trade, no re-entry after stop)."""
+def check_can_trade(session_date: str, max_trades: int = 1) -> dict:
+    """Check whether a new trade is allowed today.
+
+    Args:
+        session_date: YYYY-MM-DD (ET).
+        max_trades: Daily trade cap (default 1; multi-ticker lanes may pass
+            MAX_DAILY_OPTION_TRADES). Stop-out still halts the engine for the
+            day regardless of the cap.
+    """
     state = get_circuit_breaker_state(session_date)
-    can_trade = state["status"] == ACTIVE and state["trades_today"] < 1
+    can_trade = state["status"] == ACTIVE and state["trades_today"] < max_trades
     return {
         "can_trade": can_trade,
         "status": state["status"],
         "trades_today": state["trades_today"],
+        "max_trades": max_trades,
         "reason": ("OK" if can_trade else
                    "HALTED_FOR_DAY" if state["status"] == HALTED_FOR_DAY else
-                   "Daily trade cap reached (max 1)"),
+                   f"Daily trade cap reached (max {max_trades})"),
     }
 
 
@@ -226,6 +234,33 @@ def record_trade(session_date: str, stopped_out: bool = False) -> dict:
         state["stopped_out"] = True
     _save_state(state)
     return state
+
+
+def check_concurrent_position_cap(client: AlpacaClient,
+                                  max_positions: int = 3) -> dict:
+    """Check whether the account is at the concurrent option-position ceiling.
+
+    Args:
+        client: AlpacaClient (uses get_option_positions()).
+        max_positions: Max open option positions allowed (default 3).
+
+    Returns:
+        Dict with ``can_enter`` and the current open count.
+    """
+    try:
+        open_positions = client.get_option_positions()
+        open_count = len(open_positions)
+    except Exception as e:
+        logger.warning(f"Could not fetch open option positions: {e}")
+        return {"can_enter": True, "open_count": 0, "error": str(e)}
+    can_enter = open_count < max_positions
+    return {
+        "can_enter": can_enter,
+        "open_count": open_count,
+        "max_positions": max_positions,
+        "reason": ("OK" if can_enter else
+                   f"MAX_CONCURRENT_POSITIONS_REACHED ({open_count} >= {max_positions})"),
+    }
 
 
 # ---------------------------------------------------------------------------

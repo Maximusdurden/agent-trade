@@ -388,11 +388,12 @@ def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str) -> 
             "summary": summary, "trades_detail": results}
 
 
-def run_ablation(client: AlpacaClient, days_back: int) -> dict:
-    """Run both models across all tickers."""
+def run_ablation(client: AlpacaClient, days_back: int,
+                 symbols: list[str] | None = None) -> dict:
+    """Run both models across the given symbols (default: TICKERS)."""
     results = {}
     for model in ["A", "B"]:
-        for sym in TICKERS:
+        for sym in (symbols or TICKERS):
             logger.info(f"Running Model {model} for {sym} over {days_back} days...")
             results[f"{model}_{sym}"] = run_model(client, sym, days_back, model)
     return results
@@ -402,6 +403,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Entry-engine ablation (Sweep Fade vs Compressed ORB)")
     parser.add_argument("--days", type=int, default=60,
                         help="Days of history to backtest.")
+    parser.add_argument("--symbol", "--symbols", nargs="+", default=None,
+                        help="Tickers to evaluate (e.g. --symbol NVDA AAPL MSFT SPY QQQ). "
+                             "Defaults to the ETF universe (SPY QQQ IWM).")
     parser.add_argument("--no-discord", action="store_true",
                         help="Skip the Discord notification.")
     args = parser.parse_args()
@@ -409,7 +413,7 @@ def main() -> None:
     setup_jira_logging(app_name="agent-trade-sideload")
     try:
         client = AlpacaClient()
-        results = run_ablation(client, args.days)
+        results = run_ablation(client, args.days, symbols=args.symbol)
 
         out_path = os.path.join(OUT_DIR, "backtest_entry_ablation.json")
         with open(out_path, "w", encoding="utf-8") as f:

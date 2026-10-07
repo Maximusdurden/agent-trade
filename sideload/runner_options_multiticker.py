@@ -66,7 +66,8 @@ from sideload.runner_options_tsla import (
     MODEL_A_START,
     MODEL_A_END,
     POLL_INTERVAL_SECONDS,
-)
+        INTRADAY_INTERVAL,
+    )
 from core.alpaca_client import AlpacaClient
 from core.discord_notifier import send_discord_message
 from core.database import record_rejection
@@ -96,10 +97,92 @@ EVAL_INTERVAL_SECONDS = 5
 FILL_CONFIRM_SECONDS = 5   # Max seconds to poll for a fill.
 FILL_POLL_INTERVAL = 1.0   # Poll cadence (seconds).
 
+# ---------------------------------------------------------------------------
+# Scaled guardrails (Phase 4 expansion).
+# ---------------------------------------------------------------------------
+# Max concurrent open option positions across the account. When this ceiling is
+# reached, no new entries are dispatched (all_disarmed).
+MAX_CONCURRENT_OPTION_POSITIONS = int(
+    os.environ.get("OPTIONS_MAX_CONCURRENT_POSITIONS", "3"))
+# Max trades per day (was hard-capped at 1 by the circuit breaker). Relaxed to
+# allow one entry per arming slot; stop-out still halts the engine for the day.
+MAX_DAILY_OPTION_TRADES = int(os.environ.get("OPTIONS_MAX_DAILY_TRADES", "3"))
+# Sub-sector / beta correlation mutex: never hold two positions in the same
+# tracking pair simultaneously (e.g. QQQ+SPY or NVDA+AMD are the same exposure).
+CORRELATION_PAIRS = [
+    {"SPY", "QQQ"},
+    {"NVDA", "AMD"},
+]
 
-def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str) -> dict:
-    """Compute the PM volatility gate for a specific ticker."""
-    intraday = _load_intraday(client, symbol, days_back=5)
+
+def _batch_load_intraday(client: AlpacaClient, symbols: list[str],
+                         days_back: int = 5) -> dict[str, pd.DataFrame]:
+    """Fetch 1-min bars for all symbols in ONE batched request.
+
+    ``AlpacaClient.get_historical_bars`` accepts a list of symbols and issues a
+    single ``StockBarsRequest(symbol_or_symbols=[...])`` (with retry + per-symbol
+    fallback), returning a MultiIndex frame. This replaces the serial
+    ``_load_intraday`` per-ticker loop, cutting PM-scan latency from ~N round
+    trips to 1.
+
+    Falls back to per-symbol ``_load_intraday`` fetches when the batch call
+    returns no usable intraday data (e.g. a client that only implements the
+    paginated single-symbol path, or a transient batch failure) so the PM gate
+    still evaluates every ticker.
+    """
+    if not symbols:
+        return {}
+    try:
+        df = client.get_historical_bars(
+            symbols, limit=days_back * 10, timeframe_str=INTRADAY_INTERVAL)
+    except Exception as e:
+        logger.warning(f"Batch intraday fetch failed ({e}); falling back to "
+                       f"per-symbol fetches.")
+        df = None
+    if df is None or df.empty:
+        # Fallback: per-symbol paginated fetch (matches the pre-batch behavior).
+        return {sym: _load_intraday(client, sym, days_back=days_back)
+                for sym in symbols}
+    if not isinstance(df.index, pd.MultiIndex):
+            # Single-symbol result: wrap it. Validate the bars are intraday (the
+            # caller may have returned daily bars for a 1min request); if not,
+            # fall back to the per-symbol paginated fetch.
+            sym = symbols[0]
+            idx = pd.to_datetime(df.index)
+            intraday_like = len(idx) > 1 and (idx[1] - idx[0]) < pd.Timedelta(hours=1)
+            if not intraday_like:
+                return {sym: _load_intraday(client, sym, days_back=days_back)}
+            return {sym: df}
+    out = {}
+    for sym in symbols:
+        try:
+            sub = df.xs(sym.upper(), level=0)
+        except KeyError:
+            continue
+        sub = sub.copy()
+        sub.index = pd.to_datetime(sub.index)
+        if sub.index.tzinfo is None:
+            sub.index = sub.index.tz_localize("UTC")
+        sub.index = sub.index.tz_convert(ET)
+        out[sym] = sub.sort_index()
+    # If the batch produced nothing usable (e.g. daily bars returned for a 1min
+    # request), fall back to per-symbol fetches so the gate still runs.
+    if not out:
+        return {sym: _load_intraday(client, sym, days_back=days_back)
+                for sym in symbols}
+    return out
+
+
+def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str,
+                       intraday: pd.DataFrame | None = None) -> dict:
+    """Compute the PM volatility gate for a specific ticker.
+
+    ``intraday`` may be pre-fetched via ``_batch_load_intraday`` (one batched
+    request for the whole universe); when omitted, falls back to a per-symbol
+    fetch for backward compatibility.
+    """
+    if intraday is None:
+        intraday = _load_intraday(client, symbol, days_back=5)
     if intraday.empty:
         return {"pass": False, "reason": "No intraday data", "pmh": None, "pml": None}
 
@@ -130,6 +213,31 @@ def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str) -> 
         "pml": pml,
         "range_pct": round(range_pct * 100.0, 3),
     }
+
+
+def _correlation_conflict(symbol: str, active_symbols: set[str]) -> str | None:
+    """Return the conflicting symbol if ``symbol`` shares a correlation pair.
+
+    Prevents simultaneous entries on identical market exposure (e.g. QQQ+SPY or
+    NVDA+AMD). Returns None when no conflict.
+    """
+    for pair in CORRELATION_PAIRS:
+        if symbol in pair:
+            conflict = (pair & active_symbols) - {symbol}
+            if conflict:
+                return next(iter(conflict))
+    return None
+
+
+def _rank_armed_by_pm_range(armed: dict, max_slots: int) -> dict:
+    """Keep only the top ``max_slots`` armed tickers by PM range magnitude.
+
+    When more tickers clear the 0.20% PM gate than slots allow, the highest
+    premarket expansion names win (priority allocation).
+    """
+    ranked = sorted(armed.items(),
+                    key=lambda kv: kv[1].get("range_pct", 0.0), reverse=True)
+    return dict(ranked[:max_slots])
 
 
 def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
@@ -419,11 +527,25 @@ def _run_session_inner(client: AlpacaClient, state: dict, session_date: str,
         return {"status": "recovered_and_closed", "position": pos,
                 "exit": exit_info}
 
-    # Circuit breaker: max 1 trade/day.
-    can_trade = check_can_trade(session_date)
+    # Circuit breaker: max N trades/day (was 1; relaxed for multi-ticker).
+    can_trade = check_can_trade(session_date, max_trades=MAX_DAILY_OPTION_TRADES)
     if not can_trade["can_trade"]:
         logger.info(f"Circuit breaker: {can_trade['reason']}")
         return {"status": "skipped", "reason": can_trade["reason"]}
+
+    # Concurrency ceiling: block new entries when the account already holds
+    # MAX_CONCURRENT_OPTION_POSITIONS open option positions.
+    try:
+        open_positions = client.get_option_positions()
+        open_count = len(open_positions)
+    except Exception as e:
+        logger.warning(f"Could not fetch open option positions: {e}")
+        open_count = 0
+    if open_count >= MAX_CONCURRENT_OPTION_POSITIONS:
+        logger.info(f"Concurrency ceiling reached: {open_count} open option "
+                    f"positions >= {MAX_CONCURRENT_OPTION_POSITIONS}.")
+        return {"status": "skipped",
+                "reason": f"MAX_CONCURRENT_POSITIONS_REACHED ({open_count})"}
 
     # Macro blackout (no scheduled releases by default).
     blackout = check_macro_blackout(session_date)
@@ -432,16 +554,49 @@ def _run_session_inner(client: AlpacaClient, state: dict, session_date: str,
         return {"status": "skipped", "reason": blackout["reason"]}
 
     # 1. Pre-market volatility gate for each ticker; disarm failures.
+    #    Batch-fetch all 1-min bars in ONE request, then slice per symbol.
     armed = {}
     pm_results = {}
+    batch = _batch_load_intraday(client, active, days_back=5)
     for symbol in active:
-        pm = _pm_volatility_for(client, symbol, session_date)
+        pm = _pm_volatility_for(client, symbol, session_date,
+                                intraday=batch.get(symbol))
         pm_results[symbol] = pm
         if pm["pass"]:
             armed[symbol] = pm
             logger.info(f"[{symbol}] PM gate PASS (range {pm['range_pct']}%).")
         else:
             logger.info(f"[{symbol}] PM gate DISARMED: {pm['reason']}")
+
+    if not armed:
+        return {"status": "all_disarmed", "pm_results": pm_results}
+
+    # Correlation mutex: drop any armed ticker that duplicates an already-armed
+    # sub-sector/beta pair (e.g. QQQ+SPY or NVDA+AMD).
+    kept = {}
+    for symbol, pm in armed.items():
+        conflict = _correlation_conflict(symbol, set(kept.keys()))
+        if conflict:
+            logger.info(f"[{symbol}] Correlation mutex: skipping (conflicts "
+                        f"with {conflict}).")
+            pm_results[symbol] = {**pm, "pass": False,
+                                  "reason": f"Correlation mutex vs {conflict}"}
+            continue
+        kept[symbol] = pm
+    armed = kept
+
+    # Priority allocation: if more tickers armed than slots, keep only the top
+    # MAX_CONCURRENT_OPTION_POSITIONS by PM range magnitude.
+    if len(armed) > MAX_CONCURRENT_OPTION_POSITIONS:
+        dropped = set(armed.keys()) - set(
+            _rank_armed_by_pm_range(armed, MAX_CONCURRENT_OPTION_POSITIONS).keys())
+        for symbol in dropped:
+            logger.info(f"[{symbol}] Priority allocation: dropped (PM range "
+                        f"{armed[symbol]['range_pct']}% below top "
+                        f"{MAX_CONCURRENT_OPTION_POSITIONS}).")
+            pm_results[symbol] = {**armed[symbol], "pass": False,
+                                  "reason": "Priority allocation (PM range)"}
+        armed = _rank_armed_by_pm_range(armed, MAX_CONCURRENT_OPTION_POSITIONS)
 
     if not armed:
         return {"status": "all_disarmed", "pm_results": pm_results}
