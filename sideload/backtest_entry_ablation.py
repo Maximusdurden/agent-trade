@@ -58,8 +58,16 @@ ET = ZoneInfo("America/New_York")
 TICKERS = ["SPY", "QQQ", "IWM"]
 
 # Exit rules.
-STOP_LOSS_PCT = 0.20          # 20% premium stop (per directive)
-HARD_EXIT_TIME = dtime(11, 30, 0)  # hard time stop
+# Live production exit rules (runner_options_tsla.py): +45% target, -22% stop,
+# 30-minute time stop. These MUST match the live runner so the backtest screen
+# reflects what production actually executes.
+TP_PCT = 0.45                # +45% take-profit on premium
+STOP_LOSS_PCT = 0.22         # -22% stop-loss on premium
+MAX_HOLD_MINUTES = 30        # 30-minute time stop
+# Legacy exit rules (pre-alignment): 20% stop, trailing/EMA, 11:30 hard exit.
+# Retained behind --legacy-exit for comparison only.
+LEGACY_STOP_LOSS_PCT = 0.20
+LEGACY_HARD_EXIT_TIME = dtime(11, 30, 0)
 
 # Option premium model (corrected first-order Taylor expansion).
 DELTA_PROXY = 0.45
@@ -153,13 +161,23 @@ def _vwap_at(vwap_series: pd.Series, ts) -> float | None:
 
 def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
                    entry_price: float, stop_loss_pct: float = STOP_LOSS_PCT,
-                   use_ema_trail: bool = False) -> dict:
-    """Simulate the exit from entry to the 11:30 hard exit.
+                   use_ema_trail: bool = False, legacy_exit: bool = False) -> dict:
+    """Simulate the exit from entry.
+
+    Live exit rules (default): +45% target, -22% stop, 30-min time stop —
+    matching runner_options_tsla.py exactly.
+
+    Legacy exit rules (--legacy-exit): 20% stop, trailing/EMA, 11:30 hard exit.
 
     Models option premium as: premium = entry_premium * (1 + delta*move - theta).
-    Applies the hard stop and (optionally) a 5-min EMA trailing stop.
     """
-    exit_ts = entry_ts.replace(hour=HARD_EXIT_TIME.hour, minute=HARD_EXIT_TIME.minute)
+    if legacy_exit:
+        exit_ts = entry_ts.replace(hour=LEGACY_HARD_EXIT_TIME.hour,
+                                   minute=LEGACY_HARD_EXIT_TIME.minute)
+        stop_pct = LEGACY_STOP_LOSS_PCT
+    else:
+        exit_ts = entry_ts + timedelta(minutes=MAX_HOLD_MINUTES)
+        stop_pct = stop_loss_pct
     window = day_bars[(day_bars.index >= entry_ts) & (day_bars.index <= exit_ts)]
     if window.empty:
         return {"traded": False, "reason": "no_data"}
@@ -172,7 +190,7 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
     entry_underlying = entry_price
     exit_underlying = entry_price
 
-    # 5-min EMA for trailing (Model B).
+    # 5-min EMA for trailing (legacy Model B).
     ema = None
     ema_span = 5
 
@@ -190,15 +208,25 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
         premium = max(0.01, entry_premium + option_delta_gain - decay_loss)
         exit_underlying = px
 
-        # EMA for trailing.
+        # EMA for trailing (legacy only).
         if use_ema_trail:
             ema = px if ema is None else px * (2 / (ema_span + 1)) + ema * (1 - 2 / (ema_span + 1))
 
-        # Hard stop.
-        if premium <= entry_premium * (1.0 - stop_loss_pct):
+        # Live exit rules: +45% target, -22% stop, 30-min time stop.
+        if not legacy_exit:
+            if premium >= entry_premium * (1.0 + TP_PCT):
+                exit_premium, exit_reason = premium, "target_45pct"
+                break
+            if premium <= entry_premium * (1.0 - stop_pct):
+                exit_premium, exit_reason = premium, "stop_22pct"
+                break
+            exit_premium = premium
+            continue
+
+        # Legacy exit rules: 20% stop, trailing/EMA, 11:30 hard exit.
+        if premium <= entry_premium * (1.0 - stop_pct):
             exit_premium, exit_reason = premium, "stop_20pct"
             break
-        # Trailing stop: 5-min EMA cross (Model B) or peak giveback (Model A).
         if use_ema_trail and ema is not None:
             if direction == "BULLISH" and px < ema:
                 exit_premium, exit_reason = premium, "ema_trail"
@@ -316,7 +344,8 @@ def model_b_compressed_orb(day_bars: pd.DataFrame, day: pd.Timestamp,
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
-def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str) -> dict:
+def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str,
+              legacy_exit: bool = False) -> dict:
     """Run a single entry model over N days for a symbol."""
     daily = _load_daily(client, symbol, limit=days_back + 5)
     intraday = _load_intraday(client, symbol, days_back)
@@ -359,7 +388,8 @@ def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str) -> 
         if setup is None:
             continue
         sim = _simulate_exit(day_bars, setup["entry_ts"], setup["direction"],
-                             setup["entry_price"], use_ema_trail=use_ema)
+                                     setup["entry_price"], use_ema_trail=use_ema,
+                                     legacy_exit=legacy_exit)
         if sim["traded"]:
             sim["date"] = str(day.date())
             sim["symbol"] = symbol
@@ -389,13 +419,15 @@ def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str) -> 
 
 
 def run_ablation(client: AlpacaClient, days_back: int,
-                 symbols: list[str] | None = None) -> dict:
+                 symbols: list[str] | None = None,
+                 legacy_exit: bool = False) -> dict:
     """Run both models across the given symbols (default: TICKERS)."""
     results = {}
     for model in ["A", "B"]:
         for sym in (symbols or TICKERS):
             logger.info(f"Running Model {model} for {sym} over {days_back} days...")
-            results[f"{model}_{sym}"] = run_model(client, sym, days_back, model)
+            results[f"{model}_{sym}"] = run_model(client, sym, days_back, model,
+                                                  legacy_exit=legacy_exit)
     return results
 
 
@@ -408,12 +440,17 @@ def main() -> None:
                              "Defaults to the ETF universe (SPY QQQ IWM).")
     parser.add_argument("--no-discord", action="store_true",
                         help="Skip the Discord notification.")
+    parser.add_argument("--legacy-exit", action="store_true",
+                        help="Use legacy exit rules (20% stop, trailing, 11:30 "
+                             "hard exit) instead of live rules (45% target, "
+                             "22% stop, 30-min time stop).")
     args = parser.parse_args()
 
     setup_jira_logging(app_name="agent-trade-sideload")
     try:
         client = AlpacaClient()
-        results = run_ablation(client, args.days, symbols=args.symbol)
+        results = run_ablation(client, args.days, symbols=args.symbol,
+                               legacy_exit=args.legacy_exit)
 
         out_path = os.path.join(OUT_DIR, "backtest_entry_ablation.json")
         with open(out_path, "w", encoding="utf-8") as f:
