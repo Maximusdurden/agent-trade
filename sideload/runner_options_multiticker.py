@@ -133,8 +133,13 @@ def _batch_load_intraday(client: AlpacaClient, symbols: list[str],
     if not symbols:
         return {}
     try:
-        df = client.get_historical_bars(
-            symbols, limit=days_back * 10, timeframe_str=INTRADAY_INTERVAL)
+            # Fetch enough 1-min bars to cover the full pre-market window (04:00 ET)
+            # plus the prior session. A single trading day has ~390 1-min bars
+            # (04:00-20:00 ET); limit=days_back*10 (50) only covered ~50 minutes,
+            # which at 09:29 AM ET returned YESTERDAY's close bars, not today's
+            # pre-market — silently disarming every ticker (PM range 0.0000%).
+            df = client.get_historical_bars(
+                symbols, limit=days_back * 390, timeframe_str=INTRADAY_INTERVAL)
     except Exception as e:
         logger.warning(f"Batch intraday fetch failed ({e}); falling back to "
                        f"per-symbol fetches.")

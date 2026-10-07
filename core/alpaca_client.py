@@ -673,7 +673,11 @@ class AlpacaClient:
                         end=chunk_end,
                     )
                     if DATA_FEED_AVAILABLE:
-                        request_params.feed = DataFeed.IEX
+                        # SIP (not IEX): IEX is regular-session-only (09:30-16:00
+                        # ET) and returns NO pre-market bars, which silently
+                        # disarmed the options PM gate (range 0.0000%). SIP
+                        # includes 04:00-09:29 ET pre-market data.
+                        request_params.feed = DataFeed.SIP
                     bars = self._fetch_with_retry(
                         self.data_client, request_params,
                         self.data_client.get_stock_bars, max_retries)
@@ -860,7 +864,9 @@ class AlpacaClient:
                     "end": datetime.now()
                 }
                 if DATA_FEED_AVAILABLE:
-                    stock_bars_request_kwargs["feed"] = DataFeed.IEX
+                    # SIP (not IEX): IEX is regular-session-only and returns no
+                    # pre-market bars, silently disarming the options PM gate.
+                    stock_bars_request_kwargs["feed"] = DataFeed.SIP
                 request_params = StockBarsRequest(**stock_bars_request_kwargs)
                 bars = self._fetch_with_retry(self.data_client, request_params, self.data_client.get_stock_bars, max_retries)
                 if bars and bars.df is not None and not bars.df.empty:
@@ -877,7 +883,7 @@ class AlpacaClient:
                             "end": datetime.now()
                         }
                         if DATA_FEED_AVAILABLE:
-                            stock_bars_request_kwargs["feed"] = DataFeed.IEX
+                            stock_bars_request_kwargs["feed"] = DataFeed.SIP
                         request_params = StockBarsRequest(**stock_bars_request_kwargs)
                         bars = self._fetch_with_retry(self.data_client, request_params, self.data_client.get_stock_bars, max_retries)
                         if bars and bars.df is not None and not bars.df.empty:
