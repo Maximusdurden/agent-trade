@@ -96,6 +96,11 @@ def check_spread(bid: float, ask: float) -> dict:
 # ---------------------------------------------------------------------------
 # Component 7 — Stop-loss router (§6.10)
 # ---------------------------------------------------------------------------
+# NOTE: This router is legacy — the multi-ticker runner (runner_options_
+# multiticker.py) does NOT call route_stop_exit; it uses _monitor_position
+# from runner_options_tsla.py, which enforces STOP_PCT = 0.22 (-22%). This
+# 50% value is retained only for the original single-ticker path and any
+# external callers; do not treat it as the live stop.
 STOP_LOSS_PCT = 0.50          # 50% stop on premium (0DTE — see plan §11)
 IOC_OFFSET = 0.03             # bid - $0.03 to cross the book
 IOC_ESCALATE_SECONDS = 2.0    # escalate to market after 2s on partial fill

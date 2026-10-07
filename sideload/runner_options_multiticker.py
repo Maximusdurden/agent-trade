@@ -195,7 +195,15 @@ def _load_pm_bars_yfinance(symbol: str, session_date: str) -> pd.DataFrame:
 
     try:
         t = yf.Ticker(symbol)
-        df = t.history(period="1d", interval="1m", prepost=True)
+        # Explicit start/end bounds instead of period="1d": on Monday mornings
+        # (or holiday schedules) period="1d" can return Friday's session, which
+        # would be filtered out below and silently fail-open. Bounding the
+        # request to the session date keeps the fetch aligned with the gate.
+        day = pd.Timestamp(session_date, tz=ET)
+        start_date = day.strftime("%Y-%m-%d")
+        end_date = (day + timedelta(days=1)).strftime("%Y-%m-%d")
+        df = t.history(start=start_date, end=end_date,
+                       interval="1m", prepost=True)
         if df is None or df.empty:
             return pd.DataFrame()
         idx = pd.to_datetime(df.index)
@@ -207,7 +215,6 @@ def _load_pm_bars_yfinance(symbol: str, session_date: str) -> pd.DataFrame:
         df = df.sort_index()
 
         # Keep only today's pre-market window (04:00-09:29 ET).
-        day = pd.Timestamp(session_date, tz=ET)
         pm_start = day.replace(hour=4, minute=0)
         pm_end = day.replace(hour=9, minute=29)
         pm_bars = df[(df.index >= pm_start) & (df.index <= pm_end)]
@@ -490,9 +497,6 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
         # than requested; tracking the full qty would over-sell on exit).
         contracts = filled_qty if filled_qty >= 1 else contracts
 
-        if fill_price is None:
-            fill_price = ask
-
     pos = {
         "contract_symbol": occ,
         "entry_time": datetime.now(ET).isoformat(),
@@ -634,9 +638,14 @@ def _run_session_inner(client: AlpacaClient, state: dict, session_date: str,
         return {"status": "all_disarmed", "pm_results": pm_results}
 
     # Correlation mutex: drop any armed ticker that duplicates an already-armed
-    # sub-sector/beta pair (e.g. QQQ+SPY or NVDA+AMD).
+    # sub-sector/beta pair (e.g. QQQ+SPY or NVDA+AMD). Sort by PM range FIRST so
+    # the higher-expansion ticker wins the slot when a pair conflicts - without
+    # this, the first symbol in ACTIVE_UNIVERSE order would claim the slot even
+    # if its premarket range was far smaller than its pair-mate's.
     kept = {}
-    for symbol, pm in armed.items():
+    for symbol, pm in sorted(armed.items(),
+                             key=lambda kv: kv[1].get("range_pct", 0.0),
+                             reverse=True):
         conflict = _correlation_conflict(symbol, set(kept.keys()))
         if conflict:
             logger.info(f"[{symbol}] Correlation mutex: skipping (conflicts "
