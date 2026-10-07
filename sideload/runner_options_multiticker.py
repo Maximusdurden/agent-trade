@@ -178,6 +178,51 @@ def _batch_load_intraday(client: AlpacaClient, symbols: list[str],
     return out
 
 
+def _load_pm_bars_yfinance(symbol: str, session_date: str) -> pd.DataFrame:
+    """Fetch today's pre-market (04:00-09:29 ET) 1-min bars via yfinance.
+
+    Alpaca's IEX feed has NO pre-market bars and the SIP feed blocks recent
+    queries on this subscription, so the PM gate cannot use Alpaca for today's
+    pre-market data. yfinance (free, already a dependency) returns pre-market
+    bars with ``prepost=True``. Fails open (empty frame) so the gate degrades
+    gracefully if yfinance is unavailable.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance not installed; PM gate unavailable (fail-open).")
+        return pd.DataFrame()
+
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period="1d", interval="1m", prepost=True)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        idx = pd.to_datetime(df.index)
+        if idx.tzinfo is None:
+            idx = idx.tz_localize("UTC")
+        idx = idx.tz_convert(ET)
+        df = df.copy()
+        df.index = idx
+        df = df.sort_index()
+
+        # Keep only today's pre-market window (04:00-09:29 ET).
+        day = pd.Timestamp(session_date, tz=ET)
+        pm_start = day.replace(hour=4, minute=0)
+        pm_end = day.replace(hour=9, minute=29)
+        pm_bars = df[(df.index >= pm_start) & (df.index <= pm_end)]
+        # Normalize column names to the runner's expected schema.
+        rename = {"High": "high", "Low": "low", "Open": "open",
+                  "Close": "close", "Volume": "volume"}
+        pm_bars = pm_bars.rename(columns=rename)
+        keep = [c for c in ("open", "high", "low", "close", "volume")
+                if c in pm_bars.columns]
+        return pm_bars[keep]
+    except Exception as e:
+        logger.warning(f"yfinance PM fetch failed for {symbol}: {e} (fail-open).")
+        return pd.DataFrame()
+
+
 def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str,
                        intraday: pd.DataFrame | None = None) -> dict:
     """Compute the PM volatility gate for a specific ticker.
@@ -185,6 +230,10 @@ def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str,
     ``intraday`` may be pre-fetched via ``_batch_load_intraday`` (one batched
     request for the whole universe); when omitted, falls back to a per-symbol
     fetch for backward compatibility.
+
+    Pre-market bars come from yfinance (Alpaca IEX has none; SIP blocks recent
+    queries on this subscription). If yfinance returns no pre-market bars, the
+    gate fails open with a clear reason rather than a bogus 0.0000% range.
     """
     if intraday is None:
         intraday = _load_intraday(client, symbol, days_back=5)
@@ -198,11 +247,19 @@ def _pm_volatility_for(client: AlpacaClient, symbol: str, session_date: str,
     if day_bars.empty:
         return {"pass": False, "reason": "No bars on session date", "pmh": None, "pml": None}
 
-    pm_start = day_start.replace(hour=4, minute=0)
-    pm_end = day_start.replace(hour=9, minute=29)
-    pm_bars = day_bars[(day_bars.index >= pm_start) & (day_bars.index <= pm_end)]
+    # Pre-market bars: prefer yfinance (free, has real 04:00-09:29 ET data).
+    # Alpaca IEX returns at most a single flat pre-market print (bogus 0.0000%
+    # range) and SIP blocks recent queries on this subscription, so Alpaca
+    # cannot be the PM source. Fall back to Alpaca's window only if yfinance
+    # is unavailable.
+    pm_bars = _load_pm_bars_yfinance(symbol, session_date)
     if pm_bars.empty:
-        return {"pass": False, "reason": "No pre-market bars", "pmh": None, "pml": None}
+        pm_start = day_start.replace(hour=4, minute=0)
+        pm_end = day_start.replace(hour=9, minute=29)
+        pm_bars = day_bars[(day_bars.index >= pm_start) & (day_bars.index <= pm_end)]
+        if pm_bars.empty:
+            return {"pass": False, "reason": "No pre-market bars (yfinance + Alpaca)",
+                    "pmh": None, "pml": None}
 
     pmh = float(pm_bars["high"].max())
     pml = float(pm_bars["low"].min())
