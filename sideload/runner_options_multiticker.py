@@ -82,7 +82,10 @@ ET = ZoneInfo("America/New_York")
 # entry_premium / delta per ticker. Only tickers with PF >= 1.50 are retained.
 TICKER_CONFIG = {
     "TSLA": {"entry_premium": 3.50, "delta": 0.45},
-    "META": {"entry_premium": 4.50, "delta": 0.45},
+    # META disabled 2026-10-07: corrected backtest model (ticker-specific
+    # premiums + capped target fills) shows META PF 0.91 (negative expectancy)
+    # under live exit rules. Re-enable only if a re-screen clears PF >= 1.50.
+    # "META": {"entry_premium": 4.50, "delta": 0.45},
     # AMD/COIN/AMZN/PLTR failed the PF >= 1.50 gate in the Phase 3 screen and
     # are excluded from the active universe. Add them back only if they pass.
 }
