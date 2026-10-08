@@ -229,7 +229,10 @@ def _place_moc_order(client: AlpacaClient, symbol: str, qty: float, side: str = 
                 status_str = str(getattr(updated, "status", ""))
                 if getattr(updated, "filled_avg_price", None) is not None:
                     filled_price = float(updated.filled_avg_price)
-                if status_str.lower() in ("filled", "partially_filled"):
+                # Alpaca's OrderStatus enum stringifies as "orderstatus.filled";
+                # normalize to the plain status name before comparing.
+                status_norm = status_str.lower().replace("orderstatus.", "")
+                if status_norm in ("filled", "partially_filled"):
                     break
             except Exception as poll_err:
                 logger.warning(f"[MOC] Poll error for {symbol}: {poll_err}")
@@ -262,7 +265,10 @@ def _sell(client: AlpacaClient, symbol: str, qty: float) -> dict:
                 status_str = str(getattr(updated, "status", ""))
                 if getattr(updated, "filled_avg_price", None) is not None:
                     filled_price = float(updated.filled_avg_price)
-                if status_str.lower() in ("filled", "partially_filled"):
+                # Alpaca's OrderStatus enum stringifies as "orderstatus.filled";
+                # normalize to the plain status name before comparing.
+                status_norm = status_str.lower().replace("orderstatus.", "")
+                if status_norm in ("filled", "partially_filled"):
                     break
             except Exception as poll_err:
                 logger.warning(f"[SELL] Poll error for {symbol}: {poll_err}")
@@ -366,8 +372,9 @@ def run_scan(client: AlpacaClient, dry_run: bool = False) -> None:
         result = _place_moc_order(client, symbol, qty)
         # Only open a position if the order FULLY filled (status filled with a
         # fill price). A partial fill would track the full qty while the broker
-        # holds fewer shares, causing later over-sells.
-        status = str(result.get("status", "")).lower()
+        # holds fewer shares, causing later over-sells. Normalize the enum repr
+        # ("orderstatus.filled") to the plain status name.
+        status = str(result.get("status", "")).lower().replace("orderstatus.", "")
         fill_px = result.get("filled_avg_price")
         if status == "filled" and fill_px is not None:
             pos = fb_state.open_position(
@@ -436,7 +443,7 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                 logger.info(f"[Dry-run] Scale 1: sell {qty} {symbol} @ +3R")
             else:
                 res = _sell(client, symbol, qty)
-                status = str(res.get("status", "")).lower()
+                status = str(res.get("status", "")).lower().replace("orderstatus.", "")
                 fill_px = res.get("filled_avg_price")
                 if status == "filled" and fill_px is not None:
                     _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_3r"])
@@ -459,7 +466,7 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                 logger.info(f"[Dry-run] Scale 2: sell {qty} {symbol} @ +5R")
             else:
                 res = _sell(client, symbol, qty)
-                status = str(res.get("status", "")).lower()
+                status = str(res.get("status", "")).lower().replace("orderstatus.", "")
                 fill_px = res.get("filled_avg_price")
                 if status == "filled" and fill_px is not None:
                     _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, pos["target_5r"])
@@ -482,7 +489,7 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                 logger.info(f"[Dry-run] Trail exit: sell {qty:.2f} {symbol} (Close<SMA20)")
             else:
                 res = _sell(client, symbol, qty)
-                status = str(res.get("status", "")).lower()
+                status = str(res.get("status", "")).lower().replace("orderstatus.", "")
                 fill_px = res.get("filled_avg_price")
                 if status == "filled" and fill_px is not None:
                     _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, sma20)
@@ -502,7 +509,7 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
                 logger.info(f"[Dry-run] Time stop: sell {qty:.2f} {symbol} (held {pos['bars_held']}d)")
             else:
                 res = _sell(client, symbol, qty)
-                status = str(res.get("status", "")).lower()
+                status = str(res.get("status", "")).lower().replace("orderstatus.", "")
                 fill_px = res.get("filled_avg_price")
                 if status == "filled" and fill_px is not None:
                     _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px, close)
