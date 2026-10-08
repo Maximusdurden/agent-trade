@@ -260,7 +260,10 @@ def place_market_sell_order(client, symbol: str, qty: float) -> dict:
                 status_str = str(getattr(updated, "status", ""))
                 if getattr(updated, "filled_avg_price", None) is not None:
                     filled_price = float(updated.filled_avg_price)
-                if status_str.lower() in ("filled", "partially_filled"):
+                # Alpaca's OrderStatus enum stringifies as "OrderStatus.FILLED";
+                # normalize to the plain status name before comparing.
+                status_norm = status_str.lower().replace("orderstatus.", "")
+                if status_norm in ("filled", "partially_filled"):
                     break
             except Exception as poll_err:
                 logger.warning(f"[SELL] Poll error for {symbol}: {poll_err}")
@@ -489,7 +492,7 @@ def _prune_unfilled_orders(client, positions: dict) -> list[str]:
             continue
         try:
             order = client.trading_client.get_order_by_id(order_id=order_id)
-            status = str(getattr(order, "status", "")).lower()
+            status = str(getattr(order, "status", "")).lower().replace("orderstatus.", "")
             filled = float(getattr(order, "filled_qty", 0) or 0)
             # Filled -> log the actual buy fill (entry slippage) and keep.
             if filled > 0:
@@ -566,8 +569,11 @@ def run_monitor(dry_run: bool = False) -> dict:
                 positions.pop(sym, None)
                 continue
             res = place_market_sell_order(client, sym, qty)
-            if res.get("status", "").lower() in ("submitted", "accepted", "held",
-                                                  "filled", "partially_filled"):
+            # Normalize the OrderStatus enum repr ("OrderStatus.FILLED") to the
+            # plain status name before the acceptance check.
+            res_status = str(res.get("status", "")).lower().replace("orderstatus.", "")
+            if res_status in ("submitted", "accepted", "held",
+                              "filled", "partially_filled"):
                 sold.append({"symbol": sym, "reason": e["reason"], "qty": qty,
                              "order_id": res.get("order_id")})
                 positions.pop(sym, None)
