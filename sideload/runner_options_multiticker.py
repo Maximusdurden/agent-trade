@@ -120,64 +120,43 @@ CORRELATION_PAIRS = [
 
 def _batch_load_intraday(client: AlpacaClient, symbols: list[str],
                          days_back: int = 5) -> dict[str, pd.DataFrame]:
-    """Fetch 1-min bars for all symbols in ONE batched request.
+    """Fetch 1-min bars for all symbols (bounded window, no memory blowup).
 
-    ``AlpacaClient.get_historical_bars`` accepts a list of symbols and issues a
-    single ``StockBarsRequest(symbol_or_symbols=[...])`` (with retry + per-symbol
-    fallback), returning a MultiIndex frame. This replaces the serial
-    ``_load_intraday`` per-ticker loop, cutting PM-scan latency from ~N round
-    trips to 1.
+    NOTE: ``get_historical_bars`` with a large ``limit`` is a memory bomb for
+    1-min data: the 1min day_multiplier is 10, so ``limit=1950`` fetches
+    ``1950*10 = 19,500`` calendar days of 1-min bars (~7.6M rows/symbol) before
+    trimming to the last 1950 — OOM on the 1Gi Cloud Run container (observed
+    2026-10-08: "Out-of-memory event detected in container", signal 9).
 
-    Falls back to per-symbol ``_load_intraday`` fetches when the batch call
-    returns no usable intraday data (e.g. a client that only implements the
-    paginated single-symbol path, or a transient batch failure) so the PM gate
-    still evaluates every ticker.
+    Instead, fetch a bounded ``days_back`` window per symbol via the paginated
+    client (no multiplier), which covers the pre-market window + prior session
+    with ~5*390 = 1950 bars/symbol.
     """
     if not symbols:
         return {}
-    try:
-            # Fetch enough 1-min bars to cover the full pre-market window (04:00 ET)
-            # plus the prior session. A single trading day has ~390 1-min bars
-            # (04:00-20:00 ET); limit=days_back*10 (50) only covered ~50 minutes,
-            # which at 09:29 AM ET returned YESTERDAY's close bars, not today's
-            # pre-market — silently disarming every ticker (PM range 0.0000%).
-            df = client.get_historical_bars(
-                symbols, limit=days_back * 390, timeframe_str=INTRADAY_INTERVAL)
-    except Exception as e:
-        logger.warning(f"Batch intraday fetch failed ({e}); falling back to "
-                       f"per-symbol fetches.")
-        df = None
-    if df is None or df.empty:
-        # Fallback: per-symbol paginated fetch (matches the pre-batch behavior).
-        return {sym: _load_intraday(client, sym, days_back=days_back)
-                for sym in symbols}
-    if not isinstance(df.index, pd.MultiIndex):
-            # Single-symbol result: wrap it. Validate the bars are intraday (the
-            # caller may have returned daily bars for a 1min request); if not,
-            # fall back to the per-symbol paginated fetch.
-            sym = symbols[0]
-            idx = pd.to_datetime(df.index)
-            intraday_like = len(idx) > 1 and (idx[1] - idx[0]) < pd.Timedelta(hours=1)
-            if not intraday_like:
-                return {sym: _load_intraday(client, sym, days_back=days_back)}
-            return {sym: df}
     out = {}
     for sym in symbols:
         try:
-            sub = df.xs(sym.upper(), level=0)
-        except KeyError:
+            df = client.get_historical_bars_paginated(
+                sym, timeframe_str=INTRADAY_INTERVAL, days_back=days_back)
+        except Exception as e:
+            logger.warning(f"Batch intraday fetch failed for {sym} ({e}); "
+                           f"falling back to per-symbol fetch.")
+            df = None
+        if df is None or df.empty:
+            df = _load_intraday(client, sym, days_back=days_back)
+        if df is None or df.empty:
             continue
-        sub = sub.copy()
-        sub.index = pd.to_datetime(sub.index)
-        if sub.index.tzinfo is None:
-            sub.index = sub.index.tz_localize("UTC")
-        sub.index = sub.index.tz_convert(ET)
-        out[sym] = sub.sort_index()
-    # If the batch produced nothing usable (e.g. daily bars returned for a 1min
-    # request), fall back to per-symbol fetches so the gate still runs.
-    if not out:
-        return {sym: _load_intraday(client, sym, days_back=days_back)
-                for sym in symbols}
+        df = df.copy()
+        # The paginated client returns a MultiIndex (symbol, timestamp) even
+        # for a single symbol; drop the symbol level.
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index(level=0, drop=True)
+        df.index = pd.to_datetime(df.index)
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_convert(ET)
+        out[sym] = df.sort_index()
     return out
 
 
