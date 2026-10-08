@@ -562,7 +562,7 @@ def _enter_position(client: AlpacaClient, session_date: str, setup: dict,
                 time.sleep(1.0)
                 try:
                     updated = client.trading_client.get_order_by_id(order_id=order_id)
-                    status = str(getattr(updated, "status", "")).lower()
+                    status = str(getattr(updated, "status", "")).lower().replace("orderstatus.", "")
                     if getattr(updated, "filled_avg_price", None) is not None:
                         fill_price = float(updated.filled_avg_price)
                     fq = getattr(updated, "filled_qty", None)
