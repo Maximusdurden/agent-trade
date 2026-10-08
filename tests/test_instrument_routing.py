@@ -30,16 +30,26 @@ def _seed_watchlist(symbols):
 
 
 def _run(decision, positions=None):
+    import core.config as cfg
     g = RiskGuardrails()
     # These tests exercise option-vs-stock routing, not universe gating; endorse NVDA.
     _seed_watchlist(["NVDA"])
-    with patch("core.gcs_sync.check_options_kill_switch", return_value={"status": "ACTIVE"}), \
-         patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0), \
-         patch.object(RiskGuardrails, "is_market_open_check", return_value=(True, "open")):
-        return g.validate_and_adjust_decision(
-            decision, {"equity": 100000.0, "cash": 50000.0}, positions or {},
-            cycle_context={"spent": 0.0, "trades": 0},
-        )
+    # Options routing tests need the option path enabled + a clear earnings
+    # filter (NVDA has real earnings within the DTE window; the passing
+    # test_options.py mocks this the same way).
+    orig_options = cfg.OPTIONS_ENABLED
+    cfg.OPTIONS_ENABLED = True
+    try:
+        with patch("core.gcs_sync.check_options_kill_switch", return_value={"status": "ACTIVE"}), \
+             patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0), \
+             patch.object(RiskGuardrails, "is_market_open_check", return_value=(True, "open")), \
+             patch.object(RiskGuardrails, "_has_earnings_before_expiry", return_value=""):
+            return g.validate_and_adjust_decision(
+                decision, {"equity": 100000.0, "cash": 50000.0}, positions or {},
+                cycle_context={"spent": 0.0, "trades": 0},
+            )
+    finally:
+        cfg.OPTIONS_ENABLED = orig_options
 
 
 class TestInstrumentRouting(unittest.TestCase):

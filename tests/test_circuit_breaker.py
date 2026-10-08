@@ -73,6 +73,11 @@ class TestCircuitBreaker(unittest.TestCase):
 
     def tearDown(self):
         _clean_trades()
+        # Clear the feedback memo cache so cached round-trips from this test
+        # don't leak into later tests (e.g. test_sprint_features' SOL/USD
+        # concentration guardrail would see stale losing trips and block).
+        import core.feedback as fb
+        fb._memo.clear()
         config.MAX_ROUND_TRIPS_PER_DAY = self._orig_rt
 
     def _decision(self, symbol, qty=10.0, price=100.0):

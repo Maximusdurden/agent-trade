@@ -249,17 +249,56 @@ class TestBacktestSimulator(unittest.TestCase):
         from core import config as core_cfg
         from sideload import config_sideload as sl_cfg
 
-        # Core default: options disabled (P3 split).
-        self.assertFalse(core_cfg.OPTIONS_ENABLED)
+        # Snapshot the config knobs this test mutates so they are restored
+        # afterward (the sideload overrides mutate the shared base_config and
+        # would otherwise leak OPTIONS_ENABLED=True / MAX_TICKER_ALLOCATION_PCT
+        # etc. into later tests, e.g. test_sprint_features' concentration
+        # guardrail).
+        _snap = {
+            "OPTIONS_ENABLED": core_cfg.OPTIONS_ENABLED,
+            "OPTIONS_DTE_MIN": core_cfg.OPTIONS_DTE_MIN,
+            "OPTIONS_DTE_MAX": core_cfg.OPTIONS_DTE_MAX,
+            "OPTIONS_OTM_PERCENT_MIN": getattr(core_cfg, "OPTIONS_OTM_PERCENT_MIN", None),
+            "OPTIONS_OTM_PERCENT_MAX": getattr(core_cfg, "OPTIONS_OTM_PERCENT_MAX", None),
+            "OPTIONS_MAX_ALLOCATION_PCT": core_cfg.OPTIONS_MAX_ALLOCATION_PCT,
+            "OPTIONS_MAX_CONTRACTS_PER_TICKER": core_cfg.OPTIONS_MAX_CONTRACTS_PER_TICKER,
+            "OPTIONS_CONVICTION_THRESHOLD": core_cfg.OPTIONS_CONVICTION_THRESHOLD,
+            "OPTIONS_AUTO_CLOSE_DTE": core_cfg.OPTIONS_AUTO_CLOSE_DTE,
+            "OPTIONS_EVENT_GATE_ENABLED": getattr(core_cfg, "OPTIONS_EVENT_GATE_ENABLED", None),
+            "OPTIONS_UNIVERSE": list(core_cfg.OPTIONS_UNIVERSE),
+            # apply_sideload_overrides() knobs (risk/sizing/entry-exit gates).
+            "SL_SYMBOL": getattr(core_cfg, "SL_SYMBOL", None),
+            "SL_CYCLE_PREFIX": getattr(core_cfg, "SL_CYCLE_PREFIX", None),
+            "SL_DAILY_TARGET_USD": getattr(core_cfg, "SL_DAILY_TARGET_USD", None),
+            "MAX_TRADE_ALLOCATION_PCT": core_cfg.MAX_TRADE_ALLOCATION_PCT,
+            "MAX_TICKER_ALLOCATION_PCT": core_cfg.MAX_TICKER_ALLOCATION_PCT,
+            "MIN_CASH_BUFFER_PCT": core_cfg.MIN_CASH_BUFFER_PCT,
+            "DAILY_LOSS_LIMIT_PCT": core_cfg.DAILY_LOSS_LIMIT_PCT,
+            "EQUITY_RSI_ENTRY_MAX": core_cfg.EQUITY_RSI_ENTRY_MAX,
+            "RSI_EXIT_OVERBOUGHT": core_cfg.RSI_EXIT_OVERBOUGHT,
+            "VWAP_DEAD_ZONE_SIGMA": core_cfg.VWAP_DEAD_ZONE_SIGMA,
+            "MIN_EDGE_SIGMA": core_cfg.MIN_EDGE_SIGMA,
+            "VOL_SIZING_BASELINE_ATR_PCT": core_cfg.VOL_SIZING_BASELINE_ATR_PCT,
+            "MAX_HOLD_HOURS": core_cfg.MAX_HOLD_HOURS,
+            "TRAIL_STOP_GIVEBACK_PCT": core_cfg.TRAIL_STOP_GIVEBACK_PCT,
+            "MAX_ROUND_TRIPS_PER_DAY": core_cfg.MAX_ROUND_TRIPS_PER_DAY,
+            "TRADING_UNIVERSE": list(core_cfg.TRADING_UNIVERSE),
+        }
+        try:
+            # Core default: options disabled (P3 split).
+            self.assertFalse(core_cfg.OPTIONS_ENABLED)
 
-        # Sideload options lane: enables options with AMD tuning.
-        sl_cfg.apply_sideload_overrides()
-        sl_cfg.apply_sideload_options_overrides()
-        self.assertTrue(core_cfg.OPTIONS_ENABLED)
-        self.assertIn("AMD", core_cfg.OPTIONS_UNIVERSE)
-        # AMD-specific DTE window (shorter than core's 30-60).
-        self.assertLessEqual(core_cfg.OPTIONS_DTE_MIN, 14)
-        self.assertLessEqual(core_cfg.OPTIONS_DTE_MAX, 45)
+            # Sideload options lane: enables options with AMD tuning.
+            sl_cfg.apply_sideload_overrides()
+            sl_cfg.apply_sideload_options_overrides()
+            self.assertTrue(core_cfg.OPTIONS_ENABLED)
+            self.assertIn("AMD", core_cfg.OPTIONS_UNIVERSE)
+            # AMD-specific DTE window (shorter than core's 30-60).
+            self.assertLessEqual(core_cfg.OPTIONS_DTE_MIN, 14)
+            self.assertLessEqual(core_cfg.OPTIONS_DTE_MAX, 45)
+        finally:
+            for _k, _v in _snap.items():
+                setattr(core_cfg, _k, _v)
 
     def test_hard_stop_loss_realizes_losers(self):
         """P0: a hard stop-loss must realize losers instead of dropping them.

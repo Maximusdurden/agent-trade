@@ -117,19 +117,28 @@ class TestStrategistInstrumentHint(unittest.TestCase):
 
     def test_total_options_exposure_cap_blocks_buy(self):
         _seed_watchlist(["NVDA"])
+        import core.config as cfg
         g = RiskGuardrails()
         decision = {"action": "BUY", "symbol": "NVDA", "quantity": 1.0,
                     "conviction": 0.9, "direction": "bearish", "instrument": "option",
                     "current_price": 100.0}
         # Simulate an existing option position already at the cap (15% of 100k = 15k).
         positions = {"NVDA261016C00230000": {"qty": 1, "market_value": 15000.0}}
-        with patch("core.gcs_sync.check_options_kill_switch", return_value={"status": "ACTIVE"}), \
-             patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0), \
-             patch.object(RiskGuardrails, "is_market_open_check", return_value=(True, "open")):
-            ok, msg, adj = g.validate_and_adjust_decision(
-                decision, {"equity": 100000.0, "cash": 50000.0}, positions,
-                cycle_context={"spent": 0.0, "trades": 0},
-            )
+        # Options path must be enabled to reach the exposure-cap check, and the
+        # earnings filter must be clear (NVDA has real earnings in the DTE window).
+        orig_options = cfg.OPTIONS_ENABLED
+        cfg.OPTIONS_ENABLED = True
+        try:
+            with patch("core.gcs_sync.check_options_kill_switch", return_value={"status": "ACTIVE"}), \
+                 patch.object(RiskGuardrails, "_get_options_buying_power", return_value=100000.0), \
+                 patch.object(RiskGuardrails, "is_market_open_check", return_value=(True, "open")), \
+                 patch.object(RiskGuardrails, "_has_earnings_before_expiry", return_value=""):
+                ok, msg, adj = g.validate_and_adjust_decision(
+                    decision, {"equity": 100000.0, "cash": 50000.0}, positions,
+                    cycle_context={"spent": 0.0, "trades": 0},
+                )
+        finally:
+            cfg.OPTIONS_ENABLED = orig_options
         self.assertFalse(ok)
         self.assertIn("Total options exposure", msg)
 

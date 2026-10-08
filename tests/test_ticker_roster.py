@@ -11,6 +11,18 @@ from tools.ticker_promotion_relegation import (
     MIN_TRADES, MIN_WIN_RATE, MIN_EXPECTANCY,
 )
 
+# The tool module sets DATABASE_FILENAME to the cloud snapshot at import time
+# (a process-wide side effect). Restore the isolated test DB so later tests
+# (e.g. test_sprint_features) don't read/write the cloud DB. core.config
+# computes DATABASE_PATH at import, so it must be reloaded to re-read the env
+# var, then core.database (which imports DATABASE_PATH from config).
+os.environ["DATABASE_FILENAME"] = "test_ticker_roster.db"
+import importlib
+import core.config as _cfg
+importlib.reload(_cfg)
+import core.database as _db
+importlib.reload(_db)
+
 
 def _stats(n, wr, exp, total_pnl):
     return {
