@@ -71,7 +71,16 @@ LEGACY_HARD_EXIT_TIME = dtime(11, 30, 0)
 
 # Option premium model (corrected first-order Taylor expansion).
 DELTA_PROXY = 0.45
-ENTRY_PREMIUM = 1.50          # ~$1.50 for SPY first-OTM 0DTE
+TICKER_PREMIUMS = {
+    "META": 4.50,
+    "TSLA": 3.50,
+    "SPY": 1.50,
+    "QQQ": 1.50,
+    "NVDA": 2.50,
+    "AAPL": 1.50,
+    "MSFT": 2.50,
+}
+DEFAULT_PREMIUM = 2.00
 THETA_DECAY_PER_15MIN = 0.015  # ~0.015 per 15 min of hold
 
 # Model A window.
@@ -161,7 +170,8 @@ def _vwap_at(vwap_series: pd.Series, ts) -> float | None:
 
 def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
                    entry_price: float, stop_loss_pct: float = STOP_LOSS_PCT,
-                   use_ema_trail: bool = False, legacy_exit: bool = False) -> dict:
+                   use_ema_trail: bool = False, legacy_exit: bool = False,
+                   entry_premium: float = 1.50) -> dict:
     """Simulate the exit from entry.
 
     Live exit rules (default): +45% target, -22% stop, 30-min time stop —
@@ -182,7 +192,6 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
     if window.empty:
         return {"traded": False, "reason": "no_data"}
 
-    entry_premium = ENTRY_PREMIUM
     premium = entry_premium
     peak_premium = entry_premium
     exit_premium = None
@@ -214,8 +223,9 @@ def _simulate_exit(day_bars: pd.DataFrame, entry_ts, direction: str,
 
         # Live exit rules: +45% target, -22% stop, 30-min time stop.
         if not legacy_exit:
-            if premium >= entry_premium * (1.0 + TP_PCT):
-                exit_premium, exit_reason = premium, "target_45pct"
+            target_limit = entry_premium * (1.0 + TP_PCT)
+            if premium >= target_limit:
+                exit_premium, exit_reason = target_limit, "target_45pct"
                 break
             if premium <= entry_premium * (1.0 - stop_pct):
                 exit_premium, exit_reason = premium, "stop_22pct"
@@ -387,9 +397,10 @@ def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str,
 
         if setup is None:
             continue
+        opt_prem = TICKER_PREMIUMS.get(symbol, DEFAULT_PREMIUM)
         sim = _simulate_exit(day_bars, setup["entry_ts"], setup["direction"],
-                                     setup["entry_price"], use_ema_trail=use_ema,
-                                     legacy_exit=legacy_exit)
+                             setup["entry_price"], use_ema_trail=use_ema,
+                             legacy_exit=legacy_exit, entry_premium=opt_prem)
         if sim["traded"]:
             sim["date"] = str(day.date())
             sim["symbol"] = symbol
