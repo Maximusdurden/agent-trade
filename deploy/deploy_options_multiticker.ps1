@@ -11,9 +11,9 @@
 # Deploys ONE job from the sideload image (entrypoint = runner_options_multiticker.py):
 #   - options-multiticker-runner : TSLA/META Model A options runner (live)
 #
-# Schedule: 09:25 AM ET Mon-Fri (4 min early-boot hold to 09:29:50 PM gate).
-#   - 09:25 EDT (Mar-Nov) == 13:25 UTC -> "25 13 * * 1-5"
-#   - 09:25 EST (Nov-Mar) == 14:25 UTC -> "25 14 * * 1-5"
+# Schedule: 09:25 AM ET Mon-Fri (4 min early-boot hold to 09:29:50 PM gate),
+# expressed in local ET with an explicit --time-zone so DST is handled
+# automatically (no UTC-cron rewrite needed in March/November).
 
 # Accept -Auto (non-interactive) flag. The script is already non-interactive;
 # this parameter is accepted for compatibility with automated invocation.
@@ -218,10 +218,11 @@ $ErrorActionPreference = $OldPreference
 
 # Run at 09:25 AM ET Mon-Fri (4 min before the 09:29:50 PM gate so the
 # container absorbs the 3-4 min Cloud Run cold start and holds via the
-# early-boot wait loop). UTC cron depends on DST:
-#   - 09:25 EDT (Mar-Nov) == 13:25 UTC -> "25 13 * * 1-5"
-#   - 09:25 EST (Nov-Mar) == 14:25 UTC -> "25 14 * * 1-5"
-& $GCloud scheduler jobs create http $SchedulerName --schedule="25 13 * * 1-5" `
+# early-boot wait loop). The cron is expressed in LOCAL ET time with an
+# explicit --time-zone, so DST transitions (Mar/Nov) are handled
+# automatically — no biannual UTC-cron rewrite.
+& $GCloud scheduler jobs create http $SchedulerName --schedule="25 9 * * 1-5" `
+    --time-zone="America/New_York" `
     --location $Region `
     --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/${JobName}:run" `
     --http-method=POST `
