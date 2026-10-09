@@ -48,6 +48,7 @@ if PROJECT_ROOT not in sys.path:
 from sideload.jira_logging import setup_jira_logging, log_exception_to_jira
 from core.alpaca_client import AlpacaClient
 from core.discord_notifier import send_discord_message
+from sideload.runner_options_tsla import SWEEP_MIN_PENETRATION
 
 logger = logging.getLogger("BacktestEntryAblation")
 
@@ -275,6 +276,10 @@ def model_a_sweep_fade(day_bars: pd.DataFrame, day: pd.Timestamp,
                        anchors: dict, vwap_series: pd.Series) -> dict | None:
     """Detect a liquidity sweep fade setup.
 
+    Requires a minimum sweep penetration (SWEEP_MIN_PENETRATION dollars beyond
+    PMH/PML) so sub-cent noise wiggles don't trigger (e.g. Oct 6's $0.03
+    false positive). Matches the live runner's _model_a_setup_for.
+
     Returns {'direction', 'entry_ts', 'entry_price'} or None.
     """
     a_start = day.replace(hour=MODEL_A_START.hour, minute=MODEL_A_START.minute)
@@ -285,19 +290,20 @@ def model_a_sweep_fade(day_bars: pd.DataFrame, day: pd.Timestamp,
     pmh, pml = anchors.get("pmh"), anchors.get("pml")
     if pmh is None or pml is None:
         return None
+    min_pen = float(SWEEP_MIN_PENETRATION)
 
     for ts, bar in window.iterrows():
         high = float(bar["high"])
         close = float(bar["close"])
         vwap = _vwap_at(vwap_series, ts)
 
-        # Bearish sweep: High > PMH (swept), Close < PMH (failed), Close < VWAP.
-        if high > pmh and close < pmh and vwap is not None and close < vwap:
+        # Bearish sweep: High > PMH + min_pen, Close < PMH, Close < VWAP.
+        if (high - pmh) >= min_pen and close < pmh and vwap is not None and close < vwap:
             return {"direction": "BEARISH", "entry_ts": ts, "entry_price": close}
 
-        # Bullish sweep: Low < PML (swept), Close > PML (failed), Close > VWAP.
+        # Bullish sweep: Low < PML - min_pen, Close > PML, Close > VWAP.
         if low := float(bar["low"]):
-            if low < pml and close > pml and vwap is not None and close > vwap:
+            if (pml - low) >= min_pen and close > pml and vwap is not None and close > vwap:
                 return {"direction": "BULLISH", "entry_ts": ts, "entry_price": close}
 
     return None

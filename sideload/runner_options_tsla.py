@@ -91,6 +91,17 @@ PM_VOL_MIN = float(os.environ.get("OPTIONS_PM_VOL_MIN", "0.0020"))
 MODEL_A_START = dtime(9, 30, 0)
 MODEL_A_END = dtime(10, 15, 0)
 
+# Minimum sweep penetration (dollars) beyond PMH/PML for a valid Model A setup.
+# A sweep must push at least this far past the pre-market anchor to be a real
+# liquidity sweep, not a sub-cent noise wiggle. Analysis 2026-10-09 (252d):
+#   - 8% of setups penetrate < $0.25 (noise; e.g. Oct 6's $0.03 false positive)
+#   - median penetration $1.04; 53% penetrate > $1.00
+#   - $0.25-0.50 filters noise while keeping genuine setups (Oct 7)
+#   - $1.00 improves backtest PF (1.06 -> 1.22) but cuts trades 40%
+# Default $0.25; configurable via OPTIONS_SWEEP_MIN_PENETRATION.
+SWEEP_MIN_PENETRATION = float(
+    os.environ.get("OPTIONS_SWEEP_MIN_PENETRATION", "0.25"))
+
 # PM gate evaluation time.
 PM_GATE_TIME = dtime(9, 29, 50)
 

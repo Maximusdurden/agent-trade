@@ -63,11 +63,12 @@ from sideload.runner_options_tsla import (
     STOP_PCT,
     MAX_HOLD_MINUTES,
     PM_VOL_MIN,
-    MODEL_A_START,
-    MODEL_A_END,
-    POLL_INTERVAL_SECONDS,
-        INTRADAY_INTERVAL,
-    )
+        SWEEP_MIN_PENETRATION,
+        MODEL_A_START,
+        MODEL_A_END,
+        POLL_INTERVAL_SECONDS,
+            INTRADAY_INTERVAL,
+        )
 from core.alpaca_client import AlpacaClient
 from core.discord_notifier import send_discord_message
 from core.database import record_rejection
@@ -352,22 +353,27 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
     close = float(latest_bar["close"])
     vwap = _vwap_at(vwap_series, latest_ts)
 
-    # Bearish sweep: High > PMH, Close < PMH, Close < VWAP.
-    if high > pmh and close < pmh and vwap is not None and close < vwap:
+    # Minimum sweep penetration: the bar must push at least
+    # SWEEP_MIN_PENETRATION dollars beyond PMH/PML to be a genuine liquidity
+    # sweep, not a sub-cent noise wiggle (e.g. Oct 6's $0.03 false positive).
+    min_pen = float(SWEEP_MIN_PENETRATION)
+
+    # Bearish sweep: High > PMH + min_pen, Close < PMH, Close < VWAP.
+    if (high - pmh) >= min_pen and close < pmh and vwap is not None and close < vwap:
         return {"direction": "BEARISH", "entry_ts": latest_ts, "entry_price": close}
 
-    # Bullish sweep: Low < PML, Close > PML, Close > VWAP.
-    if low < pml and close > pml and vwap is not None and close > vwap:
+    # Bullish sweep: Low < PML - min_pen, Close > PML, Close > VWAP.
+    if (pml - low) >= min_pen and close > pml and vwap is not None and close > vwap:
         return {"direction": "BULLISH", "entry_ts": latest_ts, "entry_price": close}
 
     # Audit trail: explain WHY the latest bar did not trigger, so a missed
     # session is attributable to market conditions vs a software defect.
-    swept_high = high > pmh
-    swept_low = low < pml
+    swept_high = (high - pmh) >= min_pen
+    swept_low = (pml - low) >= min_pen
     if swept_high or swept_low:
         reason_parts = []
         if swept_high:
-            reason_parts.append(f"high {high:.2f} > PMH {pmh:.2f}")
+            reason_parts.append(f"high {high:.2f} > PMH {pmh:.2f} (+{high-pmh:.2f})")
             if close >= pmh:
                 reason_parts.append(f"close {close:.2f} NOT < PMH")
             if vwap is None:
@@ -375,7 +381,7 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
             elif close >= vwap:
                 reason_parts.append(f"close {close:.2f} NOT < VWAP {vwap:.2f}")
         if swept_low:
-            reason_parts.append(f"low {low:.2f} < PML {pml:.2f}")
+            reason_parts.append(f"low {low:.2f} < PML {pml:.2f} (-{pml-low:.2f})")
             if close <= pml:
                 reason_parts.append(f"close {close:.2f} NOT > PML")
             if vwap is None:
@@ -385,6 +391,14 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
         logger.info(
             f"[{symbol}] Bar {latest_ts.strftime('%H:%M')} swept "
             f"({'/'.join(reason_parts)}); no trigger."
+        )
+    elif (high > pmh or low < pml):
+        # Swept the anchor but penetration below the minimum threshold.
+        pen_high = high - pmh if high > pmh else 0.0
+        pen_low = pml - low if low < pml else 0.0
+        logger.info(
+            f"[{symbol}] Bar {latest_ts.strftime('%H:%M')} penetration too shallow "
+            f"(high+{pen_high:.2f}/low-{pen_low:.2f} < min ${min_pen:.2f}); no trigger."
         )
 
     return None
