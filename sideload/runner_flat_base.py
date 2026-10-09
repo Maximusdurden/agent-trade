@@ -232,7 +232,12 @@ def _place_moc_order(client: AlpacaClient, symbol: str, qty: float, side: str = 
                 # Alpaca's OrderStatus enum stringifies as "orderstatus.filled";
                 # normalize to the plain status name before comparing.
                 status_norm = status_str.lower().replace("orderstatus.", "")
-                if status_norm in ("filled", "partially_filled"):
+                # Only a FULL fill is terminal for position tracking. A
+                # partially_filled status is NOT terminal: the order can
+                # complete to full fill moments later (observed 2026-10-08:
+                # HPE showed partially_filled at poll, fully filled 1s later,
+                # orphaning the position). Keep polling for full fill.
+                if status_norm == "filled":
                     break
             except Exception as poll_err:
                 logger.warning(f"[MOC] Poll error for {symbol}: {poll_err}")
@@ -268,7 +273,12 @@ def _sell(client: AlpacaClient, symbol: str, qty: float) -> dict:
                 # Alpaca's OrderStatus enum stringifies as "orderstatus.filled";
                 # normalize to the plain status name before comparing.
                 status_norm = status_str.lower().replace("orderstatus.", "")
-                if status_norm in ("filled", "partially_filled"):
+                # Only a FULL fill is terminal for position tracking. A
+                # partially_filled status is NOT terminal: the order can
+                # complete to full fill moments later (observed 2026-10-08:
+                # HPE showed partially_filled at poll, fully filled 1s later,
+                # orphaning the position). Keep polling for full fill.
+                if status_norm == "filled":
                     break
             except Exception as poll_err:
                 logger.warning(f"[SELL] Poll error for {symbol}: {poll_err}")
