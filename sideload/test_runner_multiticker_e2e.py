@@ -119,7 +119,12 @@ class FakeClient:
 
     def get_historical_bars_paginated(self, symbol, timeframe_str="1min",
                                       days_back=5):
-        return self._intraday.copy()
+        df = self._intraday.copy()
+        # No lookahead: serve only bars with close time <= the simulated clock
+        # so the freshness check (bar within 120s) and the sweep evaluation see
+        # exactly what the live runner would at the simulated moment.
+        now_t = FakeDatetime.now(ET)
+        return df[df.index <= now_t]
 
     def get_historical_bars(self, symbol, limit=100, timeframe_str="day",
                             max_retries=3):
@@ -210,13 +215,29 @@ def run_replay() -> dict:
     monitor_quote = FakeQuote(5.10, 5.15)
     client = FakeClient(intraday, daily, chain, monitor_quote)
 
-    # Patch datetime.now in both runner modules + time.sleep to no-op.
+    # Patch datetime.now in both runner modules + time.sleep to advance the
+    # synthetic clock (so the monitor loop's time-stop can fire).
+    # Also patch the GCS DB sync (download/upload) to no-ops: run_session now
+    # syncs the shared DB to GCS, which would hit the network and hang the
+    # offline test. And force the PM gate to use the SYNTHETIC pre-market bars
+    # (the yfinance path would fetch real TSLA PM data and defeat the fixture).
+    pm_bars_synthetic = intraday[(intraday.index >=
+                                  pd.Timestamp(f"{SESSION_DATE} 04:00", tz=ET)) &
+                                 (intraday.index <=
+                                  pd.Timestamp(f"{SESSION_DATE} 09:29", tz=ET))]
     with mock.patch.object(mt, "datetime", FakeDatetime), \
          mock.patch.object(tsla, "datetime", FakeDatetime), \
          mock.patch.object(mt, "time") as mock_mt_time, \
-         mock.patch.object(tsla, "time") as mock_tsla_time:
-        mock_mt_time.sleep = lambda s: None
-        mock_tsla_time.sleep = lambda s: None
+         mock.patch.object(tsla, "time") as mock_tsla_time, \
+         mock.patch("core.gcs_sync.download_from_gcs"), \
+         mock.patch("core.gcs_sync.upload_to_gcs"), \
+         mock.patch("core.gcs_sync.get_gcs_client", return_value=None), \
+         mock.patch.object(mt, "_load_pm_bars_yfinance",
+                           return_value=pm_bars_synthetic.copy()):
+        # Advancing the clock on sleep lets the monitor loop walk toward its
+        # 30-min time stop instead of polling the same instant forever.
+        mock_mt_time.sleep = lambda s: clock.advance(seconds=int(s or 1))
+        mock_tsla_time.sleep = lambda s: clock.advance(seconds=int(s or 1))
 
         # Patch the client factory so run_session uses our FakeClient.
         with mock.patch.object(mt, "AlpacaClient", return_value=client):

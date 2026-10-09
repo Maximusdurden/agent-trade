@@ -11,9 +11,9 @@
 # Deploys ONE job from the sideload image (entrypoint = runner_options_multiticker.py):
 #   - options-multiticker-runner : TSLA/META Model A options runner (live)
 #
-# Schedule: 09:29 AM ET Mon-Fri (cron "29 9 * * 1-5").
-#   - 09:29 EDT (Mar-Nov) == 13:29 UTC -> "29 13 * * 1-5"
-#   - 09:29 EST (Nov-Mar) == 14:29 UTC -> "29 14 * * 1-5"
+# Schedule: 09:25 AM ET Mon-Fri (4 min early-boot hold to 09:29:50 PM gate).
+#   - 09:25 EDT (Mar-Nov) == 13:25 UTC -> "25 13 * * 1-5"
+#   - 09:25 EST (Nov-Mar) == 14:25 UTC -> "25 14 * * 1-5"
 
 # Accept -Auto (non-interactive) flag. The script is already non-interactive;
 # this parameter is accepted for compatibility with automated invocation.
@@ -88,7 +88,32 @@ if (Test-Path $StagingDir) { Remove-Item $StagingDir -Recurse -Force }
 New-Item -ItemType Directory -Path $StagingDir | Out-Null
 
 Copy-Item "Z:\python\projects\agent-trade\*" -Destination $StagingDir -Recurse -Force `
-    -Exclude "venv", ".venv", ".git", "deploy", ".env", "trading_agent.db", "trading.log", "__pycache__"
+    -Exclude "venv", ".venv", ".git", "deploy", ".env", "trading_agent.db", "trading.log", "__pycache__", `
+              "*.db", "*.log", "*.csv", "*.png", "live_gcs_trading_agent.db", "cloud_downloaded_trading_agent.db", `
+              "trading_agent_live.db", "_tmp_gcs2.db", "clean_local_db.py", "clean_mock_orders.py", `
+              "check_*.py", "compare_*.py", "verify_*.py", "run_health_check.py", "run_blog.py", `
+              "run_amd_*.py", "run_roster_*.py", "run_swing_*.py", "runner_diff.txt", "sprint_plan.md", `
+              "kill_switch.json", "options_kill_switch.json", "screener_pool.json", "GEMINI.md", `
+              "README.md", "agent_trade_deep_dive.py", "transition_task.py", "verify_jira_logging.py", `
+              "verify_ko_fix.py", "check_db.py", "check_db_portfolio.py", "check_ko.py", `
+              "check_projects.py", "check_watchlist.py", "check_cf_dns.py", "check_cloudflare.py", `
+              "close_nontech_error_tickets.py", "mcp_server.py", "cloud_dod_balances.csv", `
+              "portfolio_dod_balances.csv", "trading_cloud.log", "trading_agent.log", "_tmp_gcs2.db", `
+              "cloud_performance_vs_indices.py", "cloud_ticker_performance.py", "_tmp_replay_out.txt", `
+              "_tmp_replay_err.txt", ".agyrule"
+
+# Copy only the runtime code directories + tests are excluded (not needed at runtime).
+# The staging COPY below then prunes non-runtime dirs (logs, reports, tests, tools, docs, feedback).
+foreach ($NonRuntimeDir in @("logs", "reports", "tests", "tools", "docs", "feedback", ".pytest_cache", ".gemini", ".githooks", ".github", ".vscode")) {
+    $DirToPrune = Join-Path $StagingDir $NonRuntimeDir
+    if (Test-Path $DirToPrune) {
+        Remove-Item $DirToPrune -Recurse -Force
+        Write-Host "Pruned non-runtime dir from staging: $NonRuntimeDir"
+    }
+}
+# Also prune any stray DB/log/backup files that slipped through (defense-in-depth).
+Get-ChildItem $StagingDir -Recurse -File -Include "*.db", "*.log", "*.csv", "*.png", "*.bak*" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 
 # Copy the sibling agent-jira-client dependency (needed for error->Jira logging).
 Copy-Item "Z:\python\projects\agent-jira-client" -Destination (Join-Path $StagingDir "agent-jira-client") -Recurse -Force -Exclude "venv", ".git"
@@ -191,10 +216,12 @@ $ErrorActionPreference = "SilentlyContinue"
 & $GCloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
 $ErrorActionPreference = $OldPreference
 
-# Run at 09:29 AM ET Mon-Fri. UTC cron depends on DST:
-#   - 09:29 EDT (Mar-Nov) == 13:29 UTC -> "29 13 * * 1-5"
-#   - 09:29 EST (Nov-Mar) == 14:29 UTC -> "29 14 * * 1-5"
-& $GCloud scheduler jobs create http $SchedulerName --schedule="29 13 * * 1-5" `
+# Run at 09:25 AM ET Mon-Fri (4 min before the 09:29:50 PM gate so the
+# container absorbs the 3-4 min Cloud Run cold start and holds via the
+# early-boot wait loop). UTC cron depends on DST:
+#   - 09:25 EDT (Mar-Nov) == 13:25 UTC -> "25 13 * * 1-5"
+#   - 09:25 EST (Nov-Mar) == 14:25 UTC -> "25 14 * * 1-5"
+& $GCloud scheduler jobs create http $SchedulerName --schedule="25 13 * * 1-5" `
     --location $Region `
     --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/${JobName}:run" `
     --http-method=POST `
@@ -206,6 +233,6 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "`nDone: options-multiticker-runner job deployed."
 Write-Host "  Job       : $JobName"
-Write-Host "  Scheduler : $SchedulerName  ~09:29 AM ET Mon-Fri"
+Write-Host "  Scheduler : $SchedulerName  ~09:25 AM ET Mon-Fri (early boot, holds to 09:29:50)"
 Write-Host "  Resources : $Cpu CPU, $Memory RAM, timeout $Timeout, max-retries $MaxRetries"
 Write-Host "Verify: & $GCloud run jobs list --region $Region"

@@ -96,6 +96,12 @@ ACTIVE_UNIVERSE = list(TICKER_CONFIG.keys())
 # Set to 5s to reduce REST API load (was 2s -> 60-120 req/min, triggering 429s).
 EVAL_INTERVAL_SECONDS = 5
 
+# PM-gate boot target: the runner sleeps until this ET time when it boots early
+# (Cloud Run cold start can take 3-4 min, so the scheduler fires at 09:25 ET and
+# the container holds until the PM gate moment). This guarantees the poll loop
+# is live from 09:30:00 ET — no missed setups from late cold starts.
+PM_GATE_BOOT_TARGET = dtime(9, 29, 50)
+
 # Entry fill confirmation.
 FILL_CONFIRM_SECONDS = 5   # Max seconds to poll for a fill.
 FILL_POLL_INTERVAL = 1.0   # Poll cadence (seconds).
@@ -602,6 +608,16 @@ def run_replay_session(replay_date: str) -> dict:
     real_client = AlpacaClient()
     state = {"active_position": None, "last_session": replay_date}
 
+    # Reset circuit-breaker + position state so the replay is idempotent
+    # (repeated runs must not accumulate trades_today and get "skipped").
+    from sideload.options_execution_guards import STATE_FILE as CB_STATE_FILE
+    for path in (CB_STATE_FILE, STATE_PATH):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.warning(f"Could not reset {path}: {e}")
+
     class _Clock:
         def __init__(self, start: _dt.datetime):
             self.t = start
@@ -745,12 +761,15 @@ def run_replay_session(replay_date: str) -> dict:
          mock.patch.object(sys.modules["sideload.runner_options_tsla"],
                            "datetime", _FakeDatetime), \
          mock.patch.object(sys.modules[__name__], "time") as mock_mt_time, \
+         mock.patch.object(sys.modules["sideload.runner_options_tsla"],
+                           "time") as mock_tsla_time, \
          mock.patch.object(sys.modules[__name__], "AlpacaClient",
                            return_value=client):
-        # Each 5s sleep in the poll loop advances the synthetic clock, so the
-        # loop walks the FULL 09:30-10:15 ET window exactly as live (polls every
-        # EVAL_INTERVAL_SECONDS, sees only bars published up to simulated time).
+        # Each sleep in the poll/monitor loops advances the synthetic clock, so
+        # the loop walks the FULL 09:30-10:15 ET window (and the monitor's
+        # 30-min hold) instantly instead of in real time.
         mock_mt_time.sleep = lambda s: clock.advance(seconds=int(s))
+        mock_tsla_time.sleep = lambda s: clock.advance(seconds=int(s))
         try:
             result = _run_session_inner(client, state, replay_date, dry_run=True,
                                         active=ACTIVE_UNIVERSE)
@@ -813,6 +832,34 @@ def _run_session_inner(client: AlpacaClient, state: dict, session_date: str,
     if blackout["blocked"]:
         logger.info(f"Macro blackout: {blackout['reason']}")
         return {"status": "skipped", "reason": blackout["reason"]}
+
+    # Early-boot hold: Cloud Run cold start can take 3-4 min (observed
+    # 2026-10-09: scheduler fired 09:29, app started 09:32:55 — the 09:31
+    # sweep bar was already >120s old and silently dropped). The scheduler now
+    # fires at 09:25 ET; if this container is up before the PM-gate moment,
+    # hold here until 09:29:50 ET so the poll loop is live from 09:30:00.
+    now_et = datetime.now(ET)
+    boot_target = now_et.replace(hour=PM_GATE_BOOT_TARGET.hour,
+                                 minute=PM_GATE_BOOT_TARGET.minute,
+                                 second=PM_GATE_BOOT_TARGET.second,
+                                 microsecond=0)
+    # Wait only if today is the session date (never hold a stale run past
+    # market hours) and we are before the target.
+    today_str = now_et.strftime("%Y-%m-%d")
+    if today_str == session_date and now_et < boot_target:
+        logger.info(
+            f"Container initialized at {now_et.strftime('%H:%M:%S')}. "
+            f"Sleeping until PM gate at 09:29:50 ET..."
+        )
+        while True:
+            now_et = datetime.now(ET)
+            if now_et >= boot_target:
+                break
+            # Sleep in small slices so shutdown signals are handled promptly
+            # (Cloud Run sends SIGTERM on job deletion/forced stop; a single
+            # long sleep would block graceful shutdown).
+            time.sleep(min(5.0, (boot_target - now_et).total_seconds()))
+        logger.info(f"PM gate moment reached at {datetime.now(ET).strftime('%H:%M:%S')}.")
 
     # 1. Pre-market volatility gate for each ticker; disarm failures.
     #    Batch-fetch all 1-min bars in ONE request, then slice per symbol.
