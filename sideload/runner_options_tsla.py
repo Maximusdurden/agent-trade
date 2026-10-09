@@ -327,12 +327,18 @@ def _model_a_setup(client: AlpacaClient, session_date: str,
         close = float(bar["close"])
         vwap = _vwap_at(vwap_series, ts)
 
-        # Bearish sweep: High > PMH, Close < PMH, Close < VWAP.
-        if high > pmh and close < pmh and vwap is not None and close < vwap:
+        # Minimum sweep penetration: the bar must push at least
+        # SWEEP_MIN_PENETRATION dollars beyond PMH/PML to be a genuine
+        # liquidity sweep, not a sub-cent noise wiggle. Matches the
+        # multi-ticker runner and backtest.
+        min_pen = float(SWEEP_MIN_PENETRATION)
+
+        # Bearish sweep: High > PMH + min_pen, Close < PMH, Close < VWAP.
+        if (high - pmh) >= min_pen and close < pmh and vwap is not None and close < vwap:
             return {"direction": "BEARISH", "entry_ts": ts, "entry_price": close}
 
-        # Bullish sweep: Low < PML, Close > PML, Close > VWAP.
-        if low < pml and close > pml and vwap is not None and close > vwap:
+        # Bullish sweep: Low < PML - min_pen, Close > PML, Close > VWAP.
+        if (pml - low) >= min_pen and close > pml and vwap is not None and close > vwap:
             return {"direction": "BULLISH", "entry_ts": ts, "entry_price": close}
 
     return None

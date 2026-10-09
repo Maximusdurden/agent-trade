@@ -22,63 +22,75 @@ from sideload import options_execution_guards as guards
 class TestSweepPenetrationThreshold(unittest.TestCase):
     """Model A setup requires a minimum sweep penetration beyond PMH/PML.
 
-    A sub-cent wiggle (e.g. Oct 6's $0.03 dip below PML) must NOT trigger;
-    a genuine sweep (>= SWEEP_MIN_PENETRATION) must.
+    Tests the LIVE runner logic (_model_a_setup_for) directly, mocking only
+    the intraday fetch and clock. A sub-cent wiggle (e.g. Oct 6's $0.03 dip
+    below PML) must NOT trigger; a genuine sweep (>= SWEEP_MIN_PENETRATION)
+    must.
     """
 
-    def _make_bars(self, high, low, close, pmh, pml, ts_str="09:31"):
-        """Build a 1-bar frame with the given sweep + a VWAP that confirms."""
+    @mock.patch("sideload.runner_options_multiticker.datetime")
+    @mock.patch("sideload.runner_options_multiticker._load_intraday")
+    def test_shallow_penetration_does_not_trigger(self, mock_load, mock_dt):
+        """Oct 6 case: $0.03 below PML must NOT fire on the live runner."""
         import pandas as pd
         from zoneinfo import ZoneInfo
         ET = ZoneInfo("America/New_York")
-        ts = pd.Timestamp(f"2026-10-06 {ts_str}:00", tz=ET)
-        # VWAP: use a value between close and the anchor so the cross confirms.
-        # For bearish: close < vwap. For bullish: close > vwap.
-        return pd.DataFrame(
-            [{"high": high, "low": low, "close": close, "volume": 1000}],
-            index=pd.DatetimeIndex([ts]),
-        )
-
-    def test_shallow_penetration_does_not_trigger(self):
-        """Oct 6 case: $0.03 below PML must NOT fire (below $0.25 threshold)."""
-        import pandas as pd
-        from zoneinfo import ZoneInfo
-        ET = ZoneInfo("America/New_York")
-        pmh, pml = 383.66, 380.00
-        # Bullish sweep with only $0.03 penetration below PML.
         ts = pd.Timestamp("2026-10-06 09:40:00", tz=ET)
+
+        # Completed candle mock: bullish sweep with only $0.03 penetration.
         bars = pd.DataFrame(
             [{"high": 381.10, "low": 379.97, "close": 381.10, "volume": 1000}],
             index=pd.DatetimeIndex([ts]),
         )
-        # VWAP just below close (381.04) so the cross would confirm if penetration passed.
-        vwap = pd.Series([381.04], index=pd.DatetimeIndex([ts]))
-        setup = mt._model_a_setup_for.__wrapped__ if hasattr(mt._model_a_setup_for, "__wrapped__") else None
-        # Directly test the condition via the backtest's model_a_sweep_fade logic:
-        from sideload.backtest_entry_ablation import model_a_sweep_fade
-        day = pd.Timestamp("2026-10-06", tz=ET)
-        anchors = {"pmh": pmh, "pml": pml}
-        result = model_a_sweep_fade(bars, day, anchors, vwap)
-        self.assertIsNone(result, "A $0.03 penetration must not trigger a setup")
+        mock_load.return_value = bars
 
-    def test_genuine_sweep_triggers(self):
-        """Oct 7 case: >$1 penetration must fire."""
+        # Frozen mock time 90s after bar close: the 09:40 bar is a completed
+        # candle (cutoff 09:41:00) and passes the 120s freshness check, so the
+        # penetration threshold is genuinely exercised.
+        mock_dt.now.return_value = ts + pd.Timedelta(seconds=90)
+
+        result = mt._model_a_setup_for(
+            client=mock.MagicMock(),
+            symbol="TSLA",
+            session_date="2026-10-06",
+            pmh=383.66,
+            pml=380.00,
+        )
+        self.assertIsNone(result, "A $0.03 penetration must not trigger a setup in the live runner")
+
+    @mock.patch("sideload.runner_options_multiticker.datetime")
+    @mock.patch("sideload.runner_options_multiticker._load_intraday")
+    def test_genuine_sweep_triggers(self, mock_load, mock_dt):
+        """Oct 7 case: >$1 penetration must fire on the live runner."""
         import pandas as pd
         from zoneinfo import ZoneInfo
         ET = ZoneInfo("America/New_York")
-        pmh, pml = 379.47, 376.80
-        # Bearish sweep: high 380.90 > PMH by $1.43, close < PMH, close < VWAP.
         ts = pd.Timestamp("2026-10-07 09:35:00", tz=ET)
+
+        # Prepend a 09:30 open bar so VWAP evaluates above the sweep close.
+        ts_open = pd.Timestamp("2026-10-07 09:30:00", tz=ET)
         bars = pd.DataFrame(
-            [{"high": 380.90, "low": 377.00, "close": 378.89, "volume": 1500}],
-            index=pd.DatetimeIndex([ts]),
+            [
+                {"high": 381.00, "low": 379.00, "close": 380.00, "volume": 5000},
+                {"high": 380.90, "low": 377.00, "close": 378.89, "volume": 1500},
+            ],
+            index=pd.DatetimeIndex([ts_open, ts]),
         )
-        vwap = pd.Series([379.50], index=pd.DatetimeIndex([ts]))
-        from sideload.backtest_entry_ablation import model_a_sweep_fade
-        day = pd.Timestamp("2026-10-07", tz=ET)
-        anchors = {"pmh": pmh, "pml": pml}
-        result = model_a_sweep_fade(bars, day, anchors, vwap)
-        self.assertIsNotNone(result, "A $1.43 penetration must trigger a setup")
+        mock_load.return_value = bars
+
+        # Frozen mock time 90s after bar close: the 09:35 bar is a completed
+        # candle (cutoff 09:36:00) and passes the 120s freshness check, so the
+        # sweep is genuinely evaluated.
+        mock_dt.now.return_value = ts + pd.Timedelta(seconds=90)
+
+        result = mt._model_a_setup_for(
+            client=mock.MagicMock(),
+            symbol="TSLA",
+            session_date="2026-10-07",
+            pmh=379.47,
+            pml=376.80,
+        )
+        self.assertIsNotNone(result, "A $1.43 penetration must trigger a setup in the live runner")
         self.assertEqual(result["direction"], "BEARISH")
 
 
