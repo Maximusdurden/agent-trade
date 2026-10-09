@@ -333,7 +333,12 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
     latest_bar = window.iloc[-1]
 
     # Only trigger if the latest bar completed within the last 120 seconds.
-    if (now_et - latest_ts).total_seconds() > 120:
+    age_s = (now_et - latest_ts).total_seconds()
+    if age_s > 120:
+        logger.info(
+            f"[{symbol}] Bar {latest_ts.strftime('%H:%M')} too stale "
+            f"({age_s:.0f}s > 120s); no trigger."
+        )
         return None
 
     high = float(latest_bar["high"])
@@ -348,6 +353,33 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
     # Bullish sweep: Low < PML, Close > PML, Close > VWAP.
     if low < pml and close > pml and vwap is not None and close > vwap:
         return {"direction": "BULLISH", "entry_ts": latest_ts, "entry_price": close}
+
+    # Audit trail: explain WHY the latest bar did not trigger, so a missed
+    # session is attributable to market conditions vs a software defect.
+    swept_high = high > pmh
+    swept_low = low < pml
+    if swept_high or swept_low:
+        reason_parts = []
+        if swept_high:
+            reason_parts.append(f"high {high:.2f} > PMH {pmh:.2f}")
+            if close >= pmh:
+                reason_parts.append(f"close {close:.2f} NOT < PMH")
+            if vwap is None:
+                reason_parts.append("no VWAP")
+            elif close >= vwap:
+                reason_parts.append(f"close {close:.2f} NOT < VWAP {vwap:.2f}")
+        if swept_low:
+            reason_parts.append(f"low {low:.2f} < PML {pml:.2f}")
+            if close <= pml:
+                reason_parts.append(f"close {close:.2f} NOT > PML")
+            if vwap is None:
+                reason_parts.append("no VWAP")
+            elif close <= vwap:
+                reason_parts.append(f"close {close:.2f} NOT > VWAP {vwap:.2f}")
+        logger.info(
+            f"[{symbol}] Bar {latest_ts.strftime('%H:%M')} swept "
+            f"({'/'.join(reason_parts)}); no trigger."
+        )
 
     return None
 
@@ -548,6 +580,187 @@ def run_session(session_date: str, dry_run: bool = True,
             logger.warning(f"[GCS] DB upload failed: {up_err}")
 
 
+def run_replay_session(replay_date: str) -> dict:
+    """Replay a historical session offline with a synthetic clock.
+
+    Runs the SAME code path as the live session (run_session -> _run_session_inner)
+    but with ``datetime.now(ET)`` replaced by a simulated clock that ticks from
+    09:29:50 to 10:15:00 ET in 5-second increments, feeding each poll only the
+    1-minute bars that would have been visible at that simulated time (no
+    lookahead). Alpaca order endpoints are mocked so no real orders are placed.
+
+    This decouples regression testing from the live 09:30-10:15 ET window: a bug
+    that costs a 24-hour iteration loop in production is caught offline here.
+
+    Usage:
+        python -m sideload.runner_options_multiticker --replay-date 2026-10-08
+    """
+    import datetime as _dt
+    from unittest import mock
+
+    logger.info(f"=== Replay session {replay_date} (offline, synthetic clock) ===")
+    real_client = AlpacaClient()
+    state = {"active_position": None, "last_session": replay_date}
+
+    class _Clock:
+        def __init__(self, start: _dt.datetime):
+            self.t = start
+
+        def now(self, tz=None):
+            return self.t
+
+        def advance(self, **kw):
+            self.t = self.t + _dt.timedelta(**kw)
+
+    class _FakeDatetime(_dt.datetime):
+        _clock = None
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls._clock.now(tz)
+
+    # ---- Preload the replay date's real bars ONCE (network calls) ----
+    # Then the in-memory client slices them by simulated time on every poll,
+    # so the 45-minute window replays in seconds with NO lookahead bias.
+    day = pd.Timestamp(replay_date, tz=ET)
+    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    replay_bars: dict[str, pd.DataFrame] = {}
+    for sym in ACTIVE_UNIVERSE:
+        try:
+            df = real_client.get_historical_bars_paginated(
+                sym, timeframe_str=INTRADAY_INTERVAL, days_back=1)
+        except Exception:
+            df = None
+        if df is None or df.empty:
+            df = _load_intraday(real_client, sym, days_back=1)
+        if df is None or df.empty:
+            continue
+        df = df.copy()
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index(level=0, drop=True)
+        df.index = pd.to_datetime(df.index)
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_convert(ET)
+        replay_bars[sym] = df.sort_index()
+    logger.info(f"Replay data: {list(replay_bars.keys())} "
+                f"({len(replay_bars.get('TSLA', pd.DataFrame()))} TSLA bars)")
+
+    # ---- In-memory client that serves only bars visible at simulated time ----
+    class _ReplayClient:
+        """Mimics the AlpacaClient surface the runner uses, no live orders."""
+
+        trading_client = type("T", (), {"cancel_order_by_id": lambda self, o=None: None})()
+
+        def __init__(self, bars: dict[str, pd.DataFrame]):
+            self._bars = bars
+            self.entry_calls = 0
+
+        def _visible(self, symbol: str) -> pd.DataFrame:
+            df = self._bars.get(symbol, pd.DataFrame())
+            if df.empty:
+                return df
+            # No lookahead: only bars with close time <= simulated clock time.
+            now_t = _FakeDatetime.now(ET)
+            return df[df.index <= now_t]
+
+        def get_historical_bars_paginated(self, symbol, timeframe_str="1min",
+                                          days_back=5):
+            return self._visible(symbol)
+
+        def get_historical_bars(self, symbol, limit=100, timeframe_str="day",
+                                max_retries=3):
+            return pd.DataFrame()
+
+        def get_option_chain_snapshot(self, underlying_symbol, expiration_date_gte=None,
+                                      expiration_date_lte=None, strike_price_gte=None,
+                                      strike_price_lte=None, contract_type=None):
+            # No lookahead on the chain either: serve today's LIVE chain (real
+            # quotes are read-only; entry uses the ask from the real market).
+            return real_client.get_option_chain_snapshot(
+                underlying_symbol=underlying_symbol,
+                expiration_date_gte=expiration_date_gte,
+                expiration_date_lte=expiration_date_lte,
+                strike_price_gte=strike_price_gte,
+                strike_price_lte=strike_price_lte,
+                contract_type=contract_type)
+
+        def get_latest_price(self, symbol):
+            df = self._visible(symbol)
+            if df.empty:
+                return real_client.get_latest_price(symbol)
+            return float(df.iloc[-1]["close"])
+
+        def get_latest_option_data(self, symbols):
+            # Serve real chain quotes (bid/ask) so the monitor loop can
+            # evaluate take-profit/stop in dry-run (no live orders).
+            try:
+                from sideload.options_strike_sizer import _parse_occ
+                occ = symbols[0] if isinstance(symbols, list) else symbols
+                parsed = _parse_occ(occ)
+                if not parsed:
+                    return {}
+                opt_type = "put" if parsed["type"] == "PUT" else "call"
+                chain = real_client.get_option_chain_snapshot(
+                    underlying_symbol=parsed["root"],
+                    expiration_date_gte=None, expiration_date_lte=None,
+                    contract_type=opt_type)
+                for o, snap in chain.items():
+                    if o.upper() == occ.upper():
+                        quote = getattr(snap, "latest_quote", None)
+                        if quote is not None:
+                            return {occ: quote}  # has bid_price/ask_price attrs
+            except Exception:
+                pass
+            return {}
+
+        def place_option_order(self, symbol, qty, side, limit_price=None,
+                               client_order_id=None):
+            self.entry_calls += 1
+            return {"id": f"replay-{int(_dt.datetime.now().timestamp())}",
+                    "symbol": symbol, "qty": qty, "side": side,
+                    "filled_avg_price": float(limit_price or 2.50),
+                    "status": "filled"}
+
+        def close_option_position(self, symbol):
+            return {"id": f"replay-close-{int(_dt.datetime.now().timestamp())}",
+                    "symbol": symbol, "qty": 1, "side": "sell",
+                    "filled_avg_price": 2.50, "status": "filled"}
+
+        def get_option_positions(self):
+            return {}
+
+    client = _ReplayClient(replay_bars)
+
+    # GCS sync is skipped in replay (no upload of synthetic results).
+    clock = _Clock(_dt.datetime(
+        _dt.datetime.strptime(replay_date, "%Y-%m-%d").year,
+        _dt.datetime.strptime(replay_date, "%Y-%m-%d").month,
+        _dt.datetime.strptime(replay_date, "%Y-%m-%d").day,
+        9, 29, 50, tzinfo=ET))
+    _FakeDatetime._clock = clock
+    with mock.patch.object(sys.modules[__name__], "datetime", _FakeDatetime), \
+         mock.patch.object(sys.modules["sideload.runner_options_tsla"],
+                           "datetime", _FakeDatetime), \
+         mock.patch.object(sys.modules[__name__], "time") as mock_mt_time, \
+         mock.patch.object(sys.modules[__name__], "AlpacaClient",
+                           return_value=client):
+        # Each 5s sleep in the poll loop advances the synthetic clock, so the
+        # loop walks the FULL 09:30-10:15 ET window exactly as live (polls every
+        # EVAL_INTERVAL_SECONDS, sees only bars published up to simulated time).
+        mock_mt_time.sleep = lambda s: clock.advance(seconds=int(s))
+        try:
+            result = _run_session_inner(client, state, replay_date, dry_run=True,
+                                        active=ACTIVE_UNIVERSE)
+        finally:
+            pass
+    result["replay"] = True
+    result["replay_entry_calls"] = client.entry_calls
+    return result
+
+
 def _run_session_inner(client: AlpacaClient, state: dict, session_date: str,
                        dry_run: bool, active: list[str]) -> dict:
     """Core session logic (wrapped by run_session for GCS DB sync)."""
@@ -710,14 +923,34 @@ def main() -> None:
                         help="Place real orders (default is dry-run).")
     parser.add_argument("--date", default=datetime.now(ET).strftime("%Y-%m-%d"),
                         help="Session date YYYY-MM-DD (ET). Default: today.")
+    parser.add_argument("--replay-date", default=None,
+                        help="Replay a HISTORICAL session date YYYY-MM-DD using a "
+                             "synthetic clock (09:29:50->10:15 ET) against that day's "
+                             "actual bars, in dry-run mode with mocked order endpoints. "
+                             "Use for offline regression testing without waiting for "
+                             "the live market window.")
     parser.add_argument("--no-discord", action="store_true",
                         help="Skip the Discord notification.")
     args = parser.parse_args()
 
     dry_run = not args.live
     setup_jira_logging(app_name="agent-trade-sideload")
+    # Ensure INFO audit lines (PM gate results, sweep/no-trigger explanations,
+    # stale-bar drops) reach stderr so the Cloud Run logs are diagnosable. The
+    # Jira handler only forwards ERROR/CRITICAL; without a stream handler the
+    # audit trail is silent.
+    _root = logging.getLogger()
+    if not any(getattr(h, "stream", None) is not None for h in _root.handlers):
+        _stream = logging.StreamHandler(sys.stderr)
+        _stream.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s"))
+        _root.addHandler(_stream)
+    _root.setLevel(logging.INFO)
     try:
-        result = run_session(args.date, dry_run=dry_run)
+        if args.replay_date:
+            result = run_replay_session(args.replay_date)
+        else:
+            result = run_session(args.date, dry_run=dry_run)
         print(json.dumps(result, indent=2, default=str))
 
         if not args.no_discord:
