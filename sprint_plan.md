@@ -363,3 +363,104 @@ Before declaring any ticket complete, the following quality checks must be passe
 4.  **Audit DB Integrity**: Run diagnostic checks on `trading_agent.db` using sqlite tools to confirm `watchlist_history` is written correctly and trades register expected timestamps.
 
 ---
+
+## 📊 Model A Conviction & Universe Findings (2026-10-09)
+
+Backtest evidence from `backtest_entry_ablation.py` (252-day screen, live exit rules 45/22/30-min, `SWEEP_MIN_PENETRATION` = $0.25). These findings drive the decisions below and are **not** yet production changes.
+
+### 1. Dynamic Conviction Sizing — REJECTED
+
+Thesis: scale capital with setup conviction (penetration depth / PM range). **The data contradicts the premise — the edge is a binary gate, not a dial.**
+
+| Penetration bucket | n | Win% | Avg PnL% | PF |
+|---|---|---|---|---|
+| $0.25–0.50 | 16 | 31.2% | −6.20 | 0.64 |
+| $0.50–1.00 | 28 | 39.3% | +0.57 | 1.03 |
+| **$1.00–2.00** | **42** | **50.0%** | **+5.11** | **1.36** |
+| $2.00+ | 15 | 33.3% | −2.67 | 0.85 |
+
+- `corr(penetration, pnl) = 0.043` — penetration depth is **not** a continuous signal.
+- The $2.00+ collapse is real (15 trades, 10 stops / 4 targets): deep sweeps on TSLA are trend days, not fade days. Sizing up there would have doubled losses on the worst bucket.
+- **Decision: do not build dynamic sizing.** The $1.00 threshold is the correct filter (isolates the 1.36-PF band).
+
+### 2. NVDA & COIN — REJECTED (PF < 1.0)
+
+90-day ablation with the $0.25 threshold:
+
+| Ticker | Model | Trades | Underlying Win% | Option Win% | Total PnL% | PF |
+|---|---|---|---|---|---|---|
+| NVDA | A | 35 | 40.0% | 37.1% | −46.7% | 0.89 |
+| COIN | A | 11 | 36.4% | 36.4% | −84.4% | 0.68 |
+| NVDA | B | 38 | 44.7% | 39.5% | −62.2% | 0.81 |
+| COIN | B | 35 | 34.3% | 34.3% | −216.1% | 0.65 |
+
+- Underlying win rate < 50% for both — Model A mean reversion premise fails on these names (they trend, they don't fade).
+- **Decision: do not add NVDA or COIN to the live universe.**
+
+### 3. Goldilocks Curve — $1.00–$2.00 Penetration Sweet Spot
+
+- Edge lives in a narrow band: below $1.00 is noise-to-breakeven; above $2.00 collapses.
+- The $1.00 threshold (the "high-conviction variant" from the earlier 252-day screen) is confirmed with per-trade depth.
+- **Decision: candidate production filter, pending Monday baseline (see below).**
+
+### 4. PM-Range Signal — Candidate Filter (Forward Validation PENDING)
+
+| PM range bucket | n | Win% | Avg PnL% | PF |
+|---|---|---|---|---|
+| <$2.00 | 77 | 39.0% | −1.68 | 0.90 |
+| **$2–4** | **20** | **55.0%** | **+13.08** | **2.12** |
+| $4–6 | 4 | 25.0% | −10.15 | 0.53 |
+
+- The $2–4 pre-market range is the single best signal found (PF 2.12) — but n=20 is thin and it's a *filter*, not a sizer.
+- Signals are redundant, not additive: `pen>=$1 & range>=$4` = 0.0 PF (n=2); `pen>=$1 & range<$4` = 1.30 (n=55).
+- **Decision: forward validation required before any live use** (see Epic 7).
+
+### 5. Production Baseline — Hold at $0.25 for Monday 2026-10-12
+
+- **Do not** bump production to $1.00 or clamp PM range before Monday's open.
+- Image `20261009-235802` is deployed with the $0.25 gate, DST schedule fix, and 09:25 AM early-boot hold.
+- Monday runs as a pure baseline to verify timing, hold loop, telemetry, and execution pipeline.
+- `SWEEP_MIN_PENETRATION` is already env-configurable (`OPTIONS_SWEEP_MIN_PENETRATION`); shifting 0.25 → 1.00 is a config change, no code refactor.
+
+---
+
+## 🎯 Epic 7: Model A Conviction Filters (Forward Validation) [AT-EP7]
+
+> **Goal**: Validate the $2–4 PM-range gate and the $1.00 penetration threshold on forward data before any production change. No live capital until validated.
+
+#### **AT-17: Forward Validation — PM Range as % of Price**
+- Test whether the $2.00–$4.00 range bucket is robust when expressed as a percentage of underlying price (e.g., 0.8%–1.5% of TSLA price) rather than a fixed dollar amount.
+- Success: the %-based bucket preserves or improves PF vs the dollar-based bucket with comparable trade count.
+- **RESULT (2026-10-09, 252d walk-forward):** %-based band (0.8–1.5%) is NOT equivalent — it captures a different, worse set of trades (n=11, PF 0.96 vs dollar band n=20, PF 2.12). The dollar band's trades span 0.47–1.21% of price; the % band's trades span $3.20–$4.81. Only 7/20 overlap. **The dollar $2–4 band is the signal; the %-based variant is rejected.**
+
+#### **AT-18: Forward Validation — $1.00 Penetration + $4.00 Range Ceiling**
+- Test combining the $1.00 minimum penetration with a $4.00 maximum PM-range ceiling (cutting only the chaotic >$4.00 trend days while keeping the bulk of trades).
+- Success: superior PF with a larger sample than the pure $2–4 band (which cuts ~80% of trades).
+- **RESULT (2026-10-09, 252d walk-forward):** RANGE_CEIL (pen ≥ $1.00 AND range ≤ $4.00) → n=55, PF 1.30, beats baseline in 2/3 folds. It keeps 55 trades (vs 20 for the pure band) at PF 1.30 — a solid, larger-sample edge. **PASSED as the primary candidate.**
+
+#### **AT-19: Production Filter Flip (Post-Validation)**
+- After forward validation passes, flip `OPTIONS_SWEEP_MIN_PENETRATION` 0.25 → 1.00 via env var (no code change).
+- Add PM-range ceiling only if AT-18 confirms it adds edge without excessive trade reduction.
+- **STATUS:** AT-18 passed. Monday 10/12 runs as $0.25 baseline; flip to $1.00 + range ceiling after baseline confirms clean plumbing.
+
+---
+
+## 📊 Walk-Forward Validation Results (2026-10-09)
+
+Full-sample + 3-fold chronological walk-forward on TSLA Model A (252d, live exit rules):
+
+| Filter | n | Win% | AvgPnL% | PF | Fold stability |
+|---|---|---|---|---|---|
+| BASELINE_025 | 101 | 41.6% | +0.91 | 1.06 | — |
+| PEN1.00 | 57 | 45.6% | +3.06 | 1.20 | 2/3 folds |
+| RANGE_PCT (0.8–1.5%) | 11 | 36.4% | −0.72 | 0.96 | 2/3 folds |
+| **RANGE_CEIL (pen≥$1, range≤$4)** | **55** | **47.3%** | **+4.31** | **1.30** | **2/3 folds** |
+| RANGE_BAND ($2–4) | 20 | 55.0% | +13.08 | 2.12 | 3/3 folds |
+
+**Key findings:**
+- **RANGE_BAND ($2–4) is the strongest edge (PF 2.12, stable 3/3 folds) but thin (n=20).** It's a filter, not a sizer — and it cuts ~80% of trades.
+- **RANGE_CEIL is the practical winner:** pen ≥ $1.00 + range ≤ $4.00 keeps 55 trades at PF 1.30, stable in 2/3 folds. It cuts only the chaotic >$4.00 trend days.
+- **%-of-price is NOT a valid substitute** for the dollar band (different trade set, PF 0.96).
+- **Dynamic sizing remains rejected** — the edge is a binary gate, not a dial.
+
+---

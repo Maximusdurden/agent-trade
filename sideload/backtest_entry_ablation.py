@@ -299,12 +299,16 @@ def model_a_sweep_fade(day_bars: pd.DataFrame, day: pd.Timestamp,
 
         # Bearish sweep: High > PMH + min_pen, Close < PMH, Close < VWAP.
         if (high - pmh) >= min_pen and close < pmh and vwap is not None and close < vwap:
-            return {"direction": "BEARISH", "entry_ts": ts, "entry_price": close}
+            return {"direction": "BEARISH", "entry_ts": ts, "entry_price": close,
+                    "penetration": round(high - pmh, 2),
+                    "pm_range": round(pmh - pml, 2)}
 
         # Bullish sweep: Low < PML - min_pen, Close > PML, Close > VWAP.
         if low := float(bar["low"]):
             if (pml - low) >= min_pen and close > pml and vwap is not None and close > vwap:
-                return {"direction": "BULLISH", "entry_ts": ts, "entry_price": close}
+                return {"direction": "BULLISH", "entry_ts": ts, "entry_price": close,
+                        "penetration": round(pml - low, 2),
+                        "pm_range": round(pmh - pml, 2)}
 
     return None
 
@@ -410,6 +414,8 @@ def run_model(client: AlpacaClient, symbol: str, days_back: int, model: str,
         if sim["traded"]:
             sim["date"] = str(day.date())
             sim["symbol"] = symbol
+            sim["penetration"] = setup.get("penetration")
+            sim["pm_range"] = setup.get("pm_range")
             results.append(sim)
 
     if not results:
