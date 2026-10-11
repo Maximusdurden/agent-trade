@@ -111,9 +111,13 @@ $EnvVariablesList = @(
     "DATABASE_FILENAME=/tmp/trading_agent.db"
 )
 # Jira credentials (for error->Jira logging).
-$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# JIRA_API_TOKEN is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL")
 # Alpaca credentials (to check broker positions for orphans).
-$ConfigKeys = @("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER")
+# ALPACA_SECRET_KEY is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
+$ConfigKeys = @("ALPACA_API_KEY", "ALPACA_PAPER")
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -126,7 +130,9 @@ Get-Content $EnvPath | ForEach-Object {
     }
 }
 $SecretReferences = @(
-    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
+    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest",
+    "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest",
+    "JIRA_API_TOKEN=JIRA_API_TOKEN:latest"
 )
 $FlagLines = @("--set-env-vars:")
 foreach ($Entry in $EnvVariablesList) {

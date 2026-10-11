@@ -104,7 +104,9 @@ $EnvVariablesList = @(
 )
 # Jira credentials (for error->Jira logging + the weekly audit ticket) from .env.
 # NOTE: config.py reads JIRA_URL (not JIRA_SITE), so we must pass JIRA_URL.
-$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# JIRA_API_TOKEN is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL")
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -117,7 +119,9 @@ Get-Content $EnvPath | ForEach-Object {
     }
 }
 $SecretReferences = @(
-    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
+    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest",
+    "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest",
+    "JIRA_API_TOKEN=JIRA_API_TOKEN:latest"
 )
 
 function Deploy-Job {

@@ -146,7 +146,6 @@ $FlagsFile = Join-Path $StagingDir "deploy_flags.yaml"
   GCS_BUCKET_NAME: "agenttrade-us-data-bucket"
   DATABASE_FILENAME: "/tmp/trading_agent.db"
   ALPACA_API_KEY: "$AlpacaApiKey"
-  ALPACA_SECRET_KEY: "$AlpacaSecretKey"
   ALPACA_PAPER: "$AlpacaPaper"
   GEMINI_API_KEY: "$GeminiApiKey"
   GEMINI_MODEL: "$GeminiModel"
@@ -165,6 +164,7 @@ gcloud run deploy $ServiceName `
     --cpu 1 `
     --labels "service=agenttrade-dashboard,app=agent-trade,env=prod" `
     --flags-file $FlagsFile `
+    --set-secrets "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest" `
     --quiet
 
 # 7. Clean Staging Directory

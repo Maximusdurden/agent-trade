@@ -102,10 +102,14 @@ $EnvVariablesList = @(
     "DATABASE_FILENAME=/tmp/trading_agent.db"
 )
 # Jira credentials (for error->Jira logging) from .env.
-$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# JIRA_API_TOKEN is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL")
 # Alpaca + config keys the sentiment/SR component needs.
+# ALPACA_SECRET_KEY is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
 $ConfigKeys = @(
-    "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER",
+    "ALPACA_API_KEY", "ALPACA_PAPER",
     "BYPASS_MARKET_WINDOW"
 )
 Get-Content $EnvPath | ForEach-Object {
@@ -120,7 +124,9 @@ Get-Content $EnvPath | ForEach-Object {
     }
 }
 $SecretReferences = @(
-    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
+    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest",
+    "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest",
+    "JIRA_API_TOKEN=JIRA_API_TOKEN:latest"
 )
 
 Write-Host "`n--- Deploying Cloud Run Job: $JobName ---"

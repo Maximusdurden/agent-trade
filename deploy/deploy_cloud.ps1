@@ -135,8 +135,10 @@ $EnvVariablesList = @(
 
 # Extract explicitly allowed non-secret runtime settings. API keys for Gemini
 # and OpenRouter are included so the brain can initialize in the cloud.
+# ALPACA_SECRET_KEY and JIRA_API_TOKEN are secrets: injected via --set-secrets
+# (Secret Manager), never as plaintext env vars (TMCL-1070).
 $AllowedRuntimeKeys = @(
-    "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER", "LLM_PROVIDER", "GEMINI_API_KEY", "GEMINI_MODEL",
+    "ALPACA_API_KEY", "ALPACA_PAPER", "LLM_PROVIDER", "GEMINI_API_KEY", "GEMINI_MODEL",
     "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL",
     "MODEL_HEAVYWEIGHT", "MODEL_DAILY_DRIVER", "MODEL_UTILITY",
     "ACTIVE_MODEL_TIER", "BRAIN_MODEL_TIER", "STRATEGIST_MODEL_TIER",
@@ -145,7 +147,7 @@ $AllowedRuntimeKeys = @(
     "BRAIN_MAX_OUTPUT_TOKENS",
     "STRATEGIST_MAX_OUTPUT_TOKENS",
     "LLM_MAX_TOTAL_SECONDS",
-    "TRADING_INTERVAL_MINUTES", "JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN",
+    "TRADING_INTERVAL_MINUTES", "JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL",
     "OPTIONS_ENABLED", "OPTIONS_DTE_MIN", "OPTIONS_DTE_MAX",
     "OPTIONS_DTE_HARD_MIN", "OPTIONS_DTE_HARD_MAX", "OPTIONS_DTE_FALLBACK_MAX",
     "OPTIONS_WATCH_COOLDOWN_MINUTES",
@@ -214,7 +216,8 @@ if ($JobExists) {
         --task-timeout 20m `
         --memory 1Gi `
         --cpu 1 `
-        --env-vars-file $EnvFile
+        --env-vars-file $EnvFile `
+        --set-secrets "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest,JIRA_API_TOKEN=JIRA_API_TOKEN:latest"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "WARNING: gcloud run jobs update exited $LASTEXITCODE. The job may still point to the old image. Run manually: gcloud run jobs update $JobName --image $ImageTag --region $Region"
     }
@@ -230,7 +233,8 @@ if ($JobExists) {
         --task-timeout 20m `
         --memory 1Gi `
         --cpu 1 `
-        --env-vars-file $EnvFile
+        --env-vars-file $EnvFile `
+        --set-secrets "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest,JIRA_API_TOKEN=JIRA_API_TOKEN:latest"
 }
 
 # 7. Create/Update Cloud Scheduler Job (Run every 15 minutes weekdays)

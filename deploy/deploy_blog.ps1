@@ -113,8 +113,9 @@ $EnvVariablesList = @(
 # Alpaca keys are REQUIRED for the per-ticker candlestick charts. Without them
 # get_client_instance() falls into mock mode and generates fake ~$400 bars,
 # forcing a secondary y-axis and breaking the chart (the 9/10-9/11 regression).
-# Inject them as plain env vars from .env, matching the strategy job's pattern.
-$AlpacaKeys = @("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_PAPER")
+# ALPACA_SECRET_KEY is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
+$AlpacaKeys = @("ALPACA_API_KEY", "ALPACA_PAPER")
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -128,7 +129,9 @@ Get-Content $EnvPath | ForEach-Object {
 }
 # Jira credentials so the blog job's error->Jira logging (run_blog.py ->
 # logger_setup.setup_logging) can file bug tickets. config.py reads JIRA_URL.
-$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL", "JIRA_API_TOKEN")
+# JIRA_API_TOKEN is a secret: injected via --set-secrets (Secret Manager),
+# never as a plaintext env var (TMCL-1070).
+$JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL")
 Get-Content $EnvPath | ForEach-Object {
     $Line = $_.Trim()
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
@@ -145,7 +148,9 @@ $SecretReferences = @(
     "WP_APP_PASSWORD=WP_APP_PASSWORD:latest",
     "GEMINI_API_KEY=GEMINI_API_KEY:latest",
     "OPENROUTER_API_KEY=OPENROUTER_API_KEY:latest",
-    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
+    "DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest",
+    "ALPACA_SECRET_KEY=ALPACA_SECRET_KEY:latest",
+    "JIRA_API_TOKEN=JIRA_API_TOKEN:latest"
 )
 if (-not $JobExists) {
     & $GCloud run jobs create $JobName --image $ImageTag --region $Region `
