@@ -12,7 +12,11 @@
 #   - ticker-roster-daily   : recommendations + learning report + Discord
 #   - ticker-roster-weekly  : applies pool edits + uploads pool to GCS + Jira
 
-$ErrorActionPreference = "Stop"
+# Use "Continue" (not "Stop") because the gcloud.ps1 PowerShell wrapper converts
+# benign stderr output (e.g. "property overridden" warnings) into a
+# NativeCommandError that would abort the whole deploy. Real failures are caught
+# by explicit $LASTEXITCODE checks after each critical gcloud step below.
+$ErrorActionPreference = "Continue"
 
 # 1. Load Configurations from .env
 $EnvPath = "Z:\python\projects\agent-trade\.env"
