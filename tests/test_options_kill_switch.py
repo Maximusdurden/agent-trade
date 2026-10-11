@@ -15,8 +15,15 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, r"Z:\python\projects")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Isolate this test's DB BEFORE importing config (config.DATABASE_PATH is
+# computed once at import time). Without this, importing config here first
+# pins DATABASE_PATH to the real trading_agent.db, which leaks into other
+# test modules that set DATABASE_FILENAME at their own import time.
+os.environ["DATABASE_FILENAME"] = "test_options_kill_switch.db"
+
 from core.gcs_sync import check_options_kill_switch, set_options_kill_switch_state
 from core.guardrails import RiskGuardrails
+from core import config
 
 # Use a scratch options kill switch local cache so tests never touch the real one.
 SCRATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch_options_kill_switch.json")
@@ -51,6 +58,17 @@ class TestOptionsKillSwitchHelpers(unittest.TestCase):
 
 
 class TestGuardrailOptionsKillSwitch(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise the OPTIONS kill-switch path in guardrails,
+        # which is only reachable when options trading is enabled. The repo
+        # .env sets OPTIONS_ENABLED=false, so force it on for this class and
+        # restore afterwards (same pattern as tests/test_options.py).
+        self._orig_options_enabled = config.OPTIONS_ENABLED
+        config.OPTIONS_ENABLED = True
+
+    def tearDown(self):
+        config.OPTIONS_ENABLED = self._orig_options_enabled
+
     def _make_guardrails(self):
         from core.guardrails import RiskGuardrails
         g = RiskGuardrails()

@@ -180,11 +180,13 @@ class TestSprintFeatures(unittest.TestCase):
             self.assertTrue(is_crypto)
 
     @patch("core.database.get_recent_trades")
+    @patch("core.database.get_recent_trades_by_symbol")
     @patch("core.database.get_latest_watchlist_raw")
-    def test_guardrail_prevents_single_ticker_concentration_above_thirty_percent(self, mock_watchlist, mock_trades):
+    def test_guardrail_prevents_single_ticker_concentration_above_thirty_percent(self, mock_watchlist, mock_trades_by_symbol, mock_trades):
         mock_watchlist.return_value = []
         mock_trades.return_value = []
-        
+        mock_trades_by_symbol.return_value = []
+
         from core.guardrails import RiskGuardrails
         from core import config
         
