@@ -94,6 +94,71 @@ class TestSweepPenetrationThreshold(unittest.TestCase):
         self.assertEqual(result["direction"], "BEARISH")
 
 
+class TestSweepMaxPMRangeCeiling(unittest.TestCase):
+    """Model A setup respects the OPTIONS_SWEEP_MAX_PM_RANGE ceiling.
+
+    When the env var is set (> 0), a setup on a day whose pre-market range
+    (PMH - PML) exceeds the ceiling must NOT trigger. When disabled (0, the
+    default), the same setup must trigger. Mirrors the penetration tests.
+    """
+
+    def _make_bars(self, ts):
+        import pandas as pd
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        ts_open = ts - pd.Timedelta(minutes=5)
+        return pd.DataFrame(
+            [
+                {"high": 381.00, "low": 379.00, "close": 380.00, "volume": 5000},
+                {"high": 380.90, "low": 377.00, "close": 378.89, "volume": 1500},
+            ],
+            index=pd.DatetimeIndex([ts_open, ts]),
+        )
+
+    @mock.patch("sideload.runner_options_multiticker.datetime")
+    @mock.patch("sideload.runner_options_multiticker._load_intraday")
+    def test_wide_pm_range_blocked_when_ceiling_enabled(self, mock_load, mock_dt):
+        """PM range $4.50 > $4.00 ceiling must NOT trigger."""
+        import pandas as pd
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        ts = pd.Timestamp("2026-10-08 09:35:00", tz=ET)
+        mock_load.return_value = self._make_bars(ts)
+        mock_dt.now.return_value = ts + pd.Timedelta(seconds=90)
+
+        with mock.patch.dict(os.environ, {"OPTIONS_SWEEP_MAX_PM_RANGE": "4.0"}):
+            result = mt._model_a_setup_for(
+                client=mock.MagicMock(),
+                symbol="TSLA",
+                session_date="2026-10-08",
+                pmh=379.47,   # PM range = 379.47 - 374.97 = $4.50 > $4.00
+                pml=374.97,
+            )
+            self.assertIsNone(result, "PM range $4.50 > $4.00 ceiling must not trigger")
+
+    @mock.patch("sideload.runner_options_multiticker.datetime")
+    @mock.patch("sideload.runner_options_multiticker._load_intraday")
+    def test_wide_pm_range_allowed_when_ceiling_disabled(self, mock_load, mock_dt):
+        """PM range $4.50 with ceiling disabled (default 0) must trigger."""
+        import pandas as pd
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        ts = pd.Timestamp("2026-10-08 09:35:00", tz=ET)
+        mock_load.return_value = self._make_bars(ts)
+        mock_dt.now.return_value = ts + pd.Timedelta(seconds=90)
+
+        with mock.patch.dict(os.environ, {"OPTIONS_SWEEP_MAX_PM_RANGE": "0"}):
+            result = mt._model_a_setup_for(
+                client=mock.MagicMock(),
+                symbol="TSLA",
+                session_date="2026-10-08",
+                pmh=379.47,
+                pml=374.97,
+            )
+            self.assertIsNotNone(result, "PM range $4.50 must trigger when ceiling is disabled")
+            self.assertEqual(result["direction"], "BEARISH")
+
+
 class TestCorrelationMutex(unittest.TestCase):
     def test_blocks_qqq_when_spy_active(self):
         conflict = mt._correlation_conflict("QQQ", {"SPY"})

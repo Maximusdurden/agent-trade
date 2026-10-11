@@ -64,6 +64,7 @@ from sideload.runner_options_tsla import (
     MAX_HOLD_MINUTES,
     PM_VOL_MIN,
         SWEEP_MIN_PENETRATION,
+        SWEEP_MAX_PM_RANGE,
         MODEL_A_START,
         MODEL_A_END,
         POLL_INTERVAL_SECONDS,
@@ -357,6 +358,21 @@ def _model_a_setup_for(client: AlpacaClient, symbol: str, session_date: str,
     # SWEEP_MIN_PENETRATION dollars beyond PMH/PML to be a genuine liquidity
     # sweep, not a sub-cent noise wiggle (e.g. Oct 6's $0.03 false positive).
     min_pen = float(SWEEP_MIN_PENETRATION)
+
+    # Maximum PM-range ceiling: when OPTIONS_SWEEP_MAX_PM_RANGE > 0, reject
+    # setups on days whose pre-market range (PMH - PML) exceeds the ceiling.
+    # Walk-forward validation (2026-10-09) showed the >$4.00 range days are
+    # chaotic trend days (PF 0.85 collapse) vs the $1-2 sweet spot (PF 1.36).
+    # Default 0 = disabled (TMCL-1067). Read at call time so tests can toggle
+    # the env var without reloading the module.
+    max_pm_range = float(os.environ.get("OPTIONS_SWEEP_MAX_PM_RANGE", "0"))
+    pm_range = pmh - pml
+    if max_pm_range > 0 and pm_range > max_pm_range:
+        logger.info(
+            f"[{symbol}] PM range ${pm_range:.2f} exceeds ceiling "
+            f"${max_pm_range:.2f} (OPTIONS_SWEEP_MAX_PM_RANGE); no trigger."
+        )
+        return None
 
     # Bearish sweep: High > PMH + min_pen, Close < PMH, Close < VWAP.
     if (high - pmh) >= min_pen and close < pmh and vwap is not None and close < vwap:

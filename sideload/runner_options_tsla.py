@@ -102,6 +102,16 @@ MODEL_A_END = dtime(10, 15, 0)
 SWEEP_MIN_PENETRATION = float(
     os.environ.get("OPTIONS_SWEEP_MIN_PENETRATION", "0.25"))
 
+# Maximum pre-market range (PMH - PML, in dollars) for a valid Model A setup.
+# Walk-forward validation (2026-10-09) found the $2-4 PM range is the strongest
+# signal (PF 2.12, n=20, 3/3 folds), but the practical variant is a CEILING:
+# penetration >= $1.00 AND PM range <= $4.00 keeps 55 trades at PF 1.30
+# (stable 2/3 folds) vs the $0.25 baseline (n=101, PF 1.06). The ceiling cuts
+# only the chaotic >$4.00 trend days while keeping the bulk of trades.
+# Default 0 = disabled (no ceiling); configurable via OPTIONS_SWEEP_MAX_PM_RANGE.
+SWEEP_MAX_PM_RANGE = float(
+    os.environ.get("OPTIONS_SWEEP_MAX_PM_RANGE", "0"))
+
 # PM gate evaluation time.
 PM_GATE_TIME = dtime(9, 29, 50)
 
