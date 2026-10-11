@@ -28,6 +28,25 @@ def _make_client():
 
 
 class TestGeminiCrossProviderFallback(unittest.TestCase):
+    def test_newer_gemini_models_omit_deprecated_sampling_overrides(self):
+        client = _make_client()
+        client.gemini_client.models.generate_content.return_value.text = "ok"
+
+        client._generate_via_gemini("prompt", "system", "google/gemini-3.1-pro")
+
+        config = client.gemini_client.models.generate_content.call_args.kwargs["config"]
+        self.assertEqual(config.system_instruction, "system")
+        self.assertIsNone(config.temperature)
+
+    def test_legacy_gemini_models_keep_existing_temperature(self):
+        client = _make_client()
+        client.gemini_client.models.generate_content.return_value.text = "ok"
+
+        client._generate_via_gemini("prompt", "system", "google/gemini-2.5-flash")
+
+        config = client.gemini_client.models.generate_content.call_args.kwargs["config"]
+        self.assertEqual(config.temperature, 0.2)
+
     def test_falls_back_to_gemini_when_openrouter_hangs(self):
         client = _make_client()
         # Simulate OpenRouter HANGING: it never returns fast. With the bounded

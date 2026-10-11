@@ -16,6 +16,12 @@ load_dotenv(env_path, override=True)
 
 logger = logging.getLogger("SharedLLMClient")
 
+
+def _gemini_generation_config(model_name: str, system_prompt: str) -> types.GenerateContentConfig:
+    if model_name.startswith("gemini-3"):
+        return types.GenerateContentConfig(system_instruction=system_prompt)
+    return types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.2)
+
 class LLMClientError(Exception):
     """Custom exception raised when LLM generation fails."""
     pass
@@ -528,10 +534,7 @@ class SharedLLMClient:
                 response = self.gemini_client.models.generate_content(
                     model=gemini_model_name,
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=0.2,
-                    )
+                    config=_gemini_generation_config(gemini_model_name, system_prompt)
                 )
                 return response.text or ""
             except Exception as e:
@@ -640,10 +643,7 @@ class SharedLLMClient:
         response = self.gemini_client.models.generate_content(
             model=gemini_model_name,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.2,
-            )
+            config=_gemini_generation_config(gemini_model_name, system_prompt)
         )
         return response.text or ""
         

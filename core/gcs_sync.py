@@ -6,6 +6,16 @@ from core import config
 
 logger = logging.getLogger("GCSSync")
 
+
+def is_gcs_checksum_mismatch(error: Exception) -> bool:
+    """Identify checksum failures without making the optional GCS SDK mandatory."""
+    try:
+        from google.cloud.storage.exceptions import DataCorruption
+    except ImportError:
+        return False
+    return isinstance(error, DataCorruption)
+
+
 def _kill_switch_local_path() -> str:
     """Return the local kill-switch cache path.
 
@@ -60,6 +70,7 @@ def download_from_gcs():
         logger.info("GCS_BUCKET_NAME not set. Skipping download from GCS.")
         return
 
+    tmp_paths = []
     try:
         logger.info(f"Downloading database and balances from gs://{gcs_bucket}...")
         client = get_gcs_client()
@@ -76,6 +87,7 @@ def download_from_gcs():
             # Download to a temp file first, then atomically replace the live DB
             # to avoid readers hitting a partially-written/locked SQLite file.
             tmp_db = db_path + ".tmp"
+            tmp_paths.append(tmp_db)
             blob.download_to_filename(tmp_db)
             os.replace(tmp_db, db_path)
             logger.info(f"Successfully synchronized {db_path} from GCS.")
@@ -86,13 +98,25 @@ def download_from_gcs():
         csv_path = "portfolio_dod_balances.csv"
         blob_csv = bucket.blob("portfolio_dod_balances.csv")
         if blob_csv.exists():
-            blob_csv.download_to_filename(csv_path)
+            tmp_csv = csv_path + ".tmp"
+            tmp_paths.append(tmp_csv)
+            blob_csv.download_to_filename(tmp_csv)
+            os.replace(tmp_csv, csv_path)
             logger.info(f"Successfully synchronized {csv_path} from GCS.")
         else:
             logger.info("No DoD balances CSV file found on GCS.")
 
     except Exception as e:
-        logger.error(f"Failed to download files from GCS: {e}")
+        for tmp_path in tmp_paths:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError as cleanup_error:
+                    logger.warning(f"Failed to remove incomplete GCS download {tmp_path}: {cleanup_error}")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed while downloading files; incomplete downloads were discarded: {e}")
+        else:
+            logger.error(f"Failed to download files from GCS: {e}")
 
 def build_dod_csv():
     """Rebuild portfolio_dod_balances.csv from the portfolio_history table.
@@ -308,6 +332,17 @@ def upload_to_gcs():
             merged_db_path = db_path + ".merged"
             try:
                 blob.download_to_filename(merged_db_path)
+            except Exception as merge_err:
+                if is_gcs_checksum_mismatch(merge_err):
+                    logger.error(
+                        f"GCS checksum verification failed while downloading the database; "
+                        f"aborting upload to avoid overwriting a newer GCS database: {merge_err}"
+                    )
+                    return
+                logger.warning(f"Could not merge GCS DB ({merge_err}); uploading local DB as-is.")
+                blob.upload_from_filename(db_path)
+                logger.info(f"Successfully uploaded {db_path} to GCS.")
+            else:
                 if _merge_local_into_gcs_db(db_path, merged_db_path):
                     blob.upload_from_filename(merged_db_path)
                     logger.info(f"Successfully uploaded merged DB to GCS.")
@@ -315,10 +350,6 @@ def upload_to_gcs():
                     # Merge failed — fall back to uploading the local DB as-is.
                     blob.upload_from_filename(db_path)
                     logger.info(f"Merge failed; uploaded local DB to GCS as-is.")
-            except Exception as merge_err:
-                logger.warning(f"Could not merge GCS DB ({merge_err}); uploading local DB as-is.")
-                blob.upload_from_filename(db_path)
-                logger.info(f"Successfully uploaded {db_path} to GCS.")
             finally:
                 if os.path.exists(merged_db_path):
                     try:
@@ -347,7 +378,10 @@ def upload_to_gcs():
             logger.warning(f"DoD balances CSV not found at {csv_path}.")
 
     except Exception as e:
-        logger.error(f"Failed to upload files to GCS: {e}")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed during upload: {e}")
+        else:
+            logger.error(f"Failed to upload files to GCS: {e}")
 
 # ---------------------------------------------------------------------------
 # Screener pool sync (GCS-backed so weekly roster edits take effect without a
@@ -378,7 +412,10 @@ def download_screener_pool() -> str | None:
         blob.download_to_filename(tmp)
         return tmp
     except Exception as e:
-        logger.warning(f"Failed to download screener pool from GCS: {e}")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed while downloading screener pool: {e}")
+        else:
+            logger.warning(f"Failed to download screener pool from GCS: {e}")
         return None
 
 
@@ -400,7 +437,10 @@ def upload_screener_pool(pool: list) -> bool:
         logger.info(f"Uploaded screener pool ({len(pool)} tickers) to gs://{gcs_bucket}/{SCREENER_POOL_BLOB}")
         return True
     except Exception as e:
-        logger.error(f"Failed to upload screener pool to GCS: {e}")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed while uploading screener pool: {e}")
+        else:
+            logger.error(f"Failed to upload screener pool to GCS: {e}")
         return False
 
 
@@ -447,7 +487,10 @@ def check_kill_switch() -> dict:
                 pass
             return data
     except Exception as e:
-        logger.warning(f"Error checking GCS kill switch: {e}. Falling back to local cache.")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed for kill switch; falling back to local cache: {e}")
+        else:
+            logger.warning(f"Error checking GCS kill switch: {e}. Falling back to local cache.")
         if os.path.exists(local_path):
             try:
                 with open(local_path, "r", encoding="utf-8") as f:
@@ -493,7 +536,10 @@ def set_kill_switch_state(status: str, updated_by: str = "system") -> bool:
         logger.info(f"Successfully uploaded kill_switch.json with status {status} to GCS.")
         return True
     except Exception as e:
-        logger.error(f"Failed to upload kill_switch.json to GCS: {e}")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed while uploading kill_switch.json: {e}")
+        else:
+            logger.error(f"Failed to upload kill_switch.json to GCS: {e}")
         return False
 
 
@@ -552,7 +598,10 @@ def check_options_kill_switch() -> dict:
                 pass
             return data
     except Exception as e:
-        logger.warning(f"Error checking options kill switch: {e}. Falling back to local cache.")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed for options kill switch; falling back to local cache: {e}")
+        else:
+            logger.warning(f"Error checking options kill switch: {e}. Falling back to local cache.")
         return _local()
 
     return {"status": "ACTIVE", "updated_at": "", "updated_by": "default"}
@@ -591,6 +640,8 @@ def set_options_kill_switch_state(status: str, updated_by: str = "system") -> bo
         logger.info(f"Successfully uploaded options_kill_switch.json with status {status} to GCS.")
         return True
     except Exception as e:
-        logger.error(f"Failed to upload options_kill_switch.json to GCS: {e}")
+        if is_gcs_checksum_mismatch(e):
+            logger.error(f"GCS checksum verification failed while uploading options_kill_switch.json: {e}")
+        else:
+            logger.error(f"Failed to upload options_kill_switch.json to GCS: {e}")
         return False
-

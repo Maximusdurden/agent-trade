@@ -22,6 +22,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core import config
 from core import database
+from core.gcs_sync import is_gcs_checksum_mismatch
 from core.alpaca_client import AlpacaClient
 from core.data_provider import DataProvider
 from core.screener import load_screener_pool
@@ -128,19 +129,39 @@ def sync_database_from_gcs():
             log_blob = bucket.blob("trading.log")
             try:
                 if log_blob.exists():
-                    log_blob.download_to_filename("/tmp/trading.log")
+                    tmp_log = "/tmp/trading.log.tmp"
+                    log_blob.download_to_filename(tmp_log)
+                    os.replace(tmp_log, "/tmp/trading.log")
                     print("[GCS Sync] Successfully synchronized /tmp/trading.log from Cloud Storage.", flush=True)
             except Exception as log_sync_err:
-                print(f"[GCS Sync WARNING] Failed to sync trading.log: {log_sync_err}", file=sys.stderr)
+                if os.path.exists("/tmp/trading.log.tmp"):
+                    try:
+                        os.remove("/tmp/trading.log.tmp")
+                    except OSError as cleanup_err:
+                        print(f"[GCS Sync WARNING] Failed to remove incomplete trading.log download: {cleanup_err}", file=sys.stderr)
+                if is_gcs_checksum_mismatch(log_sync_err):
+                    print(f"[GCS Sync ERROR] Checksum verification failed for trading.log: {log_sync_err}", file=sys.stderr)
+                else:
+                    print(f"[GCS Sync WARNING] Failed to sync trading.log: {log_sync_err}", file=sys.stderr)
                 
             # 3. Download portfolio_dod_balances.csv
             csv_blob = bucket.blob("portfolio_dod_balances.csv")
             try:
                 if csv_blob.exists():
-                    csv_blob.download_to_filename("/tmp/portfolio_dod_balances.csv")
+                    tmp_csv = "/tmp/portfolio_dod_balances.csv.tmp"
+                    csv_blob.download_to_filename(tmp_csv)
+                    os.replace(tmp_csv, "/tmp/portfolio_dod_balances.csv")
                     print("[GCS Sync] Successfully synchronized /tmp/portfolio_dod_balances.csv from Cloud Storage.", flush=True)
             except Exception as csv_sync_err:
-                print(f"[GCS Sync WARNING] Failed to sync portfolio_dod_balances.csv: {csv_sync_err}", file=sys.stderr)
+                if os.path.exists("/tmp/portfolio_dod_balances.csv.tmp"):
+                    try:
+                        os.remove("/tmp/portfolio_dod_balances.csv.tmp")
+                    except OSError as cleanup_err:
+                        print(f"[GCS Sync WARNING] Failed to remove incomplete CSV download: {cleanup_err}", file=sys.stderr)
+                if is_gcs_checksum_mismatch(csv_sync_err):
+                    print(f"[GCS Sync ERROR] Checksum verification failed for portfolio_dod_balances.csv: {csv_sync_err}", file=sys.stderr)
+                else:
+                    print(f"[GCS Sync WARNING] Failed to sync portfolio_dod_balances.csv: {csv_sync_err}", file=sys.stderr)
 
             with CACHE_LOCK:
                 LATEST_STATUS_CACHE[last_sync_key] = now
@@ -151,7 +172,15 @@ def sync_database_from_gcs():
             global GCS_FIRST_SYNC_DONE
             GCS_FIRST_SYNC_DONE = True
         except Exception as e:
-            print(f"[GCS Sync WARNING] Failed to sync files from GCS: {e}", file=sys.stderr)
+            if os.path.exists(local_temp_db + ".tmp"):
+                try:
+                    os.remove(local_temp_db + ".tmp")
+                except OSError as cleanup_err:
+                    print(f"[GCS Sync WARNING] Failed to remove incomplete database download: {cleanup_err}", file=sys.stderr)
+            if is_gcs_checksum_mismatch(e):
+                print(f"[GCS Sync ERROR] Checksum verification failed while syncing from GCS: {e}", file=sys.stderr)
+            else:
+                print(f"[GCS Sync WARNING] Failed to sync files from GCS: {e}", file=sys.stderr)
 
 
 def gcs_sync_worker():
