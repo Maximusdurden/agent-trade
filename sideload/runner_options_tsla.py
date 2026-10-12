@@ -380,16 +380,37 @@ def _get_quote(client: AlpacaClient, occ_symbol: str) -> tuple[float | None, flo
 def _dispatch_exit(client: AlpacaClient, occ_symbol: str, qty: int,
                    reason: str, limit_price: float | None = None,
                    dry_run: bool = False) -> dict:
-    """Dispatch a SELL-to-close order for the held position."""
+    """Dispatch a SELL-to-close order for the held position.
+
+    A "position not found" (Alpaca APIError code 40410000) means the broker no
+    longer holds the position — either it was already closed by a prior run or
+    the tracked state is a phantom (never actually filled). Treat that as a
+    successful close so the state file is cleared instead of crashing and
+    re-attaching to the phantom forever.
+    """
     if dry_run:
         logger.info(f"[DRY-RUN] Would SELL {qty}x {occ_symbol} reason={reason} "
                     f"limit={limit_price}")
         return {"status": "dry_run", "reason": reason, "limit_price": limit_price}
 
-    if limit_price is not None:
-        return client.place_option_order(
-            symbol=occ_symbol, qty=qty, side="sell", limit_price=limit_price)
-    return client.close_option_position(occ_symbol)
+    try:
+        if limit_price is not None:
+            return client.place_option_order(
+                symbol=occ_symbol, qty=qty, side="sell", limit_price=limit_price)
+        return client.close_option_position(occ_symbol)
+    except Exception as e:
+        # Alpaca raises APIError with code 40410000 when the position does not
+        # exist. The position is already flat — report it as closed so the
+        # caller clears state and the runner does not crash.
+        msg = str(e)
+        if "40410000" in msg or "position not found" in msg.lower():
+            logger.warning(
+                f"[{occ_symbol}] Position not found on broker (already closed or "
+                f"phantom state); treating as closed. ({e})"
+            )
+            return {"status": "closed", "reason": reason, "filled_avg_price": None,
+                    "already_closed": True}
+        raise
 
 
 def _monitor_position(client: AlpacaClient, pos: dict, dry_run: bool = False) -> dict:
@@ -522,7 +543,10 @@ def _finalize_exit(pos: dict, result: dict, reason: str, dry_run: bool) -> dict:
     # order did not fill (e.g. take-profit limit unfilled, or emergency market
     # sell failed), the broker still holds the position and state must NOT be
     # cleared, or the position is orphaned.
-    closed = dry_run or (fill_price is not None)
+    # Exception: when the broker reports the position does not exist
+    # (already_closed=True from _dispatch_exit), the position is flat — clear
+    # state so a phantom/orphaned entry does not re-attach forever.
+    closed = dry_run or (fill_price is not None) or bool(result.get("already_closed"))
     return {"reason": reason, "fill_price": fill_price, "pnl_pct": pnl_pct,
             "closed": closed, "result": result}
 
@@ -609,8 +633,19 @@ def _enter_position(client: AlpacaClient, session_date: str, setup: dict,
                 logger.warning(f"Cancel failed for {order_id}: {cancel_err}")
             return None
 
+        # Phantom-position fix: require a CONFIRMED fill price before tracking.
+        # A partially_filled status with no fill price (or a status that flipped
+        # to filled without a fill price) means we cannot size the exit; writing
+        # state anyway creates a phantom position the broker never holds.
         if fill_price is None:
-            fill_price = ask
+            logger.error(f"Entry order {order_id} has no confirmed fill price "
+                         f"(status={status}); not tracking position.")
+            try:
+                if order_id:
+                    client.trading_client.cancel_order_by_id(order_id=order_id)
+            except Exception as cancel_err:
+                logger.warning(f"Cancel failed for {order_id}: {cancel_err}")
+            return None
         # Track the actually-filled qty (a partial fill leaves fewer contracts
         # than requested; tracking the full qty would over-sell on exit).
         contracts = filled_qty if filled_qty >= 1 else contracts

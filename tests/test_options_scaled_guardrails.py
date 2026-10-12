@@ -300,5 +300,110 @@ class TestConcurrentPositionCap(unittest.TestCase):
         self.assertEqual(res["open_count"], 1)
 
 
+class TestPhantomPositionRecovery(unittest.TestCase):
+    """Regression: a tracked position the broker no longer holds (phantom) must
+    be treated as closed so state is cleared, not crash the runner.
+
+    Root cause (2026-10-09/12): state was written without a confirmed fill, then
+    every run re-attached to _monitor_position -> _dispatch_exit ->
+    close_option_position, which raised APIError 40410000 ("position not found")
+    and crashed instead of clearing the phantom.
+    """
+
+    def test_dispatch_exit_treats_position_not_found_as_closed(self):
+        from sideload import runner_options_tsla as tsla
+
+        class FakeClient:
+            def close_option_position(self, symbol):
+                raise Exception('{"code":40410000,"message":"position not found: TSLA261016P00380000"}')
+
+        result = tsla._dispatch_exit(
+            FakeClient(), "TSLA261016P00380000", 1, "time_stop", dry_run=False)
+        self.assertEqual(result["status"], "closed")
+        self.assertTrue(result.get("already_closed"))
+        self.assertIsNone(result.get("filled_avg_price"))
+
+    def test_finalize_exit_clears_state_when_already_closed(self):
+        from sideload import runner_options_tsla as tsla
+
+        pos = {
+            "contract_symbol": "TSLA261016P00380000",
+            "entry_time": "2026-10-09T09:32:00-04:00",
+            "entry_premium": 6.34,
+            "contracts": 1,
+            "target_premium": 9.19,
+            "stop_premium": 4.95,
+            "session_date": "2026-10-09",
+        }
+        result = {"status": "closed", "reason": "time_stop",
+                  "filled_avg_price": None, "already_closed": True}
+        exit_info = tsla._finalize_exit(pos, result, "time_stop", dry_run=False)
+        self.assertTrue(exit_info["closed"], "already_closed must clear state")
+
+    def test_dispatch_exit_reraises_other_errors(self):
+        from sideload import runner_options_tsla as tsla
+
+        class FakeClient:
+            def close_option_position(self, symbol):
+                raise RuntimeError("network timeout")
+
+        with self.assertRaises(RuntimeError):
+            tsla._dispatch_exit(FakeClient(), "TSLA261016P00380000", 1,
+                                "time_stop", dry_run=False)
+
+
+class TestEntryFillConfirmation(unittest.TestCase):
+    """Regression: an entry order without a confirmed fill price must NOT write
+    state (phantom-position prevention).
+
+    Root cause: _enter_position accepted 'partially_filled' status and defaulted
+    fill_price to ask when None, writing an active_position the broker never
+    held.
+    """
+
+    def _make_client(self, order_status="filled", fill_price=None):
+        class FakeTradingClient:
+            def __init__(self):
+                self.canceled = []
+
+            def get_order_by_id(self, order_id):
+                class Order:
+                    status = order_status
+                    filled_avg_price = fill_price
+                    filled_qty = 1
+                return Order()
+
+            def cancel_order_by_id(self, order_id):
+                self.canceled.append(order_id)
+
+        class FakeClient:
+            def __init__(self):
+                self.trading_client = FakeTradingClient()
+
+            def place_option_order(self, **kwargs):
+                return {"id": "ord-1", "status": "new", "filled_avg_price": None}
+
+        return FakeClient()
+
+    def test_unfilled_entry_does_not_write_state(self):
+        from sideload import runner_options_multiticker as mt
+
+        client = self._make_client(order_status="new", fill_price=None)
+        # Mock the strike selection + spread gate to return a valid contract.
+        with mock.patch.object(mt, "resolve_front_week_expiry", return_value="2026-10-16"), \
+             mock.patch.object(mt, "select_strike", return_value={
+                 "selected_occ": "TSLA261016P00380000", "contracts": 1,
+                 "ask": 6.34, "bid": 6.20, "strike": 380.0, "delta": 0.45,
+             }), \
+             mock.patch.object(mt, "check_spread", return_value={"pass": True}):
+            pos = mt._enter_position(
+                client, "TSLA", "2026-10-12",
+                {"direction": "BEARISH", "entry_price": 381.91},
+                dry_run=False,
+            )
+        self.assertIsNone(pos, "Unfilled entry must not produce a tracked position")
+        self.assertEqual(client.trading_client.canceled, ["ord-1"], "Unfilled order must be canceled")
+
+
 if __name__ == "__main__":
     unittest.main()

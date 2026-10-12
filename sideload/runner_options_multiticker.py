@@ -541,8 +541,30 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
                     })
                     return None
 
+        # Defect 5 (phantom-position fix): require a CONFIRMED fill before
+        # tracking the position. A "partially_filled" status with no fill price,
+        # or a status that flipped to filled without a fill price, means we
+        # cannot size the exit — writing state anyway creates a phantom position
+        # that the broker never actually holds (the 2026-10-09 TSLA261016P00380000
+        # incident: state written, 0 orders in Alpaca, every run since re-attached
+        # to a position that never existed).
         if fill_price is None:
-            fill_price = ask
+            reason = (f"Entry order {order_id} has no confirmed fill price "
+                      f"(status={status}); not tracking position.")
+            logger.error(f"[{symbol}] {reason}")
+            try:
+                if order_id:
+                    client.trading_client.cancel_order_by_id(order_id=order_id)
+            except Exception as cancel_err:
+                logger.warning(f"[{symbol}] Cancel failed for {order_id}: {cancel_err}")
+            _reject("order_fill", reason, {
+                "occ": occ,
+                "contracts": contracts,
+                "order_id": order_id,
+                "status": status,
+                "ask": ask,
+            })
+            return None
         # Track the actually-filled qty (a partial fill leaves fewer contracts
         # than requested; tracking the full qty would over-sell on exit).
         contracts = filled_qty if filled_qty >= 1 else contracts
