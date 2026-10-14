@@ -695,10 +695,16 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
         # Attach the full indicator set so the whipsaw-prevention guardrails
         # (VWAP dead zone, day-direction lock) can read VWAP bands.
         decision["indicators"] = indicators
+        # Attach prior close for the gap-down-open exit guardrail.
+        for state in market_states:
+            if state["symbol"] == target_symbol:
+                decision["prev_close"] = state.get("prev_close")
+                break
 
         # 6. Filter proposed decision through Risk Guardrails
         is_approved, status_msg, adjusted_decision = guardrails.validate_and_adjust_decision(
-            decision, account_state, positions, cycle_context=cycle_context
+            decision, account_state, positions, cycle_context=cycle_context,
+            lane="main"
         )
 
         action = adjusted_decision.get("action", "HOLD")
@@ -846,9 +852,19 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
             max_allowed_stop = round(min(base_price * 0.995, base_price - 0.05), 2)
             if stop_loss_price > max_allowed_stop:
                 stop_loss_price = max_allowed_stop
-            min_allowed_tp = round(base_price + 0.05, 2)
+            # Clamp the brain's TP to [entry + 0.5%, entry + 10%] instead of
+            # overwriting it. The brain's take_profit_price was previously
+            # decorative (overwritten by the 5% default); now it's honored but
+            # bounded so a mis-specified TP can't attach a bracket that's too
+            # tight (whipsaw) or too loose (never fires).
+            # Floor = max(entry + 0.5%, entry + 5 cents) so a $150 stock can't
+            # get a useless $150.05 target (5 cents is NOT 5%).
+            min_allowed_tp = round(max(base_price * 1.005, base_price + 0.05), 2)
+            max_allowed_tp = round(base_price * 1.10, 2)
             if take_profit_price < min_allowed_tp:
                 take_profit_price = min_allowed_tp
+            if take_profit_price > max_allowed_tp:
+                take_profit_price = max_allowed_tp
         elif action == "BUY" and is_crypto and getattr(config, "CRYPTO_BRACKET_ENABLED", True):
             # Crypto bracket support: attach TP/SL to crypto BUYs so 24/7
             # positions aren't left running unhedged. Uses config defaults when
@@ -909,22 +925,36 @@ def _run_trading_cycle_impl(alpaca_client: AlpacaClient, data_provider: DataProv
                 filled_avg_price=order_result.get("filled_avg_price"),
                 status=order_result.get("status", "submitted")
             )
+            # Clear the trailing-stop high-water mark ONLY on a full liquidation
+            # (qty >= held qty). A partial scale-out must NOT wipe the peak ?
+            # the remaining shares still carry the historical high-water mark.
+            if action == "SELL":
+                try:
+                    from core.strategy_rules import normalize_symbol
+                    held = positions.get(symbol) or positions.get(symbol.replace("/", ""))
+                    held_qty = float(held.get("qty", 0.0) or 0.0) if isinstance(held, dict) else 0.0
+                    if qty >= held_qty - 1e-9:
+                        database.set_system_state(f"hwm_main_{normalize_symbol(symbol)}", "")
+                except Exception:
+                    pass
             executed_results.append(f"{action} {qty} {symbol}")
             # Account this executed trade toward the per-cycle cap and cumulative budget
             cycle_context["trades"] = int(cycle_context.get("trades", 0)) + 1
             cycle_context["spent"] = float(cycle_context.get("spent", 0.0)) + qty * float(order_result.get("filled_avg_price", current_price) or current_price)
         except Exception as e:
             # A minimum-notional rejection is benign/expected (the position was
-            # simply too small for the broker's per-asset floor). Log it at
-            # WARNING so it doesn't file a CRITICAL Jira ticket; all other
-            # execution failures remain CRITICAL.
+            # simply too small for the broker's per-asset floor). An
+            # insufficient-balance rejection is likewise benign/expected (the
+            # sizing model over-estimated available cash). Log both at WARNING
+            # so they don't file a CRITICAL Jira ticket; all other execution
+            # failures remain CRITICAL.
             try:
-                from core.alpaca_client import MinimumNotionalError
-                _is_min_notional = isinstance(e, MinimumNotionalError)
+                from core.alpaca_client import MinimumNotionalError, InsufficientBalanceError
+                _is_benign = isinstance(e, (MinimumNotionalError, InsufficientBalanceError))
             except Exception:
-                _is_min_notional = False
+                _is_benign = False
 
-            if _is_min_notional:
+            if _is_benign:
                 logger.warning(f"Skipped order for {symbol}: {e}")
             else:
                 logger.critical(f"FATAL: Order execution failed for {symbol}: {e}")

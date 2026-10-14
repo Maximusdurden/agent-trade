@@ -146,6 +146,35 @@ class TestMissingCommaRepair(unittest.TestCase):
         self.assertEqual(repaired, raw)
         json.loads(repaired)
 
+    def test_inserts_comma_between_number_value_and_key(self):
+        # TMCL-1081/1089 signature: the model drops the comma between a
+        # NUMBER value and the next key (e.g. quantity -> action).
+        raw = ('{"decisions": [{"symbol": "AAPL", "action": "HOLD", '
+               '"quantity": 10 "action": "BUY"}]}')
+        repaired = _repair_missing_comma(raw)
+        parsed = json.loads(repaired)
+        self.assertEqual(parsed["decisions"][0]["action"], "BUY")
+        self.assertEqual(parsed["decisions"][0]["quantity"], 10)
+
+    def test_inserts_comma_between_float_value_and_key(self):
+        raw = '{"a": 1.5 "b": 2}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(json.loads(repaired), {"a": 1.5, "b": 2})
+
+    def test_inserts_comma_between_bool_value_and_key(self):
+        raw = '{"a": true "b": 1}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(json.loads(repaired), {"a": True, "b": 1})
+
+    def test_inserts_comma_between_negative_number_and_key(self):
+        raw = '{"a": -1 "b": 2}'
+        repaired = _repair_missing_comma(raw)
+        self.assertEqual(json.loads(repaired), {"a": -1, "b": 2})
+
+    def test_does_not_touch_number_followed_by_closing_brace(self):
+        raw = '{"a": 1}'
+        self.assertEqual(_repair_missing_comma(raw), raw)
+
     def test_full_brain_style_missing_comma_before_key(self):
         # Full brain-style response with a dropped comma between a long
         # thought_process value and the next key (the TMCL-1008..1012 signature).

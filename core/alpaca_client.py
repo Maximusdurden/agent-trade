@@ -84,6 +84,27 @@ class MinimumNotionalError(Exception):
         )
 
 
+class InsufficientBalanceError(Exception):
+    """Raised when Alpaca rejects an order for insufficient buying power.
+
+    Alpaca rejects orders with code 40310000 "insufficient balance for USD"
+    when the account lacks the cash for the requested notional (seen on
+    BTC/USD 2026-10-12). This is a benign, expected condition (the sizing
+    model over-estimated available cash), NOT a system fault — the runner
+    catches it and logs a WARNING rather than a CRITICAL (which would file a
+    Jira ticket, e.g. TMCL-1087/1088).
+    """
+
+    def __init__(self, symbol: str, requested: float, available: float):
+        self.symbol = symbol
+        self.requested = requested
+        self.available = available
+        super().__init__(
+            f"Insufficient balance for {symbol}: requested ${requested:.2f}, "
+            f"available ${available:.2f}."
+        )
+
+
 class AlpacaClient:
     """Wrapper class for interfacing with the Alpaca API."""
     
@@ -1445,8 +1466,28 @@ class AlpacaClient:
             # re-raise so the caller can skip the order cleanly.
             logger.warning(str(e))
             raise
+        except InsufficientBalanceError as e:
+            # Benign, expected condition: the account lacks the cash for the
+            # requested notional (sizing over-estimated available balance).
+            # Log a WARNING (never files a Jira ticket) and re-raise so the
+            # caller can skip the order cleanly (TMCL-1087/1088).
+            logger.warning(str(e))
+            raise
         except Exception as e:
             err_msg = str(e)
+            # Alpaca rejects orders with code 40310000 "insufficient balance
+            # for USD" when the account lacks the cash. This is a benign,
+            # expected condition (sizing over-estimated available balance), not
+            # a system fault — normalize it to InsufficientBalanceError so the
+            # runner logs a WARNING instead of a CRITICAL Jira ticket
+            # (TMCL-1087/1088).
+            if "40310000" in err_msg and "insufficient" in err_msg.lower():
+                import re as _re
+                m = _re.search(r'"requested":\s*"?([\d.]+)"?', err_msg)
+                req = float(m.group(1)) if m else 0.0
+                m2 = _re.search(r'"available":\s*"?([\d.]+)"?', err_msg)
+                avail = float(m2.group(1)) if m2 else 0.0
+                raise InsufficientBalanceError(symbol, req, avail) from e
             # Check if this is an Alpaca validation error about stop_loss.stop_price or take_profit.limit_price
             if "stop_loss.stop_price" in err_msg or "take_profit.limit_price" in err_msg:
                 import re

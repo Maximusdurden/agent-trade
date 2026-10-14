@@ -400,6 +400,36 @@ def _repair_missing_comma(text: str):
             out.append(ch)
             i += 1
             continue
+        if ch in "0123456789-+.tfn":
+            # A number/boolean/literal VALUE immediately followed (after
+            # whitespace) by a `"` key opener with no comma -> insert the
+            # missing comma. This is the TMCL-1081/1089 signature: the model
+            # drops the comma between e.g. `"quantity": 10 "action": "BUY"`.
+            # Consume the full literal: digits/sign/dot/exponent for numbers,
+            # or the letters of true/false/null for booleans.
+            j = i
+            if ch in "tfn":
+                while j < n and text[j].isalpha():
+                    j += 1
+            else:
+                while j < n and text[j] in "0123456789-+.eE":
+                    j += 1
+            # Skip whitespace after the literal.
+            k = j
+            while k < n and text[k] in " \t\r\n":
+                k += 1
+            if k < n and text[k] == '"' and not prev_was_string_value:
+                out.append(text[i:j])
+                out.append(",")
+                out.append(text[j:k])
+                changed = True
+                i = k
+                prev_was_string_value = False
+                continue
+            prev_was_string_value = False
+            out.append(ch)
+            i += 1
+            continue
         # Any other token (number, literal, etc.) clears the string-value flag.
         prev_was_string_value = False
         out.append(ch)

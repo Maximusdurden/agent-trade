@@ -157,19 +157,63 @@ def _opg_window_state(now: datetime | None = None) -> tuple[bool, str]:
 
 
 def _load_positions() -> dict:
+    """Load swing positions with corruption self-heal.
+
+    If the positions file is missing or unparseable (e.g. a torn write from a
+    crashed container, as seen 2026-10-12/13), quarantine the bad file and
+    write a fresh empty state so the lane NEVER runs blind:
+      - the corrupted bytes are preserved as ``<file>.corrupt-<ts>`` for
+        forensics instead of being silently re-uploaded to GCS;
+      - the fresh ``{}`` file is what the next ``_sync_up_to_gcs()`` uploads,
+        which overwrites the corrupted GCS blob and self-heals the cloud state.
+    """
     if os.path.exists(POSITIONS_FILE):
         try:
             with open(POSITIONS_FILE, "r", encoding="utf-8") as fh:
                 return json.load(fh)
         except Exception as e:
-            logger.warning(f"Could not load positions file: {e}")
+            ts = _now_et().strftime("%Y%m%d-%H%M%S")
+            quarantine = f"{POSITIONS_FILE}.corrupt-{ts}"
+            try:
+                os.replace(POSITIONS_FILE, quarantine)
+                logger.warning(
+                    f"Could not load positions file ({e}); quarantined to "
+                    f"{quarantine} and starting fresh. GCS will be overwritten "
+                    f"with a valid empty state on the next upload."
+                )
+            except Exception as qe:
+                logger.warning(
+                    f"Could not load positions file ({e}) and quarantine failed "
+                    f"({qe}); starting fresh."
+                )
+            # Write a valid empty state so the next GCS upload self-heals the
+            # corrupted cloud blob instead of re-uploading the bad bytes.
+            try:
+                _save_positions({})
+            except Exception as se:
+                logger.warning(f"Could not write fresh positions file: {se}")
     return {}
 
 
 def _save_positions(positions: dict) -> None:
+    """Atomically persist the positions file.
+
+    Writes to a temp file in the same directory, then os.replace()s it over the
+    target. This prevents the concurrent-write corruption seen 2026-10-12: two
+    overlapping swing runs both wrote swing_positions.json, and a reader (or the
+    GCS upload) caught a partially-written file (144-byte truncated JSON).
+    os.replace is atomic on POSIX and Windows (same filesystem), so readers
+    always see either the old or the new complete file, never a torn write.
+    """
     os.makedirs(os.path.dirname(POSITIONS_FILE), exist_ok=True)
-    with open(POSITIONS_FILE, "w", encoding="utf-8") as fh:
-        json.dump(positions, fh, indent=2)
+    tmp = POSITIONS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        # default=str: coerce any stray non-JSON-serializable value (e.g. a
+        # UUID order id) to its string form instead of crashing the lane.
+        json.dump(positions, fh, indent=2, default=str)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, POSITIONS_FILE)
 
 
 def _log_fill(symbol: str, fill_price: float, ref_price: float, side: str = "buy") -> None:
@@ -224,8 +268,12 @@ def place_market_on_open_order(client, symbol: str, qty: float, side: str = "buy
         order = client.trading_client.submit_order(order_data=req)
         logger.info(f"[OPG] Submitted {side} {qty} {symbol} "
                     f"(time_in_force={getattr(tif, 'value', tif)})")
+        # Alpaca's order.id is a UUID object; coerce to str so the positions
+        # file (JSON) can serialize it. Without this, _save_positions raises
+        # "TypeError: Object of type UUID is not JSON serializable" and the
+        # whole EOD scan crashes (TMCL-1084/1085/1086/1091/1092).
         return {"symbol": symbol, "qty": qty, "side": side, "status": "submitted",
-                "order_id": getattr(order, "id", None)}
+                "order_id": str(getattr(order, "id", "")) or None}
     except Exception as e:
         logger.error(f"[OPG] Failed to submit {symbol}: {e}")
         return {"symbol": symbol, "qty": qty, "side": side, "status": "failed", "error": str(e)}
@@ -385,6 +433,31 @@ def _log_trade_to_db(decision_id: int | None, order_id: str, symbol: str, side: 
         logger.warning(f"[DB] log_trade failed for {symbol}: {e}")
 
 
+def _open_order_symbols(client) -> set:
+    """Return the set of symbols that already have open (unfilled) orders.
+
+    Used by the dedup guard in run_eod_scan: if a symbol already has an open
+    market-on-open order (e.g. from a prior scheduler run or a retry), we must
+    NOT stage another ? otherwise a retry storm places N duplicate MOO orders
+    that all fill at the next opening auction (2026-10-12: 3x NVDA + 3x SMH).
+    """
+    try:
+        orders = client.trading_client.get_orders()
+        open_statuses = ("accepted", "new", "held", "partially_filled", "pending_new")
+        result = set()
+        for o in orders:
+            status = str(getattr(o, "status", "")).lower()
+            # Alpaca enums stringify as "OrderStatus.ACCEPTED" ? strip the prefix.
+            if status.startswith("orderstatus."):
+                status = status[len("orderstatus."):]
+            if status in open_statuses:
+                result.add(str(o.symbol).upper().replace("/", ""))
+        return result
+    except Exception as e:
+        logger.warning(f"[DEDUP] Could not fetch open orders: {e}")
+        return set()
+
+
 def run_eod_scan(dry_run: bool = False) -> dict:
     """EOD 4:05 PM signal scan + stage MOO orders for open slots."""
     from core.strategies.swing_rsi2_mean_reversion import (
@@ -422,6 +495,19 @@ def run_eod_scan(dry_run: bool = False) -> dict:
         logger.info(f"Deferring OPG staging: {opg_reason}")
         return {"candidates": len(candidates), "staged": 0, "open_slots": open_slots,
                 "deferred": True, "reason": opg_reason}
+
+    # Dedup guard: skip any candidate that already has an open order. Without
+    # this, overlapping scheduler runs / Cloud Run retries place duplicate MOO
+    # orders that all fill at the next open (2026-10-12 incident: 3x NVDA +
+    # 3x SMH = ~$93k notional against a ~$94k account).
+    open_symbols = _open_order_symbols(client) if not dry_run else set()
+    if open_symbols:
+        logger.info(f"[DEDUP] Symbols with existing open orders: {sorted(open_symbols)}")
+    candidates = [c for c in candidates if c["symbol"] not in open_symbols]
+    if not candidates:
+        logger.info("[DEDUP] All candidates already have open orders; skipping staging.")
+        return {"candidates": len(candidates), "staged": 0, "open_slots": open_slots,
+                "deduped": True, "open_symbols": sorted(open_symbols)}
 
     staged = stage_orders(candidates, open_slots, dry_run=dry_run)
     if not dry_run:

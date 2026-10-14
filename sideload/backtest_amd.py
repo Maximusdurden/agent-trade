@@ -459,13 +459,27 @@ def _bar_hours(df: pd.DataFrame) -> float:
 # ---------------------------------------------------------------------------
 # Grid search
 # ---------------------------------------------------------------------------
+# Process-pool shared state. The DataFrames are loaded ONCE per worker via the
+# pool initializer instead of being pickled into every task tuple. Pickling the
+# full df_by_interval per task (chunksize=64) multiplied the memory footprint
+# by the grid size and OOM-killed workers on Cloud Run -> BrokenProcessPool
+# (TMCL-1093).
+_POOL_DF_BY_INTERVAL: dict = {}
+
+
+def _pool_init(df_by_interval: dict) -> None:
+    """Initializer: stash the interval DataFrames in each worker's global."""
+    global _POOL_DF_BY_INTERVAL
+    _POOL_DF_BY_INTERVAL = df_by_interval
+
+
 def _eval_combo(args):
     """Evaluate one combo (picklable for multiprocessing). Returns a result dict
     or None if the config produced too few trades."""
-    combo, keys, df_by_interval = args
+    combo, keys = args
     cfg = dict(zip(keys, combo))
     interval = cfg["interval"]
-    df = df_by_interval.get(interval)
+    df = _POOL_DF_BY_INTERVAL.get(interval)
     if df is None or df.empty:
         return None
     stats = simulate_config(df, cfg)
@@ -491,9 +505,13 @@ def run_grid(df_by_interval: dict, grid: dict, top_n: int = 20,
         workers = max(1, _os.cpu_count() or 1)
     logger.info(f"Running grid with {workers} workers...")
 
-    tasks = [(combo, keys, df_by_interval) for combo in combos]
+    # Tasks carry ONLY the combo + keys; the DataFrames ride in the pool
+    # initializer (loaded once per worker, not once per task).
+    tasks = [(combo, keys) for combo in combos]
     results = []
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    with ProcessPoolExecutor(max_workers=workers,
+                             initializer=_pool_init,
+                             initargs=(df_by_interval,)) as ex:
         for res in ex.map(_eval_combo, tasks, chunksize=64):
             if res is not None:
                 results.append(res)
