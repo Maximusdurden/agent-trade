@@ -43,6 +43,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from sideload.jira_logging import setup_jira_logging, log_exception_to_jira
+from sideload.options_execution_guards import check_spread
 from core.alpaca_client import AlpacaClient
 from core.discord_notifier import send_discord_message
 
@@ -60,6 +61,7 @@ BASE_ALLOCATION = 500.0  # $500 per trade
 # Delta target (§6.2).
 DELTA_MIN = 0.40
 DELTA_MAX = 0.50
+DELTA_FLOOR = 0.30  # Hard floor for spread-aware OTM walk to prevent leverage decay
 
 # Round-number buffer (§6.4): no entry within $0.50 below a round number.
 ROUND_NUMBER_BUFFER = 0.50
@@ -153,6 +155,8 @@ def _delta_target_fallback(candidates: list[dict], opt_type: str,
     cheaper, so it often fits where the first-OTM does not.
 
     Prefers OTM strikes, then delta closest to 0.45, then lowest ask.
+    Spread-aware: prefers strikes that pass the spread gate so the runner
+    doesn't reject the fallback contract after selection.
     Returns None when no candidate fits (greeks unavailable or all too
     expensive).
     """
@@ -164,8 +168,10 @@ def _delta_target_fallback(candidates: list[dict], opt_type: str,
     ]
     if not target:
         return None
-    # Prefer OTM (dist >= 0), then delta closest to 0.45, then lowest ask.
-    target.sort(key=lambda c: (0 if c["dist"] >= 0 else 1,
+    # Prefer spread-passing strikes first, then OTM (dist >= 0), then delta
+    # closest to 0.45, then lowest ask.
+    target.sort(key=lambda c: (0 if c.get("spread_pass") else 1,
+                               0 if c["dist"] >= 0 else 1,
                                abs(abs(c["delta"]) - 0.45),
                                c["ask"]))
     return target[0]
@@ -228,6 +234,7 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
         else:
             dist = current_price - strike
         delta = _get_greeks_delta(snapshot)
+        spread_info = check_spread(bid, ask)
         candidates.append({
             "occ": occ,
             "strike": strike,
@@ -235,6 +242,9 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
             "ask": ask,
             "dist": dist,
             "delta": delta,
+            "spread_pass": spread_info["pass"],
+            "spread": spread_info.get("spread"),
+            "spread_rule": spread_info.get("rule"),
         })
 
     if not candidates:
@@ -249,6 +259,8 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
 
     # 5. Select the first OTM strike (smallest positive distance).
     #    Prefer strikes with delta in [0.40, 0.50] when greeks available.
+    #    Spread-aware: prefer strikes that pass the spread gate so the runner
+    #    doesn't burn the Model A window on a contract it will reject.
     otm = [c for c in filtered if c["dist"] >= 0]
     if not otm:
         # All strikes are ITM; fall back to the closest to ATM.
@@ -256,7 +268,26 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
 
     # Sort by distance ascending (first OTM first), then by delta proximity to 0.45.
     otm.sort(key=lambda c: (c["dist"], abs((c["delta"] or 0.45) - 0.45)))
-    selected = otm[0]
+
+    # Prefer the first OTM strike that passes the spread gate AND respects the
+    # delta floor. If the closest OTM fails the gate, walk further OTM until one
+    # passes, capping the walk at DELTA_FLOOR to prevent deep-OTM leverage decay.
+    # If no viable strike passes, fall back to the closest OTM (the runner's
+    # spread gate will cleanly reject it there).
+    spread_ok = [
+        c for c in otm
+        if c["spread_pass"] and (c["delta"] is None or abs(c["delta"]) >= DELTA_FLOOR)
+    ]
+    if spread_ok:
+        selected = spread_ok[0]
+    else:
+        selected = otm[0]
+        logger.warning(
+            f"No {symbol} {opt_type} strike passes the spread gate above {DELTA_FLOOR} delta; "
+            f"selecting closest OTM {selected['occ']} (spread "
+            f"{selected.get('spread')} violates {selected.get('spread_rule')}) "
+            f"for runner-side rejection."
+        )
 
     # 6. Compute position size (§6.6) with Phase 2 elasticity.
     contracts = int(math.floor(BASE_ALLOCATION / (selected["ask"] * 100.0)))
@@ -308,6 +339,9 @@ def select_strike(client: AlpacaClient, symbol: str, direction: str,
         "notional": round(selected["ask"] * 100.0 * contracts, 2),
         "max_loss_20pct": round(selected["ask"] * 100.0 * contracts * 0.20, 2),
         "round_number_checked": True,
+        "spread_pass": selected.get("spread_pass"),
+        "spread": selected.get("spread"),
+        "spread_rule": selected.get("spread_rule"),
         "reject_reason": reject_reason,
         "selection_note": selection_note,
     }

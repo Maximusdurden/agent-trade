@@ -53,6 +53,26 @@ GCS_FILLS_BLOB = "swing_fills.csv"
 MAX_SLOTS = 3
 
 
+def _flatbase_held_symbols() -> set[str]:
+    """Symbols the flat-base lane currently holds.
+
+    The two lanes share a universe (NVDA/SMH/MSFT/ANET appear in both), so
+    without this the swing lane can buy a name flatbase already owns. That is
+    how NVDA reached 52% of equity on 2026-10-14: flatbase held 118 shares and
+    the swing lane independently bought 102 more, leaving the extra 102 managed
+    by neither lane's exit logic.
+
+    Read-only and best-effort: a missing or unreadable flatbase state must
+    never block the swing lane, so failures degrade to an empty exclusion set.
+    """
+    try:
+        from sideload import flatbase_state
+        return set(flatbase_state.get_open_positions().keys())
+    except Exception as e:
+        logger.warning(f"[DECONFLICT] Could not read flatbase positions: {e}")
+        return set()
+
+
 def _now_et() -> datetime:
     return datetime.now(ET)
 
@@ -84,8 +104,13 @@ def _sync_down_from_gcs() -> None:
     if bucket is None:
         return
     os.makedirs(os.path.dirname(POSITIONS_FILE), exist_ok=True)
+    # The flat-base state is pulled too: the cross-lane guard in run_eod_scan
+    # reads it to avoid buying a name flatbase already holds, and this container
+    # is ephemeral so the file would otherwise never exist here.
+    from sideload import flatbase_state as _fbs
     for local, blob in ((POSITIONS_FILE, GCS_POSITIONS_BLOB),
-                        (FILL_LOG, GCS_FILLS_BLOB)):
+                        (FILL_LOG, GCS_FILLS_BLOB),
+                        (_fbs.STATE_PATH, _fbs.fb_cfg.GCS_STATE_BLOB)):
         try:
             gblob = bucket.blob(blob)
             if gblob.exists():
@@ -326,18 +351,35 @@ def place_market_sell_order(client, symbol: str, qty: float) -> dict:
 
 
 def _get_position_qty(client, symbol: str, fallback: float | None = None) -> float:
-    """Get the actual filled qty for a symbol from Alpaca (source of truth).
+    """Get the qty this lane should sell for a symbol.
 
-    Falls back to the staged qty if the position can't be fetched.
+    The broker position is the source of truth for what is actually held, but
+    it is NOT the qty this lane owns: the flat-base lane can hold the same
+    symbol, and selling the broker total would liquidate flatbase's shares too.
+    On 2026-10-14 the broker held 220 NVDA (flatbase 118 + swing 102); a swing
+    exit would have sold all 220.
+
+    So: sell the lane's own tracked qty, capped by what the broker actually
+    holds. Falls back to the broker total only when this lane has no record.
     """
+    broker_qty = None
     try:
         positions = client.trading_client.get_all_positions()
         for p in positions:
             if str(getattr(p, "symbol", "")).upper() == symbol.upper():
-                return float(getattr(p, "qty", 0) or 0)
+                broker_qty = float(getattr(p, "qty", 0) or 0)
+                break
     except Exception as e:
         logger.warning(f"[SELL] Could not fetch Alpaca qty for {symbol}: {e}")
-    return fallback or 0.0
+
+    if broker_qty is None:
+        return fallback or 0.0
+    if fallback is None or fallback <= 0:
+        return broker_qty
+    if fallback < broker_qty:
+        logger.info(f"[SELL] {symbol}: selling lane qty {fallback:.2f} of "
+                    f"{broker_qty:.2f} held (remainder belongs to another lane).")
+    return min(float(fallback), broker_qty)
 
 
 def _latest_open_print(client, symbol: str) -> float:
@@ -508,6 +550,19 @@ def run_eod_scan(dry_run: bool = False) -> dict:
         logger.info("[DEDUP] All candidates already have open orders; skipping staging.")
         return {"candidates": len(candidates), "staged": 0, "open_slots": open_slots,
                 "deduped": True, "open_symbols": sorted(open_symbols)}
+
+    # Cross-lane guard: never buy a name the flat-base lane already holds.
+    # Applied after the dedup guard so the two are independent.
+    fb_held = _flatbase_held_symbols()
+    if fb_held:
+        blocked = sorted(c["symbol"] for c in candidates if c["symbol"] in fb_held)
+        if blocked:
+            logger.info(f"[DECONFLICT] Skipping flatbase-held symbols: {blocked}")
+        candidates = [c for c in candidates if c["symbol"] not in fb_held]
+    if not candidates:
+        logger.info("[DECONFLICT] All candidates held by flatbase; skipping staging.")
+        return {"candidates": len(candidates), "staged": 0, "open_slots": open_slots,
+                "deconflicted": True, "flatbase_held": sorted(fb_held)}
 
     staged = stage_orders(candidates, open_slots, dry_run=dry_run)
     if not dry_run:

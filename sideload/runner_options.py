@@ -163,7 +163,8 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         decision["indicators"] = market_state.get("indicators", {}) or {}
 
         is_approved, status_msg, adjusted = guardrails.validate_and_adjust_decision(
-            decision, account_state, positions, cycle_context=cycle_context
+            decision, account_state, positions, cycle_context=cycle_context,
+            lane="sideload_options"
         )
         action = str(adjusted.get("action", "HOLD")).upper()
         qty = float(adjusted.get("quantity", 0.0) or 0.0)
@@ -220,6 +221,19 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             option_result = option_executor.execute(adjusted, account_state)
             logger.info(f"Option order result for {symbol}: {option_result}")
             executed_results.append(option_result)
+            # Wipe the trailing-stop HWM on full liquidation to prevent
+            # stale-peak false exits. For options, the held position key is the
+            # OCC symbol (resolved by the option guardrails to adjusted.symbol).
+            if action == "SELL":
+                occ_symbol = adjusted.get("symbol", symbol)
+                held = positions.get(occ_symbol) or positions.get(occ_symbol.replace("/", ""))
+                held_qty = float(held.get("qty", 0.0)) if isinstance(held, dict) else 0.0
+                if qty >= held_qty:
+                    try:
+                        from core.strategy_rules import normalize_symbol
+                        database.set_system_state(f"hwm_sideload_options_{normalize_symbol(occ_symbol)}", "")
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Option execution failed for {symbol}: {e}")
             log_exception_to_jira(e, "AMD Options Execution Failure",

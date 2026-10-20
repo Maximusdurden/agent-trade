@@ -120,7 +120,13 @@ def sync_up_to_gcs() -> None:
 
 
 def load_state() -> dict:
-    """Load flat-base state from local JSON (or empty if missing)."""
+    """Load flat-base state from local JSON (or empty if missing).
+
+    Includes corruption self-heal: if the state file is unparseable (torn
+    write / crashed container), quarantine the bad bytes and write a fresh
+    empty state so the lane never runs blind and the next GCS upload
+    overwrites the corrupted cloud blob.
+    """
     if not os.path.exists(STATE_PATH):
         return _empty_state()
     try:
@@ -130,15 +136,36 @@ def load_state() -> dict:
         state.setdefault("realized_pnl_30d", 0.0)
         return state
     except Exception as e:
-        logger.warning(f"Could not load flat-base state: {e}")
+        ts = datetime.now(ET).strftime("%Y%m%d-%H%M%S")
+        quarantine = f"{STATE_PATH}.corrupt-{ts}"
+        try:
+            os.replace(STATE_PATH, quarantine)
+            logger.warning(
+                f"Could not load flat-base state ({e}); quarantined to "
+                f"{quarantine} and starting fresh. GCS will be overwritten "
+                f"with a valid empty state on the next upload."
+            )
+        except Exception as qe:
+            logger.warning(
+                f"Could not load flat-base state ({e}) and quarantine failed "
+                f"({qe}); starting fresh."
+            )
+        try:
+            save_state(_empty_state())
+        except Exception as se:
+            logger.warning(f"Could not write fresh flat-base state: {se}")
         return _empty_state()
 
 
 def save_state(state: dict) -> None:
-    """Save flat-base state to local JSON."""
+    """Save flat-base state to local JSON (atomically)."""
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    with open(STATE_PATH, "w", encoding="utf-8") as fh:
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2, default=str)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, STATE_PATH)
 
 
 def open_position(symbol: str, entry_price: float, initial_shares: float,
@@ -260,17 +287,34 @@ def reconcile_with_broker(client, entry_ref_price: dict | None = None) -> list[s
         if entry <= 0:
             continue
 
-        # Compute ATR14 for the stop distance.
+        # Compute ATR14 for the stop distance. NOTE: load_daily() returns raw
+        # OHLCV only, so the indicator is computed here explicitly. Previously
+        # this looked for an "atr" column that never existed, so EVERY adopted
+        # position silently took the 6%-of-entry fallback (a 9% stop distance
+        # after ATR_STOP_MULT). That inflated per-share risk, making positions
+        # oversized, and parked the stop far below any real support.
+        # 2026-10-14: NVDA adopted at a 9.00% stop instead of its true 3.77%
+        # ATR stop, carrying ~$4.4k of risk on a $350-risk strategy.
         atr = None
         try:
             df = load_daily(client, symbol, fb_cfg.LOOKBACK_BARS)
-            if df is not None and not df.empty and "atr" in df.columns:
-                atr = float(df["atr"].iloc[-1])
+            if df is not None and not df.empty:
+                if "atr14" not in df.columns:
+                    from sideload.runner_flat_base import _build_cfg
+                    from sideload.backtest_flat_base import add_indicators
+                    df = add_indicators(df, _build_cfg())
+                if "atr14" in df.columns:
+                    atr = float(df["atr14"].iloc[-1])
         except Exception as e:
             logger.warning(f"[Reconcile] ATR fetch failed for {symbol}: {e}")
 
         if atr is None or atr <= 0:
-            # Fall back to a 6% stop if ATR is unavailable.
+            # Fall back to ATR = 6% of entry when ATR is genuinely unavailable.
+            # Note the stop distance this produces is ATR_STOP_MULT * 6% = 9%,
+            # not 6%.
+            logger.warning(f"[Reconcile] {symbol}: ATR14 unavailable; "
+                           f"falling back to a 6% ATR assumption "
+                           f"({fb_cfg.ATR_STOP_MULT * 6:.1f}% stop distance).")
             atr = entry * 0.06
         stop = entry - fb_cfg.ATR_STOP_MULT * atr
         r = entry - stop

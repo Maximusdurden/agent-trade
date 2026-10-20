@@ -437,6 +437,36 @@ def run_monitor(client: AlpacaClient, dry_run: bool = False) -> None:
         remaining = pos["remaining_shares"]
         initial = pos["initial_shares"]
 
+        # Hard stop: exit the full remaining position on an intraday breach of
+        # stop_loss. Mirrors backtest_flat_base._walk_direction (L331-335), which
+        # has always exited here. Without this the live lane never cut a loser:
+        # an adopted position holds a 9% stop, and the SMA20 trail below is
+        # gated on scale_1_filled (+3R), so a position that never reaches +3R
+        # could ONLY exit via the 45-day time stop (ANET -$600 / NVDA -$997,
+        # 2026-10-14). Placed FIRST so the stop wins on ambiguous bars.
+        if low <= pos["stop_loss"]:
+            qty = pos["remaining_shares"]
+            if dry_run:
+                logger.info(f"[Dry-run] Stop hit: sell {qty:.2f} {symbol} "
+                            f"@ stop {pos['stop_loss']:.2f}")
+            else:
+                res = _sell(client, symbol, qty)
+                status = str(res.get("status", "")).lower().replace("orderstatus.", "")
+                fill_px = res.get("filled_avg_price")
+                if status == "filled" and fill_px is not None:
+                    _log_fill(pos["cluster_id"], symbol, "sell", qty, fill_px,
+                              pos["stop_loss"])
+                    pnl = (fill_px - entry) * qty
+                    fb_state.close_position(symbol, pnl)
+                    logger.info(f"[Monitor] {symbol}: STOP exit @ {pos['stop_loss']:.2f} "
+                                f"(low {low:.2f}); realized ${pnl:.2f}")
+                    _log_trade_to_db(None, res.get("order_id"), symbol, "sell",
+                                     qty, fill_px, "filled")
+                else:
+                    logger.warning(f"[Monitor] {symbol}: stop sell not fully filled "
+                                   f"(status={status}); position kept.")
+            continue
+
         # Breakeven floor: once price reaches entry + 2R, move stop to entry.
         if not pos["breakeven_active"] and high >= entry + fb_cfg.BREAKEVEN_R * r:
             pos["breakeven_active"] = True

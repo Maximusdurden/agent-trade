@@ -100,7 +100,8 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         decision["indicators"] = market_state.get("indicators", {}) or {}
 
         is_approved, status_msg, adjusted = guardrails.validate_and_adjust_decision(
-            decision, account_state, positions, cycle_context=cycle_context
+            decision, account_state, positions, cycle_context=cycle_context,
+            lane="sideload_sol"
         )
         action = str(adjusted.get("action", "HOLD")).upper()
         qty = float(adjusted.get("quantity", 0.0) or 0.0)
@@ -169,6 +170,17 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             except Exception as log_err:
                 logger.error(f"Failed to log execution: {log_err}")
             executed_results.append(order_result)
+            # Wipe the trailing-stop HWM on full liquidation to prevent
+            # stale-peak false exits.
+            if action == "SELL":
+                held = positions.get(symbol) or positions.get(symbol.replace("/", ""))
+                held_qty = float(held.get("qty", 0.0)) if isinstance(held, dict) else 0.0
+                if qty >= held_qty:
+                    try:
+                        from core.strategy_rules import normalize_symbol
+                        database.set_system_state(f"hwm_sideload_sol_{normalize_symbol(symbol)}", "")
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Execution failed for {symbol}: {e}")
             log_exception_to_jira(e, "SOL Execution Failure",

@@ -107,7 +107,8 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
         decision["indicators"] = market_state.get("indicators", {}) or {}
 
         is_approved, status_msg, adjusted = guardrails.validate_and_adjust_decision(
-            decision, account_state, positions, cycle_context=cycle_context
+            decision, account_state, positions, cycle_context=cycle_context,
+            lane="sideload_amd"
         )
         action = str(adjusted.get("action", "HOLD")).upper()
         qty = float(adjusted.get("quantity", 0.0) or 0.0)
@@ -211,6 +212,18 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                 status=order_result.get("status", "submitted"),
             )
             executed_results.append(f"{action} {qty} {symbol}")
+            # Wipe the trailing-stop HWM on full liquidation to prevent
+            # stale-peak false exits (a 30% winner's peak must not blind the
+            # next entry in the same symbol).
+            if action == "SELL":
+                held = positions.get(symbol) or positions.get(symbol.replace("/", ""))
+                held_qty = float(held.get("qty", 0.0)) if isinstance(held, dict) else 0.0
+                if qty >= held_qty:
+                    try:
+                        from core.strategy_rules import normalize_symbol
+                        database.set_system_state(f"hwm_sideload_amd_{normalize_symbol(symbol)}", "")
+                    except Exception:
+                        pass
             cycle_context["trades"] = int(cycle_context.get("trades", 0)) + 1
         except Exception as e:
             logger.critical(f"Order execution failed for {symbol}: {e}")

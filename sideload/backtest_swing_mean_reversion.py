@@ -70,6 +70,15 @@ DEFAULT_CFG = {
     "profit_sma": 5,          # exit on first touch of SMA5 (or SMA20 return)
     "max_hold_days": 5,       # time stop
     "catastrophic_atr_mult": 2.0,  # hard stop at entry - 2.0*ATR14
+    # Trailing stop (equity-only, HPE 2026-10-12 fix): exit when a winner
+    # gives back TRAIL_GIVEBACK_PCT of its peak gain after reaching
+    # TRAIL_MIN_GAIN_PCT. 0 disables.
+    "trail_giveback_pct": 0.20,
+    "trail_min_gain_pct": 0.02,
+    # Gap-down-open exit: exit at the open when the entry-day open gaps down
+    # more than GAP_DOWN_PCT from the prior close. 0 disables (ablation showed
+    # it is net-harmful ? sells into recoveries).
+    "gap_down_pct": 0.0,
     # Sizing
     "size_pct": 0.10,
     "equity": 10000.0,
@@ -85,6 +94,9 @@ BASELINE_CFG = {
     "slippage": 0.05,
     "size_pct": 0.10,
     "equity": 10000.0,
+    "trail_giveback_pct": 0.20,
+    "trail_min_gain_pct": 0.02,
+    "gap_down_pct": 0.0,
 }
 
 
@@ -287,12 +299,38 @@ def simulate(df: pd.DataFrame, cfg: dict, baseline: bool = False,
             # Catastrophic stop: entry - 2.0*ATR14 (structural, fixed).
             cat_mult = float(cfg.get("catastrophic_atr_mult", DEFAULT_CFG["catastrophic_atr_mult"]))
             cat_stop = entry - cat_mult * entry_atr
+            # Gap-down-open exit: if the entry-day open gaps down more than
+            # gap_down_pct from the prior close, exit at the open (HPE
+            # 2026-10-12 failure mode: opened -0.83%, flushed to -2.9%).
+            gap_down_pct = float(cfg.get("gap_down_pct", 0.0))
+            if gap_down_pct > 0 and i >= 1:
+                prior_close = float(df.iloc[i - 1]["close"])
+                if prior_close > 0:
+                    gap_pct = (float(row["open"]) - prior_close) / prior_close
+                    if gap_pct <= -gap_down_pct:
+                        exit_reason = "gap_down"
+                        exit_px = float(row["open"])
+                        exit_ts = ts
+                        ret = (exit_px - entry) / entry
+                        trades.append({
+                            "entry_ts": str(entry_ts.date()), "exit_ts": str(exit_ts.date()),
+                            "entry": entry, "exit": exit_px,
+                            "ret_pct": ret * 100.0, "exit_reason": exit_reason,
+                            "hold_days": 0,
+                        })
+                        i += 1
+                        continue
             # Walk forward up to max_hold_days to find the exit.
             exit_reason = None
             exit_px = None
             exit_ts = None
+            peak = entry  # high-water mark for trailing stop
+            trail_giveback = float(cfg.get("trail_giveback_pct", 0.0))
+            trail_min_gain = float(cfg.get("trail_min_gain_pct", 0.0))
             for j in range(i + 1, min(i + 1 + int(cfg["max_hold_days"]), n)):
                 bar = df.iloc[j]
+                # Track high-water mark (intraday high approximates peak).
+                peak = max(peak, float(bar["high"]))
                 # Profit target: first touch of SMA5 (close > SMA5).
                 if float(bar["close"]) > float(sig.iloc[j]["sma5"]):
                     exit_reason = "sma5_touch"
@@ -305,6 +343,19 @@ def simulate(df: pd.DataFrame, cfg: dict, baseline: bool = False,
                     exit_px = cat_stop
                     exit_ts = df.index[j]
                     break
+                # Trailing stop: in profit but gave back too much of peak.
+                # Arm on PEAK gain (matches live guardrails.py), not current
+                # close gain ? a stock that spiked 5% intraday and closed +1%
+                # must still be evaluated for giveback.
+                if trail_giveback > 0 and peak > entry:
+                    peak_gain = (peak - entry) / entry
+                    if peak_gain >= trail_min_gain:
+                        giveback = (peak - float(bar["close"])) / (peak - entry)
+                        if giveback >= trail_giveback:
+                            exit_reason = "trail_stop"
+                            exit_px = float(bar["close"])
+                            exit_ts = df.index[j]
+                            break
             if exit_reason is None:
                 # Time stop: exit at the close of the max-hold day.
                 j = min(i + int(cfg["max_hold_days"]), n - 1)
@@ -558,6 +609,70 @@ def robustness_scan(df: pd.DataFrame, symbol: str,
     return results
 
 
+def ablation_sweep(df: pd.DataFrame, symbol: str,
+                    earnings_dates: set | None = None,
+                    earnings_window: int = 2) -> list[dict]:
+    """Ablation matrix: which exit filter adds edge, which is redundant.
+
+    Sweeps trailing-stop giveback x min-gain and gap-down threshold on the
+    baseline, plus a no-exit-filter control. Gates (per the options lane):
+    win rate >= 55%, PF >= 2.0, max DD <= 10%, n >= 20.
+    """
+    results = []
+    # Control: no trailing stop, no gap rule (current production behavior).
+    cfg = dict(BASELINE_CFG)
+    cfg["trail_giveback_pct"] = 0.0
+    cfg["gap_down_pct"] = 0.0
+    trades = simulate(df, cfg, baseline=True, earnings_dates=earnings_dates,
+                      earnings_window=earnings_window)
+    stats = _stats(trades, cfg)
+    stats.update({"symbol": symbol, "variant": "control (no trail, no gap)",
+                  "trail_giveback": 0.0, "trail_min_gain": 0.0, "gap_down": 0.0})
+    results.append(stats)
+
+    # Trailing-stop sweep (gap disabled).
+    for giveback in [0.20, 0.30, 0.40, 0.50]:
+        for min_gain in [0.01, 0.02, 0.03]:
+            cfg = dict(BASELINE_CFG)
+            cfg["trail_giveback_pct"] = giveback
+            cfg["trail_min_gain_pct"] = min_gain
+            cfg["gap_down_pct"] = 0.0
+            trades = simulate(df, cfg, baseline=True, earnings_dates=earnings_dates,
+                              earnings_window=earnings_window)
+            stats = _stats(trades, cfg)
+            stats.update({"symbol": symbol, "variant": f"trail {giveback:.0%}/{min_gain:.0%}",
+                          "trail_giveback": giveback, "trail_min_gain": min_gain,
+                          "gap_down": 0.0})
+            results.append(stats)
+
+    # Gap-down sweep (trailing disabled).
+    for gap in [0.01, 0.015, 0.02, 0.03]:
+        cfg = dict(BASELINE_CFG)
+        cfg["trail_giveback_pct"] = 0.0
+        cfg["gap_down_pct"] = gap
+        trades = simulate(df, cfg, baseline=True, earnings_dates=earnings_dates,
+                          earnings_window=earnings_window)
+        stats = _stats(trades, cfg)
+        stats.update({"symbol": symbol, "variant": f"gap {gap:.1%}",
+                      "trail_giveback": 0.0, "trail_min_gain": 0.0, "gap_down": gap})
+        results.append(stats)
+
+    # Combined: recommended params (30% giveback / 2% min-gain + 1.5% gap).
+    cfg = dict(BASELINE_CFG)
+    cfg["trail_giveback_pct"] = 0.30
+    cfg["trail_min_gain_pct"] = 0.02
+    cfg["gap_down_pct"] = 0.015
+    trades = simulate(df, cfg, baseline=True, earnings_dates=earnings_dates,
+                      earnings_window=earnings_window)
+    stats = _stats(trades, cfg)
+    stats.update({"symbol": symbol, "variant": "combined (30%/2% + 1.5% gap)",
+                  "trail_giveback": 0.30, "trail_min_gain": 0.02, "gap_down": 0.015})
+    results.append(stats)
+
+    results.sort(key=lambda x: -x["expectancy_usd"])
+    return results
+
+
 def print_benchmark(r: dict) -> None:
     b = r.get("benchmark", {})
     if not b:
@@ -607,6 +722,8 @@ def main() -> None:
                         help="Run anchored/rolling walk-forward OOS on the baseline")
     parser.add_argument("--robustness", action="store_true",
                         help="Sweep RSI threshold x exit SMA (parameter robustness)")
+    parser.add_argument("--ablation", action="store_true",
+                        help="Ablation sweep: trailing-stop x gap-down exit filters")
     parser.add_argument("--earnings-blackout", action="store_true",
                         help="Block entries within +/-2 days of earnings (avoid gap-down tail risk)")
     parser.add_argument("--gate", choices=["dual_sma50", "sma200_slope", "sector"],
@@ -661,6 +778,16 @@ def main() -> None:
                 print(f"  {s['rsi_buy_below']:>5} {s['profit_sma']:>4} {s['trades']:>4} "
                       f"{s['win_rate']*100:>5.1f}% {s['expectancy_usd']:>8.2f} "
                       f"{s['profit_factor']:>5.2f} {s['total_pnl_usd']:>9.2f}")
+        if args.ablation:
+            scan = ablation_sweep(df, symbol, earnings_dates=earnings_dates)
+            results.append({"type": "ablation_sweep", "symbol": symbol, "scan": scan})
+            print(f"\n=== Ablation Sweep ? {symbol} (trailing-stop x gap-down) ===")
+            print(f"  {'variant':<28} {'n':>4} {'win%':>6} {'exp$':>8} {'PF':>5} {'DD%':>6} {'total$':>9}")
+            for s in scan:
+                print(f"  {s['variant']:<28} {s['trades']:>4} "
+                      f"{s['win_rate']*100:>5.1f}% {s['expectancy_usd']:>8.2f} "
+                      f"{s['profit_factor']:>5.2f} {s['max_drawdown_pct']:>6.1f} "
+                      f"{s['total_pnl_usd']:>9.2f}")
         if args.baseline:
             r = run_backtest(df, symbol, base_cfg, baseline=True,
                              earnings_dates=earnings_dates, sector_df=sector_df)

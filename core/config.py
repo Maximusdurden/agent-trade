@@ -92,8 +92,16 @@ MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "0"))  # default disabled (se
 #    winners). 0 disables.
 #    BACKTEST: net-negative when applied to all (cuts DOT/LTC winners); only a
 #    tiny positive edge when equity-only. Default DISABLED.
-TRAIL_STOP_GIVEBACK_PCT = float(os.getenv("TRAIL_STOP_GIVEBACK_PCT", "0"))
-TRAIL_STOP_MIN_GAIN_PCT = float(os.getenv("TRAIL_STOP_MIN_GAIN_PCT", "0.03"))
+TRAIL_STOP_GIVEBACK_PCT = float(os.getenv("TRAIL_STOP_GIVEBACK_PCT", "0.20"))
+TRAIL_STOP_MIN_GAIN_PCT = float(os.getenv("TRAIL_STOP_MIN_GAIN_PCT", "0.02"))
+#
+# 2b. Gap-down-open exit (equity-only): if a held equity position opens down
+#    more than EQUITY_GAP_DOWN_EXIT_PCT from the prior close, force a
+#    market-on-open SELL. A -1.5%+ gap on a large-cap equity is a news/regime
+#    event, not noise (HPE 2026-10-12: opened -0.83%, flushed to -2.9% before
+#    recovering). 0 disables. Skipped when the position is already in profit
+#    >= TRAIL_STOP_MIN_GAIN_PCT (the trailing stop handles that more gracefully).
+EQUITY_GAP_DOWN_EXIT_PCT = float(os.getenv("EQUITY_GAP_DOWN_EXIT_PCT", "0"))  # disabled: ablation showed net-harmful (sells into recoveries)
 #
 # 3. RSI-overbought exit: if a held position is in profit AND RSI is overbought
 #    (>= RSI_EXIT_OVERBOUGHT), force a full-exit SELL to take profit before the

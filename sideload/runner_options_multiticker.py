@@ -469,7 +469,8 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
         return None
 
     ask = float(strike_info["ask"])
-    # Spread gate.
+    # Spread gate (defense-in-depth: the strike selector is now spread-aware,
+    # but re-verify here in case the quote moved between selection and entry).
     spread = check_spread(float(strike_info["bid"]), ask)
     if not spread["pass"]:
         reason = f"Spread gate failed for {occ}: {spread['reason']}"
@@ -480,6 +481,9 @@ def _enter_position(client: AlpacaClient, symbol: str, session_date: str,
             "ask": ask,
             "spread": spread.get("spread"),
             "rule": spread.get("rule"),
+            "selector_spread_pass": strike_info.get("spread_pass"),
+            "selector_spread": strike_info.get("spread"),
+            "selector_spread_rule": strike_info.get("spread_rule"),
         })
         return None
 

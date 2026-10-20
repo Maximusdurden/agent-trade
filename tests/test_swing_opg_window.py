@@ -109,6 +109,59 @@ class TestEodScanDefersStaging(unittest.TestCase):
         place_mock.assert_not_called()
 
 
+class TestDedupGuard(unittest.TestCase):
+    """The dedup guard must prevent duplicate MOO orders on retry storms."""
+
+    def _client_with_open_orders(self, symbols=("NVDA", "SMH")):
+        client = MagicMock()
+        orders = []
+        for sym in symbols:
+            o = MagicMock()
+            o.symbol = sym
+            o.status = "OrderStatus.ACCEPTED"
+            orders.append(o)
+        client.trading_client.get_orders.return_value = orders
+        return client
+
+    def test_open_order_symbols_detects_accepted(self):
+        client = self._client_with_open_orders()
+        syms = rst._open_order_symbols(client)
+        self.assertEqual(syms, {"NVDA", "SMH"})
+
+    def test_open_order_symbols_ignores_cancelled(self):
+        client = self._client_with_open_orders()
+        client.trading_client.get_orders.return_value[0].status = "OrderStatus.CANCELLED"
+        syms = rst._open_order_symbols(client)
+        self.assertEqual(syms, {"SMH"})
+
+    def test_scan_skips_candidates_with_open_orders(self):
+        candidates = [
+            {"symbol": "NVDA", "signal_date": "2026-10-09", "rsi": 11.2,
+             "stretch": 0.0, "close": 230.57},
+            {"symbol": "SMH", "signal_date": "2026-10-09", "rsi": 6.8,
+             "stretch": 0.0, "close": 606.68},
+            {"symbol": "AAPL", "signal_date": "2026-10-09", "rsi": 5.0,
+             "stretch": 1.0, "close": 100.0},
+        ]
+        client = self._client_with_open_orders(("NVDA", "SMH"))
+        client.get_account_state.return_value = {"equity": 100000.0}
+
+        with patch("core.strategies.swing_rsi2_mean_reversion.scan_signals",
+                   return_value=candidates), \
+             patch("core.alpaca_client.AlpacaClient", return_value=client), \
+             patch.object(rst, "_load_positions", return_value={}), \
+             patch.object(rst, "_opg_window_state", return_value=(True, "open")), \
+             patch("core.strategies.swing_rsi2_mean_reversion.stage_orders") as stage_mock, \
+             patch.object(rst, "place_market_on_open_order") as place_mock:
+            result = rst.run_eod_scan(dry_run=False)
+
+        # Only AAPL should be staged (NVDA/SMH deduped).
+        staged_symbols = [c["symbol"] for c in stage_mock.call_args[0][0]]
+        self.assertEqual(staged_symbols, ["AAPL"])
+        # The dedup guard filtered NVDA/SMH before staging.
+        self.assertEqual(result["candidates"], 1)
+
+
 class TestAutoModeSelection(unittest.TestCase):
     """The 7:05 PM OPG staging run must select scan mode, not monitor mode."""
 

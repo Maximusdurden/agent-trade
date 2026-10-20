@@ -43,6 +43,11 @@ class TestIntelligentExits(unittest.TestCase):
     def setUp(self):
         self.g = RiskGuardrails()
         self.g.is_market_open_check = lambda: (True, "open")
+        # Clear any persisted high-water marks so tests are isolated (the
+        # trailing stop persists hwm_<symbol> in system_state).
+        from core import database
+        for sym in ("GOOG", "NVDA", "INTC", "AAPL", "XOM", "SOL/USD", "HPE"):
+            database.set_system_state(f"hwm_main_{sym}", "")
         self._orig = {
             "max_hold": getattr(config, "MAX_HOLD_HOURS", 0),
             "giveback": getattr(config, "TRAIL_STOP_GIVEBACK_PCT", 0),
@@ -94,16 +99,14 @@ class TestIntelligentExits(unittest.TestCase):
         """A winner that gave back >50% of its peak gain is force-exited."""
         config.TRAIL_STOP_GIVEBACK_PCT = 0.50
         config.TRAIL_STOP_MIN_GAIN_PCT = 0.03
-        # Avg entry 1.00, peak 1.20 (from trade history), now 1.05.
+        # Avg entry 1.00, peak 1.20 (persisted high-water mark), now 1.05.
         # gain_pct = 5% >= 3%; giveback = (1.20-1.05)/(1.20-1.00) = 75% >= 50%.
-        with patch("core.database.get_recent_trades_by_symbol",
-                   return_value=[{"side": "buy", "status": "filled",
-                                  "timestamp": datetime.utcnow().isoformat(),
-                                  "filled_avg_price": 1.20}]):
-            approved, msg, adj = self.g.validate_and_adjust_decision(
-                _decision("NVDA", action="HOLD", qty=0.0, price=1.05),
-                _account(), _positions("NVDA", 100.0, 1.00)
-            )
+        from core import database
+        database.set_system_state("hwm_main_NVDA", "1.200000")
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("NVDA", action="HOLD", qty=0.0, price=1.05),
+            _account(), _positions("NVDA", 100.0, 1.00)
+        )
         self.assertTrue(approved)
         self.assertEqual(adj["action"], "SELL")
         self.assertIn("gave back", msg)
@@ -111,15 +114,13 @@ class TestIntelligentExits(unittest.TestCase):
     def test_trailing_stop_not_exited_when_holding_gain(self):
         config.TRAIL_STOP_GIVEBACK_PCT = 0.50
         config.TRAIL_STOP_MIN_GAIN_PCT = 0.03
-        # Peak 1.20, now 1.18 -> giveback (1.20-1.18)/(1.20-1.00) = 10% < 50%.
-        with patch("core.database.get_recent_trades_by_symbol",
-                   return_value=[{"side": "buy", "status": "filled",
-                                  "timestamp": datetime.utcnow().isoformat(),
-                                  "filled_avg_price": 1.20}]):
-            approved, msg, adj = self.g.validate_and_adjust_decision(
-                _decision("NVDA", action="HOLD", qty=0.0, price=1.18),
-                _account(), _positions("NVDA", 100.0, 1.00)
-            )
+        # Peak 1.20 (persisted HWM), now 1.18 -> giveback 10% < 50%.
+        from core import database
+        database.set_system_state("hwm_main_NVDA", "1.200000")
+        approved, msg, adj = self.g.validate_and_adjust_decision(
+            _decision("NVDA", action="HOLD", qty=0.0, price=1.18),
+            _account(), _positions("NVDA", 100.0, 1.00)
+        )
         self.assertTrue(approved)
         self.assertEqual(adj["action"], "HOLD")
 
@@ -161,6 +162,7 @@ class TestIntelligentExits(unittest.TestCase):
     def test_drawdown_exits_losing_position(self):
         """A held equity down >5% from entry is force-exited (GOOG failure mode)."""
         config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        config.TRAIL_STOP_GIVEBACK_PCT = 0  # isolate drawdown behavior
         # Avg entry 1.00, now 0.93 -> 7% drawdown >= 5% -> force-exit.
         approved, msg, adj = self.g.validate_and_adjust_decision(
             _decision("GOOG", action="HOLD", qty=0.0, price=0.93),
@@ -174,6 +176,7 @@ class TestIntelligentExits(unittest.TestCase):
     def test_drawdown_not_exited_when_small_loss(self):
         """A small drawdown below the threshold is NOT force-exited."""
         config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        config.TRAIL_STOP_GIVEBACK_PCT = 0  # isolate drawdown behavior
         # Avg entry 1.00, now 0.98 -> 2% drawdown < 5% -> hold.
         approved, msg, adj = self.g.validate_and_adjust_decision(
             _decision("GOOG", action="HOLD", qty=0.0, price=0.98),
@@ -185,6 +188,7 @@ class TestIntelligentExits(unittest.TestCase):
     def test_drawdown_not_exited_when_profitable(self):
         """A position above entry is never drawdown-exited."""
         config.EQUITY_DRAWDOWN_EXIT_PCT = 0.05
+        config.TRAIL_STOP_GIVEBACK_PCT = 0  # isolate drawdown behavior
         approved, msg, adj = self.g.validate_and_adjust_decision(
             _decision("GOOG", action="HOLD", qty=0.0, price=1.05),
             _account(), _positions("GOOG", 80.0, 1.00)

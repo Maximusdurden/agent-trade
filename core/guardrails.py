@@ -201,7 +201,9 @@ class RiskGuardrails:
                 f"De-risking with a full exit instead of scaling into a falling position.")
 
     def _intelligent_exit_reason(self, symbol: str, current_price: float,
-                                 current_positions: dict, indicators: dict | None) -> str | None:
+                                 current_positions: dict, indicators: dict | None,
+                                 prev_close: float | None = None,
+                                 lane: str = "main") -> str | None:
         """Return a reason if a held position should be force-exited (Phase 4).
 
         Deterministic exit guardrails that complement the broker TP/SL brackets
@@ -258,26 +260,35 @@ class RiskGuardrails:
                 logger.error(f"Error checking max-hold exit for {symbol}: {err}")
 
         # 2. Trailing-stop exit: in profit but gave back too much of the peak gain.
+        #    The high-water mark is persisted in system_state and updated on
+        #    EVERY cycle (not just when in profit), so a winner that gives back
+        #    its gains ? even below entry ? is caught. This fixes the dead-code
+        #    bug where the peak was sourced from filled_avg_price (the entry
+        #    fill), which can never detect giveback.
         trail_giveback = float(getattr(config, "TRAIL_STOP_GIVEBACK_PCT", 0))
         trail_min_gain = float(getattr(config, "TRAIL_STOP_MIN_GAIN_PCT", 0))
-        if trail_giveback > 0 and current_price > avg_entry:
-            gain_pct = (current_price - avg_entry) / avg_entry * 100.0
-            if gain_pct >= trail_min_gain * 100.0:
-                # Peak gain = highest close since entry. Approximate with the
-                # position's high-water mark from recent trades if available,
-                # else use current price (no giveback detected).
-                peak = current_price
-                try:
-                    from core import database
-                    recent = database.get_recent_trades_by_symbol(symbol, limit=50)
-                    for t in recent:
-                        p = t.get("filled_avg_price")
-                        if p and float(p) > peak:
-                            peak = float(p)
-                except Exception:
-                    pass
-                if peak > avg_entry:
-                    peak_gain_pct = (peak - avg_entry) / avg_entry * 100.0
+        if trail_giveback > 0:
+            peak = current_price
+            try:
+                from core import database
+                hwm_key = f"hwm_{lane}_{normalize_symbol(symbol)}"
+                stored = database.get_system_state(hwm_key)
+                if stored:
+                    try:
+                        peak = max(peak, float(stored))
+                    except (ValueError, TypeError):
+                        pass
+                # Update the high-water mark with the current price.
+                if current_price > peak:
+                    peak = current_price
+                database.set_system_state(hwm_key, f"{peak:.6f}")
+            except Exception:
+                pass
+            if peak > avg_entry:
+                peak_gain_pct = (peak - avg_entry) / avg_entry * 100.0
+                gain_pct = (current_price - avg_entry) / avg_entry * 100.0
+                # Only fire once the position reached the min-gain threshold.
+                if peak_gain_pct >= trail_min_gain * 100.0:
                     giveback_pct = (peak - current_price) / (peak - avg_entry) * 100.0
                     if giveback_pct >= trail_giveback * 100.0:
                         return (f"Force-exit: {symbol} gave back {giveback_pct:.0f}% "
@@ -285,6 +296,26 @@ class RiskGuardrails:
                                 f"${current_price:.2f}, >= TRAIL_STOP_GIVEBACK_PCT "
                                 f"{trail_giveback*100:.0f}%). Locking in remaining "
                                 f"profit (NVDA failure mode).")
+
+        # 2b. Gap-down-open exit (equity-only): if a held position opens down
+        # more than EQUITY_GAP_DOWN_EXIT_PCT from the prior close, force a
+        # market-on-open SELL. A -1.5%+ gap on a large-cap equity is a
+        # news/regime event, not noise (HPE 2026-10-12: opened -0.83%, flushed
+        # to -2.9% before recovering). Skip when the position is already in
+        # profit >= min-gain (the trailing stop handles that more gracefully).
+        gap_exit = float(getattr(config, "EQUITY_GAP_DOWN_EXIT_PCT", 0))
+        if gap_exit > 0 and current_price < avg_entry:
+            scope = str(getattr(config, "EXIT_RULE_SCOPE", "equity_only")).lower()
+            if scope == "equity_only" and "/" in normalize_symbol(symbol):
+                pass  # crypto exempt
+            elif prev_close and prev_close > 0:
+                gap_pct = (current_price - prev_close) / prev_close * 100.0
+                if gap_pct <= -gap_exit * 100.0:
+                    return (f"Force-exit: {symbol} gapped down {gap_pct:.1f}% "
+                            f"from prior close ${prev_close:.2f} (<= "
+                            f"EQUITY_GAP_DOWN_EXIT_PCT {gap_exit*100:.0f}%). "
+                            f"Market-on-open exit to avoid gap-through "
+                            f"continuation (HPE failure mode).")
 
         # 3. RSI-overbought exit: in profit and overbought -> take profit.
         rsi_exit = float(getattr(config, "RSI_EXIT_OVERBOUGHT", 0))
@@ -738,7 +769,8 @@ class RiskGuardrails:
         return None
 
     def validate_and_adjust_decision(self, decision: dict, account_state: dict, current_positions: dict,
-                                     cycle_context: dict | None = None) -> tuple[bool, str, dict]:
+                                     cycle_context: dict | None = None,
+                                     lane: str = "main") -> tuple[bool, str, dict]:
         """
         Validates the proposed decision from the LLM trading brain against risk limits.
         If necessary, it safely scales down trade size (shares) to comply with guidelines.
@@ -791,8 +823,14 @@ class RiskGuardrails:
         # force-exit) so they override even a HOLD/NO_ACTION decision — a stale or
         # give-back position must be exited regardless of what the brain says.
         _ix_indicators = decision.get("indicators") if isinstance(decision.get("indicators"), dict) else {}
+        _ix_prev_close = decision.get("prev_close")
+        try:
+            _ix_prev_close = float(_ix_prev_close) if _ix_prev_close is not None else None
+        except (ValueError, TypeError):
+            _ix_prev_close = None
         intelligent_exit_reason = self._intelligent_exit_reason(
-            symbol, _fx_price, current_positions, _ix_indicators
+            symbol, _fx_price, current_positions, _ix_indicators, _ix_prev_close,
+            lane=lane
         )
         if intelligent_exit_reason:
             held = current_positions.get(symbol) or current_positions.get(symbol.replace("/", ""))
