@@ -191,9 +191,13 @@ def check_schedulers() -> list[str]:
             if job.last_attempt_time is None:
                 continue
             age_h = (now - job.last_attempt_time).total_seconds() / 3600.0
-            if age_h > 48:
-                issues.append(f"Scheduler {job.name.split('/')[-1]} has not fired in "
-                              f"{age_h:.1f}h (> 48h).")
+            # Weekly jobs (e.g. fill audits, weekly roster) are expected to run once a week (~168h).
+            # Allow up to 192h (8 days) for weekly schedulers before flagging.
+            job_id = job.name.split('/')[-1]
+            threshold_h = 192.0 if ("weekly" in job_id or "audit" in job_id) else 48.0
+            if age_h > threshold_h:
+                issues.append(f"Scheduler {job_id} has not fired in "
+                              f"{age_h:.1f}h (> {threshold_h:.0f}h).")
     except Exception as e:
         issues.append(f"Could not check schedulers: {e}")
     return issues
