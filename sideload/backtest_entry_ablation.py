@@ -48,7 +48,11 @@ if PROJECT_ROOT not in sys.path:
 from sideload.jira_logging import setup_jira_logging, log_exception_to_jira
 from core.alpaca_client import AlpacaClient
 from core.discord_notifier import send_discord_message
-from sideload.runner_options_tsla import SWEEP_MIN_PENETRATION
+
+# NOTE: the TSLA options lane (sideload/runner_options_tsla.py) was removed on
+# 2026-10-26 — options now live solely in Z:\python\projects\model-a-options.
+# SWEEP_MIN_PENETRATION is inlined here so this historical backtest still runs.
+SWEEP_MIN_PENETRATION = float(os.environ.get("OPTIONS_SWEEP_MIN_PENETRATION", "0.25"))
 
 logger = logging.getLogger("BacktestEntryAblation")
 

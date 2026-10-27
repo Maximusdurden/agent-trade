@@ -1,5 +1,6 @@
 {
-  "status": "ACTIVE",
-  "updated_at": "",
-  "updated_by": "system"
+    "updated_by":  "migration",
+    "status":  "DISARMED",
+    "note":  "Moved to model-a-options project. Do not re-arm here.",
+    "updated_at":  "2026-10-26T00:00:00"
 }
