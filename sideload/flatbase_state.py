@@ -223,6 +223,31 @@ def count_open_positions() -> int:
     return len(get_open_positions())
 
 
+def should_notify_cycle(symbols: list[str]) -> bool:
+    """Return True when a cycle-complete notification is worth sending.
+
+    The monitor scheduler runs hourly from 10:00-15:00 ET (6x/day) and used to
+    send an identical "Runner cycle complete (N open positions)" message every
+    single time. That is pure noise: the count rarely changes intraday.
+
+    Notify only when the position SET changed, or on the first cycle of the
+    day (a once-daily heartbeat proving the lane is alive).
+
+    The marker is persisted into the state file, so it must be written BEFORE
+    ``sync_up_to_gcs()`` — otherwise the next container downloads the older
+    cloud state, loses the marker, and re-notifies.
+    """
+    state = load_state()
+    today = datetime.now(ET).date().isoformat()
+    current = sorted(symbols)
+    last = state.get("last_cycle_notify") or {}
+    if last.get("date") == today and last.get("symbols") == current:
+        return False
+    state["last_cycle_notify"] = {"date": today, "symbols": current}
+    save_state(state)
+    return True
+
+
 def increment_bars_held() -> None:
     """Increment bars_held for all open positions (once per trading day).
 
@@ -274,6 +299,34 @@ def reconcile_with_broker(client, entry_ref_price: dict | None = None) -> list[s
 
     state = load_state()
     adopted = []
+
+    # PRUNE: drop state entries the broker no longer holds.
+    #
+    # Without this the state only ever GROWS. A position closed by another lane
+    # (or manually) stays in active_positions forever, so the reported count
+    # drifts above reality. Observed 2026-11-02: state said 6 open, the broker
+    # held 5 — AMD had been closed but was never removed, and every cycle
+    # notification reported the phantom.
+    #
+    # Only prune when the broker call SUCCEEDED and returned a snapshot, so a
+    # transient API failure (handled above by the early return) can never wipe
+    # live state.
+    broker_equity = set()
+    for symbol, pos in positions.items():
+        if "/" in symbol or getattr(pos, "is_option", False) or pos.get("is_option"):
+            continue
+        broker_equity.add(symbol.upper())
+
+    stale = [s for s in state["active_positions"]
+             if s.upper() not in broker_equity]
+    for symbol in stale:
+        logger.warning(
+            f"[Reconcile] PRUNED stale position {symbol}: not held at broker "
+            f"(state had {len(state['active_positions'])} open, "
+            f"broker has {len(broker_equity)})."
+        )
+        del state["active_positions"][symbol]
+
     for symbol, pos in positions.items():
         # Only adopt equity positions (skip options / crypto).
         if "/" in symbol or getattr(pos, "is_option", False) or pos.get("is_option"):
@@ -342,6 +395,6 @@ def reconcile_with_broker(client, entry_ref_price: dict | None = None) -> list[s
         logger.warning(f"[Reconcile] ADOPTED orphaned broker position {symbol}: "
                        f"qty={qty:.2f} entry={entry:.2f} stop={stop:.2f}")
 
-    if adopted:
+    if adopted or stale:
         save_state(state)
     return adopted

@@ -638,6 +638,34 @@ def main() -> None:
         else:
             parser.print_help()
 
+        # Cycle-complete notification.
+        #
+        # The monitor scheduler runs hourly 10:00-15:00 ET, so this used to fire
+        # 6 identical messages every trading day ("Runner cycle complete (N open
+        # positions)"). Only notify when the position SET actually changed, or
+        # on the first cycle of the day as a liveness heartbeat.
+        #
+        # ORDERING MATTERS: should_notify_cycle() persists its marker into the
+        # state file, so it MUST run BEFORE sync_up_to_gcs(). If it ran after,
+        # the marker would never reach GCS, the next container would download
+        # the older cloud state, lose the marker, and re-notify every cycle.
+        if not args.no_discord and not args.dry_run:
+            try:
+                open_syms = sorted(fb_state.get_open_positions())
+                if fb_state.should_notify_cycle(open_syms):
+                    send_discord_message(
+                        f"[FlatBase] Runner cycle complete "
+                        f"({len(open_syms)} open positions)"
+                        + (f": {', '.join(open_syms)}" if open_syms else "")
+                    )
+                else:
+                    logger.info(
+                        f"[FlatBase] Cycle notification suppressed "
+                        f"(unchanged: {len(open_syms)} open positions)."
+                    )
+            except Exception as e:
+                logger.warning(f"Discord failed: {e}")
+
         # Push state + fills to GCS at shutdown.
         fb_state.sync_up_to_gcs()
         _sync_fills_to_gcs()
@@ -651,13 +679,6 @@ def main() -> None:
                 upload_to_gcs()
             except Exception as up_err:
                 logger.warning(f"[GCS] DB upload failed: {up_err}")
-
-        if not args.no_discord and not args.dry_run:
-            try:
-                send_discord_message(f"[FlatBase] Runner cycle complete "
-                                     f"({len(fb_state.get_open_positions())} open positions)")
-            except Exception as e:
-                logger.warning(f"Discord failed: {e}")
     except Exception as e:
         logger.critical(f"Flat base runner failed: {e}")
         log_exception_to_jira(e, "Flat Base Runner Failure")

@@ -203,6 +203,111 @@ def check_schedulers() -> list[str]:
     return issues
 
 
+def check_local_tasks() -> list[str]:
+    """Check LOCAL Windows scheduled tasks (workstation only).
+
+    Why this exists
+    ---------------
+    check_schedulers() only inspects Cloud Scheduler. The quote sniffer and the
+    EOD DB sync are LOCAL Windows tasks, so they were completely invisible to
+    this health check — and both were silently dead for weeks:
+
+      - ModelAQuoteSniffer: action was `cmd.exe` with no `/c`, so it opened an
+        interactive shell, never ran the script, and hung until the execution
+        time limit killed it (0xC000013A). It had never recorded a single row.
+      - ModelAOptions EOD DB Sync: the registration script existed but had
+        never been run, so the task did not exist at all.
+
+    Two specific blind spots this closes:
+      1. A task that has NEVER run has no LastRunTime. The cloud check skips
+         such jobs entirely; here a never-run task is reported explicitly.
+      2. A task whose last result is a failure code is reported even though the
+         task state still reads "Ready".
+
+    Returns [] on non-Windows or when PowerShell is unavailable, so the Cloud
+    Run deployment is unaffected.
+    """
+    issues = []
+    if os.name != "nt":
+        return issues
+
+    import subprocess
+
+    # Tasks that must exist and be healthy. Keep this list explicit: a task
+    # silently disappearing is exactly the failure mode we are guarding against.
+    REQUIRED = {
+        "ModelAQuoteSniffer": "quote spread recorder (Model A)",
+        "ModelAOptions EOD DB Sync": "local DB pull from GCS",
+    }
+
+    ps = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-ScheduledTask | Where-Object { $_.TaskPath -notmatch '\\Microsoft\\' } |
+  ForEach-Object {
+    $i = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath
+    $lr = if ($i.LastRunTime) { $i.LastRunTime.ToString('o') } else { '' }
+    '{0}|{1}|{2}|{3}' -f $_.TaskName, $_.State, $lr, $i.LastTaskResult
+  }
+"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=60)
+        rows = {}
+        for line in out.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            rows[parts[0]] = {
+                "state": parts[1],
+                "last_run": parts[2],
+                "result": parts[3],
+            }
+    except Exception as e:
+        logger.warning(f"Could not enumerate local tasks: {e}")
+        return issues
+
+    if not rows:
+        logger.warning("Local task enumeration returned nothing; skipping.")
+        return issues
+
+    now = _now_utc()
+    for name, purpose in REQUIRED.items():
+        info = rows.get(name)
+        if info is None:
+            issues.append(f"LOCAL TASK MISSING: '{name}' ({purpose}) is not "
+                          f"registered — it will never run.")
+            continue
+        if info["state"] == "Disabled":
+            issues.append(f"LOCAL TASK DISABLED: '{name}' ({purpose}).")
+            continue
+        if not info["last_run"]:
+            issues.append(f"LOCAL TASK NEVER RAN: '{name}' ({purpose}) has no "
+                          f"last-run time.")
+            continue
+        try:
+            last = datetime.fromisoformat(info["last_run"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            age_h = (now - last).total_seconds() / 3600.0
+        except ValueError:
+            continue
+        # 0x41303 (267011) = task has not yet run; 0x0 = success.
+        result = info["result"].strip()
+        if result not in ("0", "267009", "267011"):
+            issues.append(f"LOCAL TASK FAILED: '{name}' ({purpose}) last result "
+                          f"0x{int(result):X}." if result.isdigit()
+                          else f"LOCAL TASK FAILED: '{name}' ({purpose}) "
+                               f"last result {result}.")
+        elif age_h > 72:
+            issues.append(f"LOCAL TASK STALE: '{name}' ({purpose}) has not run "
+                          f"in {age_h:.1f}h (> 72h).")
+        else:
+            logger.info(f"Local task OK: {name} ({age_h:.1f}h ago).")
+
+    return issues
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Agent-trade cloud health check")
     parser.add_argument("--always", action="store_true",
@@ -217,6 +322,7 @@ def main() -> int:
     issues += check_orphaned_positions()
     issues += check_blog_quiet_streak()
     issues += check_schedulers()
+    issues += check_local_tasks()
 
     if issues:
         msg = "🚨 **Agent-Trade Health Check**\n" + "\n".join(f"- {i}" for i in issues)
