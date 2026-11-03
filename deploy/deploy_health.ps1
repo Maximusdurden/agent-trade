@@ -94,7 +94,13 @@ RUN pip install --no-cache-dir /src/agent-jira-client
 COPY . .
 # Entrypoint is overridden per-job via --command (run_health_check.py).
 "@
-$DockerfileContent | Out-File -FilePath $DockerProdPath -Encoding utf8
+# PowerShell 5.1's `Out-File -Encoding utf8` and [System.Text.Encoding]::UTF8
+# both emit a UTF-8 BOM (EF BB BF). A BOM prepended to a Dockerfile line or to a
+# flags-file key corrupts it — see the model-a-options deploy, where a BOM on the
+# secret value produced "'latin-1' codec can't encode character '\ufeff'".
+# Always write UTF-8 WITHOUT a BOM.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($DockerProdPath, $DockerfileContent, $Utf8NoBom)
 
 # 4. Build image via Cloud Build
 Write-Host "`n--- Building health image via Cloud Build ---"
@@ -119,11 +125,12 @@ $JiraKeys = @("JIRA_URL", "JIRA_PROJECT_KEY", "JIRA_EMAIL")
 # never as a plaintext env var (TMCL-1070).
 $ConfigKeys = @("ALPACA_API_KEY", "ALPACA_PAPER")
 Get-Content $EnvPath | ForEach-Object {
-    $Line = $_.Trim()
+    # Strip any BOM that may have been introduced at the start of the file.
+    $Line = $_.Trim().TrimStart([char]0xFEFF)
     if ($Line -and -not $Line.StartsWith("#") -and $Line.Contains("=")) {
         $Parts = $Line.Split("=", 2)
-        $Key = $Parts[0].Trim()
-        $Val = $Parts[1].Trim().Trim("'`"")
+        $Key = $Parts[0].Trim().TrimStart([char]0xFEFF)
+        $Val = $Parts[1].Trim().Trim("'`"").TrimStart([char]0xFEFF)
         if (($JiraKeys -contains $Key -or $ConfigKeys -contains $Key) -and $Val -and -not $Val.StartsWith("your_")) {
             $EnvVariablesList += "$Key=$Val"
         }
@@ -142,7 +149,7 @@ foreach ($Entry in $EnvVariablesList) {
     $Escaped = $V.Replace("\", "\\").Replace('"', '\"')
     $FlagLines += "  ${K}: `"$Escaped`""
 }
-[System.IO.File]::WriteAllText($FlagsFile, [string]::Join("`n", $FlagLines), [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($FlagsFile, [string]::Join("`n", $FlagLines), $Utf8NoBom)
 
 $JobExists = (& $GCloud run jobs list --region $Region --format="value(name)" 2>$null | Select-String "^$JobName$")
 if (-not $JobExists) {
