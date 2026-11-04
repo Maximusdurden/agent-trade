@@ -1,4 +1,4 @@
-import http.server
+﻿import http.server
 import socketserver
 import json
 import logging
@@ -301,7 +301,7 @@ def get_data_freshness(heartbeat: dict, interval_minutes: int | None = None,
     Uses the cycle heartbeat (started_at / completed_at / status) rather than
     the last trade timestamp so the dashboard can report STALE, RUNNING,
     FAILED, or CRYPTO_ONLY_MONITORING even when no trades occurred. Staleness
-    is defined as 2× the configured interval plus a 5-minute grace period.
+    is defined as 2Ã— the configured interval plus a 5-minute grace period.
     """
     interval = interval_minutes or config.TRADING_INTERVAL_MINUTES
     current_time = now_utc or datetime.now(timezone.utc)
@@ -2819,12 +2819,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                 const firstEq = chartHistory[0].equity || 100000;
                 const lastEq = chartHistory[chartHistory.length - 1].equity || 100000;
 
-                // 1. Total Net Return (full data is fine – start-to-end)
+                // 1. Total Net Return (full data is fine â€“ start-to-end)
                 if (firstEq > 0) {
                     totalReturn = ((lastEq - firstEq) / firstEq) * 100;
                 }
 
-                // 2. Peak Drawdown (full data is fine – peak/trough independent of rate)
+                // 2. Peak Drawdown (full data is fine â€“ peak/trough independent of rate)
                 let peak = -Infinity;
                 chartHistory.forEach(item => {
                     const eq = item.equity !== undefined ? item.equity : 100000;
@@ -3014,12 +3014,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                         statusDot.style.backgroundColor = "var(--color-crimson)";
                         statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
                     } else if (data.freshness && data.freshness.state === "STALE") {
-                        statusText.innerText = "RUNNER STALE — HEARTBEAT OVERDUE";
+                        statusText.innerText = "RUNNER STALE â€” HEARTBEAT OVERDUE";
                         statusText.style.color = "var(--color-crimson)";
                         statusDot.style.backgroundColor = "var(--color-crimson)";
                         statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
                     } else if (data.freshness && data.freshness.state === "FAILED") {
-                        statusText.innerText = "RUNNER FAILED — CHECK CLOUD LOGS";
+                        statusText.innerText = "RUNNER FAILED â€” CHECK CLOUD LOGS";
                         statusText.style.color = "var(--color-crimson)";
                         statusDot.style.backgroundColor = "var(--color-crimson)";
                         statusDot.style.boxShadow = "0 0 12px var(--color-crimson)";
@@ -3032,7 +3032,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                         const heartbeatTime = data.heartbeat && data.heartbeat.completed_at
                             ? formatToEastern(data.heartbeat.completed_at)
                             : 'unknown';
-                        statusText.innerText = `CRYPTO-ONLY MONITORING — HEARTBEAT ${heartbeatTime}`;
+                        statusText.innerText = `CRYPTO-ONLY MONITORING â€” HEARTBEAT ${heartbeatTime}`;
                         statusText.style.color = "var(--color-gold)";
                         statusDot.style.backgroundColor = "var(--color-green)";
                         statusDot.style.boxShadow = "0 0 10px var(--color-green)";
@@ -3283,7 +3283,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
                         // Build a per-symbol "previous cycle" conviction lookup from
                         // ticker_convictions so we can flag conviction/direction
-                        // changes (Δ) vs the prior cycle. Rows are newest-first.
+                        // changes (Î”) vs the prior cycle. Rows are newest-first.
                         const tickerConvictions = (data && data.ticker_convictions) || [];
                         const prevConvictionBySymbol = {};
                         const seenSymbols = {};
@@ -3316,7 +3316,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                             if (!isApproved) {
                                 // A "Deferred" rejection (e.g. all shares locked in
                                 // open bracket orders) is expected behavior, not a
-                                // risk failure — render it as an informational amber
+                                // risk failure â€” render it as an informational amber
                                 // badge instead of a red guardrail rejection.
                                 const reason = dec.rejection_reason || '';
                                 if (reason.startsWith('Deferred:')) {
@@ -3352,7 +3352,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                                 const dir = dec.direction ? dec.direction.toUpperCase() : '';
                                 convictionTag = `<span class="badge" style="background: rgba(59, 130, 246, 0.12); color: var(--text-secondary); margin-left: 0.5rem; text-transform: none;">${dir} ${(dec.conviction * 100).toFixed(0)}%</span>`;
                             }
-                            // Conviction-change (Δ) indicator vs the prior cycle
+                            // Conviction-change (Î”) indicator vs the prior cycle
                             let changeTag = '';
                             if (dec.proposed_symbol) {
                                 const sym = dec.proposed_symbol.toUpperCase();
@@ -3366,7 +3366,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                                     const convChanged = prevC != null && curC != null && Math.abs(prevC - curC) >= 0.05;
                                     if (dirChanged || convChanged) {
                                         const delta = (prevC != null && curC != null) ? ((curC - prevC) * 100).toFixed(0) : '';
-                                        const arrow = (delta && delta > 0) ? '▲' : (delta && delta < 0) ? '▼' : 'Δ';
+                                        const arrow = (delta && delta > 0) ? 'â–²' : (delta && delta < 0) ? 'â–¼' : 'Î”';
                                         changeTag = `<span class="badge" style="background: rgba(250, 204, 21, 0.12); color: #facc15; margin-left: 0.5rem; text-transform: none;" title="Conviction changed vs prior cycle">${arrow}${delta ? ' ' + delta + '%' : ''}</span>`;
                                     }
                                 }
@@ -3420,7 +3420,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                     }
                 }
 
-                // 4. Broker-Side Executed Orders — single source: live Alpaca orders.
+                // 4. Broker-Side Executed Orders â€” single source: live Alpaca orders.
                 //    After the dexter cutover the broker ledger is authoritative;
                 //    we no longer merge the (stale pre-cutover) DB trades into it.
                 //    The panel is COLLAPSED by default and lazily fetches orders
@@ -3434,7 +3434,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                     if (isOrdersExpanded) {
                         // Only render orders if the panel is expanded (lazy).
                         if (typeof window._brokerOrdersLoaded === 'undefined' || !window._brokerOrdersLoaded) {
-                            // Not loaded yet this session — fetch lazily.
+                            // Not loaded yet this session â€” fetch lazily.
                             tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--color-gold); padding: 1.5rem;"><span class="spinner"></span> Loading broker orders...</td></tr>';
                             fetch('/api/orders')
                                 .then(res => res.json())
@@ -3450,13 +3450,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                             renderBrokerOrders(window._brokerOrders || []);
                         }
                     } else {
-                        // Panel is collapsed — leave the placeholder; orders load
+                        // Panel is collapsed â€” leave the placeholder; orders load
                         // on expand. Do NOT fetch broker orders here.
                         tradesTbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">Expand to load broker orders (last 1 month).</td></tr>';
                     }
                 }
 
-                // 5. System Logs live tail — oldest-first, auto-scrolled to bottom
+                // 5. System Logs live tail â€” oldest-first, auto-scrolled to bottom
                 const terminalPane = document.getElementById('terminal-pane');
                 if (terminalPane) {
                     terminalPane.innerHTML = '';
@@ -3924,14 +3924,14 @@ HTML_CONTENT = """<!DOCTYPE html>
                     const side = t.side || 'buy';
                     const sideClass = side.toLowerCase() === 'buy' ? 'text-green' : 'text-crimson';
                     const dateStr = t.timestamp ? formatToEastern(t.timestamp) : 'N/A';
-                    const createdStr = t.created_at ? formatToEastern(t.created_at) : '—';
+                    const createdStr = t.created_at ? formatToEastern(t.created_at) : 'â€”';
                     const fillPriceStr = t.filled_avg_price ? '$' + t.filled_avg_price.toFixed(2) : '<span style="color: var(--text-muted)">Unfilled</span>';
                     const symbol = t.symbol || 'N/A';
                     const qty = t.qty !== undefined ? t.qty : 0;
                     const status = t.status || 'filled';
                     const orderId = t.alpaca_order_id || 'N/A';
                     const dateGapHint = (t.created_at && t.timestamp && t.created_at.slice(0,10) !== t.timestamp.slice(0,10))
-                        ? ' <span style="color: var(--color-gold); font-size: 0.7rem;" title="Order was created on a different day than it filled (GTC limit order).">↔</span>'
+                        ? ' <span style="color: var(--color-gold); font-size: 0.7rem;" title="Order was created on a different day than it filled (GTC limit order).">â†”</span>'
                         : '';
                     
                     // Universe classification: sideload-reserved symbols get a
@@ -4272,7 +4272,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         function toggleLogSort() {
-            // Sort toggle deprecated — logs are now always oldest-first, auto-scrolled to bottom.
+            // Sort toggle deprecated â€” logs are now always oldest-first, auto-scrolled to bottom.
         }
 
         // Initialize user preferences on DOM content loaded or script execution
@@ -4679,7 +4679,7 @@ LOGIN_HTML = """<!DOCTYPE html>
                 <label class="form-label" for="auth-key">Authorization Key</label>
                 <div class="input-wrapper">
                     <span class="prompt-char">></span>
-                    <input type="password" id="auth-key" class="auth-input" autofocus autocomplete="current-password" placeholder="••••••••" onkeydown="handleKeyDown(event)">
+                    <input type="password" id="auth-key" class="auth-input" autofocus autocomplete="current-password" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" onkeydown="handleKeyDown(event)">
                 </div>
             </div>
 
@@ -4990,6 +4990,50 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(encoded_err)))
                 self.end_headers()
                 self.wfile.write(encoded_err)
+        elif self.path == '/jobs':
+            # JobWatch: every scheduled job, local and cloud, with its
+            # latest outcome. Read-only -- the collector is the only writer,
+            # so a slow collector cannot make this page hang.
+            try:
+                from jobwatch.page import PAGE as JOBS_PAGE
+                body = JOBS_PAGE.encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                err = json.dumps({"error": str(e)}).encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(err)))
+                self.end_headers()
+                self.wfile.write(err)
+        elif self.path.startswith('/api/jobs'):
+            # JobWatch JSON. Query string is parsed here and handed to the
+            # api module, which knows nothing about HTTP.
+            try:
+                from urllib.parse import urlparse, parse_qs
+                from jobwatch import api as jobwatch_api
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                params = {k: v[0] for k, v in qs.items() if v}
+                status, payload = jobwatch_api.dispatch(parsed.path, params)
+                body = json.dumps(payload, default=str).encode('utf-8')
+                self.send_response(status)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                err = json.dumps({"error": str(e)}).encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Content-Length', str(len(err)))
+                self.end_headers()
+                self.wfile.write(err)
         elif self.path == '/api/orders':
             # Lazy-loaded Broker-Side Executed Orders. The panel is collapsed by
             # default and only calls this endpoint when the user expands it, so
@@ -5187,10 +5231,10 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "=== SYSTEM CAPABILITIES & TRADING FRAMEWORK ===\n"
                     "- Active Technical Indicators: RSI (14), Simple Moving Averages (SMA 20, SMA 50), MACD, and Bollinger Bands.\n"
                     "- Intraday VWAP & Bands: Our system calculates dynamic, daily-resetting Volume Weighted Average Price (VWAP) using 15-minute bars.\n"
-                    "  It establishes standard deviation bands at ±1σ (vwap_upper_1, vwap_lower_1) and ±2σ (vwap_upper_2, vwap_lower_2).\n"
+                    "  It establishes standard deviation bands at Â±1Ïƒ (vwap_upper_1, vwap_lower_1) and Â±2Ïƒ (vwap_upper_2, vwap_lower_2).\n"
                     "- VWAP-Based Execution Strategy:\n"
                     "  1. Execution Quality: The agent targets buying below VWAP and selling above it.\n"
-                    "  2. Mean Reversion: Price deviations exceeding ±2σ (vwap_dist_pct >= 2.0% or <= -2.0%) are flagged as extreme overextensions to trigger mean-reversion trades.\n"
+                    "  2. Mean Reversion: Price deviations exceeding Â±2Ïƒ (vwap_dist_pct >= 2.0% or <= -2.0%) are flagged as extreme overextensions to trigger mean-reversion trades.\n"
                     "  3. Strategic Guardrails: The MetaStrategist dynamically rewrites trading rules to incorporate VWAP-based price-distance triggers.\n\n"
                     
                     "=== CRITICAL REQUIREMENT 1: ABSOLUTELY NO CODE OR DATA BLOCKS ===\n"
@@ -5325,7 +5369,7 @@ def run_server():
     # starting the cache worker / HTTP server. This guarantees the local /tmp DB
     # exists (or the failure is logged) before the first cache build, so the
     # equity curve is not blank for the first ~2 min after boot. The download is
-    # wrapped in try/except so a failure never crashes startup — the background
+    # wrapped in try/except so a failure never crashes startup â€” the background
     # sync worker will keep retrying and the cache worker gates on the flag.
     try:
         sync_database_from_gcs()

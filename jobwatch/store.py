@@ -1,0 +1,267 @@
+"""SQLite storage for job runs.
+
+WHY SQLITE AND NOT POSTGRES
+---------------------------
+The dashboard already uses SQLite (`core/database.py`), the write volume is
+tiny (about 30 jobs x a few runs a day = hundreds of rows a day), and there is
+exactly one writer. Postgres would add an ops burden for no benefit.
+
+WHY A SEPARATE FILE
+-------------------
+`data/trades.db` is the trading database. Job history is operational metadata
+with a different retention policy and a different failure mode -- a corrupt
+job-history table must never be able to take down trading. So it lives in its
+own file, `data/jobwatch.db`.
+
+THE ONE TABLE THAT MATTERS
+--------------------------
+`job_runs` holds one row per observed run. The columns that carry the value
+are `outcome` and `did_work`:
+
+    outcome    ok | no_op | failed | missed | skipped | running | unknown
+    did_work   1 if the run produced evidence of work, 0 if not, NULL if
+               we could not tell
+
+`did_work` is separate from `outcome` on purpose. A run can exit 0 and do
+nothing (`no_op`), and a run can fail after doing real work. Collapsing them
+loses the distinction that makes the report trustworthy.
+
+IDEMPOTENCY
+-----------
+The collector runs hourly and re-reads overlapping windows. `run_key` is a
+deterministic hash of (job_id, scheduled_for, source_ref), so re-collecting
+the same run updates the row instead of duplicating it. Without this the
+history would grow a duplicate every hour.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from core.config import BASE_DIR
+
+DB_PATH = BASE_DIR / "data" / "jobwatch.db"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS job_runs (
+    run_key        TEXT PRIMARY KEY,
+    job_id         TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    scheduled_for  TEXT,              -- ISO8601 UTC, when it was due
+    started_at     TEXT,              -- ISO8601 UTC
+    finished_at    TEXT,              -- ISO8601 UTC
+    duration_s     REAL,
+    exit_code      INTEGER,
+    outcome        TEXT NOT NULL,
+    did_work       INTEGER,           -- 1 | 0 | NULL
+    detail_json    TEXT,              -- extracted fields, for the rule
+    log_excerpt    TEXT,              -- last N lines, redacted
+    source_ref     TEXT,              -- task name / execution name
+    collected_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_job     ON job_runs(job_id);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON job_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_outcome ON job_runs(outcome);
+
+-- One row per collector pass, so the page can show "last collected" and the
+-- user can tell a stale page from a quiet day.
+CREATE TABLE IF NOT EXISTS collect_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    jobs_seen    INTEGER DEFAULT 0,
+    runs_written INTEGER DEFAULT 0,
+    errors_json  TEXT
+);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    """Open the jobwatch database, creating it if needed."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    # WAL lets the API read while the collector writes. Without it a long
+    # collect pass blocks the page.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.Error:
+        pass
+    return conn
+
+
+def init_db() -> None:
+    with connect() as conn:
+        conn.executescript(SCHEMA)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_run_key(job_id: str, scheduled_for: str | None,
+                 source_ref: str | None) -> str:
+    """Deterministic key so re-collecting a run updates rather than duplicates."""
+    raw = f"{job_id}|{scheduled_for or ''}|{source_ref or ''}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def upsert_run(row: dict) -> None:
+    """Insert or update one run. Idempotent on run_key."""
+    init_db()
+    key = row.get("run_key") or make_run_key(
+        row["job_id"], row.get("scheduled_for"), row.get("source_ref"))
+    detail = row.get("detail") or {}
+    with connect() as conn:
+        conn.execute("""
+            INSERT INTO job_runs (
+                run_key, job_id, source, scheduled_for, started_at,
+                finished_at, duration_s, exit_code, outcome, did_work,
+                detail_json, log_excerpt, source_ref, collected_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(run_key) DO UPDATE SET
+                started_at   = excluded.started_at,
+                finished_at  = excluded.finished_at,
+                duration_s   = excluded.duration_s,
+                exit_code    = excluded.exit_code,
+                outcome      = excluded.outcome,
+                did_work     = excluded.did_work,
+                detail_json  = excluded.detail_json,
+                log_excerpt  = excluded.log_excerpt,
+                collected_at = excluded.collected_at
+        """, (
+            key, row["job_id"], row["source"], row.get("scheduled_for"),
+            row.get("started_at"), row.get("finished_at"),
+            row.get("duration_s"), row.get("exit_code"),
+            row.get("outcome", "unknown"),
+            None if row.get("did_work") is None else int(bool(row["did_work"])),
+            json.dumps(detail) if detail else None,
+            row.get("log_excerpt"), row.get("source_ref"), _now(),
+        ))
+
+
+def record_collect(started_at: str, finished_at: str, jobs_seen: int,
+                   runs_written: int, errors: list[str]) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute("""
+            INSERT INTO collect_runs
+                (started_at, finished_at, jobs_seen, runs_written, errors_json)
+            VALUES (?,?,?,?,?)
+        """, (started_at, finished_at, jobs_seen, runs_written,
+              json.dumps(errors) if errors else None))
+
+
+def last_collect() -> dict | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM collect_runs ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Queries used by the API
+# ---------------------------------------------------------------------------
+def latest_per_job() -> dict[str, dict]:
+    """The most recent run for every job that has one.
+
+    Uses ROW_NUMBER() rather than a MAX() self-join. The join version silently
+    dropped every row whose timestamp was NULL -- which is most of them, since
+    a disabled job has no start time -- so only 5 of 32 jobs appeared.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT * FROM (
+                SELECT r.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY job_id
+                           ORDER BY COALESCE(started_at, scheduled_for,
+                                             collected_at) DESC
+                       ) AS rn
+                FROM job_runs r
+            ) WHERE rn = 1
+        """).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail_json"]) if d["detail_json"] else {}
+        out[d["job_id"]] = d
+    return out
+
+
+def runs_for(job_id: str, since: str | None = None,
+             until: str | None = None, limit: int = 200) -> list[dict]:
+    """Run history for one job, newest first."""
+    init_db()
+    sql = "SELECT * FROM job_runs WHERE job_id = ?"
+    params: list = [job_id]
+    if since:
+        sql += " AND COALESCE(started_at, scheduled_for) >= ?"
+        params.append(since)
+    if until:
+        sql += " AND COALESCE(started_at, scheduled_for) <= ?"
+        params.append(until)
+    sql += " ORDER BY COALESCE(started_at, scheduled_for) DESC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail_json"]) if d["detail_json"] else {}
+        out.append(d)
+    return out
+
+
+def runs_between(since: str, until: str, job_ids: list[str] | None = None,
+                 limit: int = 2000) -> list[dict]:
+    """All runs in a window, newest first, optionally filtered by job."""
+    init_db()
+    sql = ("SELECT * FROM job_runs "
+           "WHERE COALESCE(started_at, scheduled_for) BETWEEN ? AND ?")
+    params: list = [since, until]
+    if job_ids:
+        placeholders = ",".join("?" * len(job_ids))
+        sql += f" AND job_id IN ({placeholders})"
+        params.extend(job_ids)
+    sql += " ORDER BY COALESCE(started_at, scheduled_for) DESC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail_json"]) if d["detail_json"] else {}
+        out.append(d)
+    return out
+
+
+def outcome_counts(since: str, until: str) -> dict[str, int]:
+    """How many runs of each outcome in a window."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT outcome, COUNT(*) AS n FROM job_runs
+            WHERE COALESCE(started_at, scheduled_for) BETWEEN ? AND ?
+            GROUP BY outcome
+        """, (since, until)).fetchall()
+    return {r["outcome"]: r["n"] for r in rows}
+
+
+def prune(keep_days: int = 90) -> int:
+    """Delete runs older than `keep_days`. Returns rows removed."""
+    init_db()
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=keep_days)).isoformat()
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM job_runs WHERE COALESCE(started_at, scheduled_for) < ?",
+            (cutoff,))
+        return cur.rowcount or 0
