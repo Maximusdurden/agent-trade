@@ -111,10 +111,44 @@ history would grow a duplicate every hour.
 - **Filters** — search, category, source, outcome, and a *show disabled*
   checkbox (on by default, per the requirement to include disabled jobs).
 - **Table** — one row per job: name, schedule, outcome, did-work, last run,
-  rule note.
+  rule note. **Every column header sorts**; click to toggle direction. The
+  default is worst-first by outcome, because the reason to open this page is
+  to find what is broken, not to read an alphabetical list. Missing values
+  (no last run, no rule) always sink to the bottom in both directions.
+- **Legend** — a collapsible panel explaining the two columns that are not
+  self-evident, `Work` and `Rule / note` (see below).
 - **Detail** — click a row for the raw detail JSON, the last 50 log lines, and
   the last 20 runs.
 - **History** — a date range picker that loads runs for the window.
+
+### What `Work` and `Rule / note` mean
+
+These two columns are the reason the page is trustworthy, and neither is
+obvious at a glance.
+
+**`Work`** answers *did the run produce evidence of doing its job?* — which is
+not the same question as *did the process exit cleanly?*
+
+| value | meaning |
+|---|---|
+| `yes` | the job's success rule passed |
+| `NO` | the process ran and exited 0, but the rule failed — it did nothing |
+| `?` | there is no rule, so the only guarantee is the exit code |
+
+**`Rule / note`** shows the rule that was applied and what it found. A rule is
+a small declarative check on the run's extracted detail, such as
+`markets > 0` or `execution_status == Completed`.
+
+| value | meaning |
+|---|---|
+| `rule passed` | the check succeeded |
+| `markets=0 fails > 0` | the check failed, and this is the actual value |
+| `exit code only` | the job has no rule — a green row is a weaker claim |
+| `rule needs 'x', not in detail` | the rule could not be evaluated |
+
+The distinction matters because of the 2026-11-03 `NBA Prop Daily` case: it
+exited 0 while recording `markets: 0`, because Kalshi had not listed the slate
+yet. Exit-code-only reporting would have shown that as a healthy green row.
 
 ### Refresh cadence
 
@@ -132,6 +166,41 @@ Everything is stored and served in **UTC**. The browser converts to local for
 display. Doing the conversion in one place avoids the class of bug where a
 job at 20:00 New York appears on the wrong day because the server was thinking
 in UTC.
+
+---
+
+## Failure alerts to Discord
+
+The page is **pull**: you have to look at it. A job that fails at 20:00 and is
+still failing at 09:00 is exactly the case the page cannot solve, because
+nobody opened the tab. `jobwatch/notify.py` is the push half.
+
+**What alerts:** `failed` and `missed` only. Deliberately **not** `no_op`.
+`no_op` means the job ran, exited 0, and did nothing — usually because the
+upstream data was not ready. That belongs on the page, in context next to the
+schedule, but alerting on it would train you to ignore the channel, which is
+how alerting dies.
+
+**What is excluded:** disabled jobs, and jobs with `scheduled=False`
+(logon-triggered). The latter is not cosmetic — `Master MCP Gateway` reports
+exit `0xC000013A` (`STATUS_CONTROL_C_EXIT`) on every shutdown, which is the
+process being killed at logoff, not a failure. Alerting on it would page on
+every reboot. This mirrors the page's attention list exactly; if the two ever
+disagree, the page and Discord tell different stories about the same system.
+
+**Dedupe lives in the database.** The collector runs hourly over overlapping
+windows, so the same failed run is seen again on every pass.
+`job_runs.notified_at` is the memory: a run is alerted once, then stamped.
+The stamp is written **only after a successful send**, so a Discord outage
+leaves the run unalerted and the next pass retries.
+
+**It never raises.** A Discord outage must not fail a collection pass. The
+data is already correct and stored; only the notification is missing.
+
+```powershell
+# preview the alert without sending or stamping
+python -m jobwatch.collect --alert-dry-run
+```
 
 ---
 
@@ -188,6 +257,14 @@ schedule. Added a `scheduled` flag and excluded it from the attention list.
 **9. WAL sidecar files block deletion on Windows.** The test cleanup raised
 `PermissionError` on `-wal` and `-shm`.
 
+**10. The first version of the failure alert paged on a shutdown.** It
+filtered on outcome alone, so `Master MCP Gateway` — a logon-triggered task
+that exits `0xC000013A` when the machine shuts down — looked like a failure.
+The page had excluded it since bug 8; the notifier had not. Fixed by sharing
+the same `enabled and scheduled` filter, and by pushing the job-id filter into
+the SQL so excluded rows cannot consume the `LIMIT` and crowd out real
+failures.
+
 ---
 
 ## Usage
@@ -195,6 +272,9 @@ schedule. Added a `scheduled` flag and excluded it from the attention list.
 ```powershell
 # collect once
 python -m jobwatch.collect --verbose
+
+# preview the Discord failure alert
+python -m jobwatch.collect --alert-dry-run
 
 # prune old history
 python -m jobwatch.collect --prune-days 90

@@ -69,6 +69,20 @@ PAGE = r"""<!DOCTYPE html>
   th { color:var(--dim); font-weight:500; font-size:11px;
        text-transform:uppercase; letter-spacing:.04em;
        position:sticky; top:0; background:var(--bg); }
+  th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  th.sortable:hover { color:var(--text); }
+  th .arrow { opacity:.3; margin-left:4px; font-size:9px; }
+  th.sorted .arrow { opacity:1; color:var(--text); }
+  .legend { padding:10px 20px; border-bottom:1px solid var(--line);
+            background:var(--panel); font-size:12px; color:var(--dim); }
+  .legend summary { cursor:pointer; }
+  .legend summary:hover { color:var(--text); }
+  .legend dl { margin:10px 0 0; display:grid;
+               grid-template-columns:auto 1fr; gap:6px 16px; }
+  .legend dt { color:var(--text); font-weight:600; white-space:nowrap; }
+  .legend dd { margin:0; }
+  .legend code { background:#0b0d11; padding:1px 5px; border-radius:3px;
+                 font-size:11px; }
   tbody tr:hover { background:#141821; cursor:pointer; }
   .name { font-weight:500; }
   .meta { color:var(--dim); font-size:11px; }
@@ -118,15 +132,38 @@ PAGE = r"""<!DOCTYPE html>
   <span class="sub" id="refreshNote"></span>
 </div>
 
+<details class="legend">
+  <summary>What do the <b>Work</b> and <b>Rule / note</b> columns mean?</summary>
+  <dl>
+    <dt>Work</dt>
+    <dd>Whether the run produced <i>evidence</i> of doing its job, which is
+      not the same as whether the process exited cleanly. <b>yes</b> means the
+      job's success rule passed. <b>NO</b> means the process ran and exited 0
+      but the rule failed &mdash; it did nothing (for example, Kalshi had not
+      listed the slate yet). <b>?</b> means there is no rule to judge by, so
+      the only guarantee is the exit code.</dd>
+    <dt>Rule / note</dt>
+    <dd>The rule that was applied to this run and what it found. A rule is a
+      small declarative check on the run's extracted detail, such as
+      <code>markets &gt; 0</code> or
+      <code>execution_status == Completed</code>. When it passes you see
+      <code>rule passed</code>; when it fails you see the actual value, e.g.
+      <code>markets=0 fails &gt; 0</code>. <code>exit code only</code> means the
+      job has no rule, so a green row is a weaker claim than it looks.</dd>
+  </dl>
+</details>
+
 <table>
   <thead>
     <tr>
-      <th style="width:26%">Job</th>
-      <th style="width:14%">Schedule</th>
-      <th style="width:9%">Outcome</th>
-      <th style="width:8%">Work</th>
-      <th style="width:17%">Last run</th>
-      <th style="width:26%">Rule / note</th>
+      <th class="sortable" data-sort="name" style="width:26%">Job</th>
+      <th class="sortable" data-sort="schedule" style="width:14%">Schedule</th>
+      <th class="sortable" data-sort="outcome" style="width:9%">Outcome</th>
+      <th class="sortable" data-sort="did_work" style="width:8%"
+          title="Did the run produce evidence of work? Separate from outcome: a run can exit 0 and do nothing.">Work</th>
+      <th class="sortable" data-sort="started_at" style="width:17%">Last run</th>
+      <th class="sortable" data-sort="rule" style="width:26%"
+          title="The success rule applied to this run, and what it found.">Rule / note</th>
     </tr>
   </thead>
   <tbody id="rows"></tbody>
@@ -163,6 +200,76 @@ PAGE = r"""<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 let DATA = null;
+
+// Sort state. `dir` is 1 for ascending, -1 for descending. The default is
+// worst-first by outcome, because the reason to open this page is to find
+// what is broken, not to read an alphabetical list.
+let SORT = { key: 'outcome', dir: 1 };
+
+// Outcome severity, worst first. Sorting alphabetically would put `failed`
+// above `ok` by accident; this makes the order mean something.
+const OUTCOME_RANK = {
+  failed:0, missed:1, no_op:2, running:3, unknown:4, skipped:5, ok:6
+};
+
+function sortValue(j, key) {
+  switch (key) {
+    case 'name':       return (j.name || '').toLowerCase();
+    case 'schedule':   return (j.schedule || '').toLowerCase();
+    case 'outcome':    return OUTCOME_RANK[j.outcome] ?? 99;
+    // did_work: 0 (did nothing) sorts before 1 (worked), and null last.
+    case 'did_work':   return j.did_work === 0 ? 0 : j.did_work === 1 ? 1 : 2;
+    // Missing timestamps sort last regardless of direction.
+    case 'started_at': return j.started_at ? Date.parse(j.started_at) : null;
+    case 'rule':       return (j.rule_note || '').toLowerCase();
+    default:           return '';
+  }
+}
+
+function sortJobs(jobs) {
+  const { key, dir } = SORT;
+  return jobs.slice().sort((a, b) => {
+    const va = sortValue(a, key), vb = sortValue(b, key);
+    // Nulls always sink to the bottom, in both directions.
+    if (va === null && vb === null) return 0;
+    if (va === null) return 1;
+    if (vb === null) return -1;
+    if (va < vb) return -1 * dir;
+    if (va > vb) return 1 * dir;
+    // Stable tiebreak so equal rows do not shuffle on every refresh.
+    return (a.name || '').localeCompare(b.name || '');
+  });
+}
+
+function paintHeaders() {
+  document.querySelectorAll('th.sortable').forEach(th => {
+    const on = th.dataset.sort === SORT.key;
+    th.classList.toggle('sorted', on);
+    const arrow = th.querySelector('.arrow');
+    if (arrow) arrow.textContent = on ? (SORT.dir === 1 ? '▲' : '▼') : '▲';
+  });
+}
+
+document.querySelectorAll('th.sortable').forEach(th => {
+  // The arrow span is created here rather than in the HTML so the markup
+  // stays readable.
+  const a = document.createElement('span');
+  a.className = 'arrow';
+  a.textContent = '▲';
+  th.appendChild(a);
+  th.addEventListener('click', () => {
+    const key = th.dataset.sort;
+    // Clicking the active column flips direction; a new column starts
+    // ascending, except outcome which is more useful worst-first.
+    if (SORT.key === key) {
+      SORT.dir = -SORT.dir;
+    } else {
+      SORT = { key, dir: 1 };
+    }
+    paintHeaders();
+    render();
+  });
+});
 
 function fmtLocal(iso) {
   if (!iso) return '—';
@@ -224,7 +331,7 @@ function render() {
     att.innerHTML = '<b>All clear.</b> No enabled job is failed, no-op, or missed.';
   }
 
-  $('rows').innerHTML = DATA.jobs.map(j => {
+  $('rows').innerHTML = sortJobs(DATA.jobs).map(j => {
     const cls = j.enabled ? '' : ' class="disabled"';
     const rule = j.rule_note || (j.has_rule ? '' : 'exit code only');
     const bad = j.outcome === 'no_op' || j.outcome === 'failed';
@@ -297,7 +404,6 @@ async function load() {
     $('sub').textContent = 'failed to load: ' + e;
   }
 }
-
 async function refreshNow() {
   $('refreshNote').textContent = 'refreshing…';
   try {
@@ -359,6 +465,7 @@ const weekAgo = new Date(Date.now() - 7*86400*1000);
 $('until').value = today.toISOString().slice(0,10);
 $('since').value = weekAgo.toISOString().slice(0,10);
 
+paintHeaders();
 load();
 // The page is a report, not a live feed: refresh every 5 minutes so a tab
 // left open does not go stale, but not so often that it is noise.

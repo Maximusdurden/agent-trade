@@ -284,6 +284,131 @@ def test_api() -> None:
     check("history has since/until", "since" in p and "until" in p)
 
 
+# ------------------------------------------------------------------ notify
+def test_notify() -> None:
+    """The failure alert must fire once per run, and never on no_op.
+
+    The failure mode this guards against is the one that kills alerting:
+    paging on every hourly pass for the same failure until the channel is
+    muted.
+    """
+    section("notify")
+
+    from jobwatch import notify
+
+    # no_op is deliberately excluded: it means "ran, did nothing", which is
+    # worth showing on the page but not worth waking someone up.
+    check("no_op is not an alert outcome",
+          registry.NO_OP not in notify.ALERT_OUTCOMES,
+          str(notify.ALERT_OUTCOMES))
+    check("failed is an alert outcome",
+          registry.FAILED in notify.ALERT_OUTCOMES)
+    check("missed is an alert outcome",
+          registry.MISSED in notify.ALERT_OUTCOMES)
+
+    # A logon-triggered task must never alert. `Master MCP Gateway` reports
+    # exit 0xC000013A (STATUS_CONTROL_C_EXIT) on every shutdown, which is the
+    # process being killed at logoff, not a failure. Alerting on it would
+    # page on every reboot.
+    alertable = notify.alertable_job_ids()
+    check("logon-triggered jobs are not alertable",
+          "local:master-mcp-gateway" not in alertable,
+          "master-mcp-gateway would alert on every shutdown")
+    check("alertable excludes unscheduled jobs",
+          all(registry.BY_ID[i].scheduled for i in alertable),
+          "an unscheduled job is alertable")
+    check("alertable excludes disabled jobs",
+          all(registry.BY_ID[i].enabled for i in alertable),
+          "a disabled job is alertable")
+    check("alertable is not empty", len(alertable) > 0, str(len(alertable)))
+
+    # message composition
+    run = {
+        "run_key": "k1", "job_id": "local:nba-prop-daily",
+        "outcome": "failed", "started_at": "2026-11-04T15:00:00+00:00",
+        "exit_code": 1, "detail": {"rule": "markets=0 fails > 0"},
+    }
+    msg = notify.build_message([run])
+    check("message names the job", "NBA Prop Daily" in msg, msg)
+    check("message includes the rule reason", "markets=0" in msg, msg)
+    check("message includes exit code", "exit 1" in msg, msg)
+    check("singular failure is not pluralised",
+          "1 job failure" in msg and "failures" not in msg, msg)
+
+    two = notify.build_message([run, dict(run, run_key="k2")])
+    check("plural failure is pluralised", "2 job failures" in two, two)
+
+    # Discord hard-caps content at 2000 characters.
+    many = [dict(run, run_key=f"k{i}") for i in range(40)]
+    big = notify.build_message(many)
+    check("long message is truncated under 2000", len(big) <= 2000,
+          str(len(big)))
+    check("long message summarises the remainder", "more" in big, big[-120:])
+
+    # dedupe: a run is alerted once, then stamped
+    saved = store.DB_PATH
+    scratch = Path(__file__).resolve().parent / "_scratch_notify.db"
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(scratch) + suffix).unlink(missing_ok=True)
+        store.DB_PATH = scratch
+        store.init_db()
+
+        store.upsert_run({
+            "job_id": "local:nba-prop-daily", "source": "local",
+            "started_at": "2026-11-04T15:00:00+00:00",
+            "scheduled_for": "2026-11-04T15:00:00+00:00",
+            "outcome": "failed", "did_work": False,
+            "detail": {"rule": "markets=0 fails > 0"}, "source_ref": "t1",
+        })
+        store.upsert_run({
+            "job_id": "local:webmaster-agent", "source": "local",
+            "started_at": "2026-11-04T15:05:00+00:00",
+            "scheduled_for": "2026-11-04T15:05:00+00:00",
+            "outcome": "no_op", "did_work": False,
+            "detail": {"rule": "markets=0 fails > 0"}, "source_ref": "t2",
+        })
+
+        pending = store.unnotified_attention(notify.ALERT_OUTCOMES)
+        check("only the failure is pending", len(pending) == 1,
+              str([r["job_id"] for r in pending]))
+        check("pending excludes no_op",
+              all(r["outcome"] != "no_op" for r in pending),
+              str([r["outcome"] for r in pending]))
+
+        # dry run must not stamp
+        dry = notify.notify_failures(dry_run=True)
+        check("dry run reports the count", dry.get("count") == 1, str(dry))
+        check("dry run does not stamp",
+              len(store.unnotified_attention(notify.ALERT_OUTCOMES)) == 1,
+              "dry run consumed the alert")
+
+        # stamping clears it
+        store.mark_notified([r["run_key"] for r in pending])
+        check("stamping clears the pending alert",
+              store.unnotified_attention(notify.ALERT_OUTCOMES) == [],
+              "still pending after stamp")
+
+        # re-collecting the same run must not resurrect the alert
+        store.upsert_run({
+            "job_id": "local:nba-prop-daily", "source": "local",
+            "started_at": "2026-11-04T15:00:00+00:00",
+            "scheduled_for": "2026-11-04T15:00:00+00:00",
+            "outcome": "failed", "did_work": False,
+            "detail": {"rule": "markets=0 fails > 0"}, "source_ref": "t1",
+        })
+        check("re-collect does not resurrect the alert",
+              store.unnotified_attention(notify.ALERT_OUTCOMES) == [],
+              "upsert reset notified_at")
+    finally:
+        store.DB_PATH = saved
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(scratch) + suffix).unlink(missing_ok=True)
+            except PermissionError:
+                pass
+
+
 # --------------------------------------------------------------- timezone
 def test_timezone() -> None:
     section("timezone handling")
@@ -341,6 +466,7 @@ def main() -> int:
     test_redaction()
     test_store()
     test_api()
+    test_notify()
     test_timezone()
     test_outcome_semantics()
 

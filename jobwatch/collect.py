@@ -567,10 +567,26 @@ def collect_all(verbose: bool = False) -> dict:
         print(f"  gcs upload: {'ok' if uploaded else 'skipped/failed'}",
               flush=True)
 
+    # Alert on failures. This runs AFTER the upload so a Discord outage can
+    # never delay the data reaching the dashboard, and it never raises -- a
+    # notification problem must not fail a pass that collected correctly.
+    alert: dict = {}
+    try:
+        from jobwatch import notify
+        alert = notify.notify_failures()
+        if verbose:
+            print(f"  discord: {alert.get('reason') or 'sent ' + str(alert.get('count'))}",
+                  flush=True)
+    except Exception as e:
+        alert = {"sent": False, "reason": f"{type(e).__name__}: {e}"}
+        if verbose:
+            print(f"  discord: FAILED {e}", flush=True)
+
     return {
         "started_at": started, "finished_at": finished,
         "jobs_seen": len(all_rows), "runs_written": written,
         "uploaded": uploaded,
+        "alert": alert,
         "errors": errors,
     }
 
@@ -581,7 +597,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--prune-days", type=int, default=0,
                     help="delete runs older than N days, then exit")
+    ap.add_argument("--alert-dry-run", action="store_true",
+                    help="print the Discord failure alert without sending it")
     args = ap.parse_args(argv)
+
+    if args.alert_dry_run:
+        from jobwatch import notify
+        result = notify.notify_failures(dry_run=True)
+        print(result.get("content") or f"nothing to alert ({result.get('reason')})")
+        return 0
 
     if args.prune_days:
         n = store.prune(args.prune_days)
@@ -592,6 +616,11 @@ def main(argv: list[str] | None = None) -> int:
     summary = collect_all(verbose=args.verbose)
     print(f"  jobs seen    : {summary['jobs_seen']}")
     print(f"  runs written : {summary['runs_written']}")
+    alert = summary.get("alert") or {}
+    if alert.get("sent"):
+        print(f"  discord      : alerted on {alert.get('count')} failure(s)")
+    elif alert.get("reason"):
+        print(f"  discord      : {alert['reason']}")
     if summary["errors"]:
         print(f"  errors       : {len(summary['errors'])}")
         for e in summary["errors"][:10]:

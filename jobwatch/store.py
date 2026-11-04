@@ -60,7 +60,11 @@ CREATE TABLE IF NOT EXISTS job_runs (
     detail_json    TEXT,              -- extracted fields, for the rule
     log_excerpt    TEXT,              -- last N lines, redacted
     source_ref     TEXT,              -- task name / execution name
-    collected_at   TEXT NOT NULL
+    collected_at   TEXT NOT NULL,
+    -- When a failure alert for this run was sent to Discord. NULL means
+    -- "not yet alerted". The collector runs hourly over overlapping windows,
+    -- so without this a single failure would page every hour forever.
+    notified_at    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job     ON job_runs(job_id);
@@ -95,9 +99,23 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns that were introduced after a database already existed.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a new
+    column in SCHEMA never reaches a database that was created before it.
+    Without this, adding `notified_at` would raise "no such column" on the
+    live DB while passing on a fresh one -- the worst kind of bug.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_runs)")}
+    if "notified_at" not in cols:
+        conn.execute("ALTER TABLE job_runs ADD COLUMN notified_at TEXT")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def _now() -> str:
@@ -253,6 +271,64 @@ def outcome_counts(since: str, until: str) -> dict[str, int]:
             GROUP BY outcome
         """, (since, until)).fetchall()
     return {r["outcome"]: r["n"] for r in rows}
+
+
+def unnotified_attention(outcomes: tuple[str, ...],
+                         job_ids: list[str] | None = None,
+                         limit: int = 25) -> list[dict]:
+    """Runs that need attention and have not been alerted on yet.
+
+    Ordered oldest-first so a burst of failures reads chronologically in
+    Discord rather than backwards.
+
+    `job_ids` narrows the query to jobs the caller considers alertable. This
+    is not cosmetic: the LIMIT applies to the SQL, so without it a pile of
+    runs from excluded jobs (logon-triggered tasks, disabled jobs) would
+    crowd real failures out of the result entirely.
+    """
+    if not outcomes:
+        return []
+    if job_ids is not None and not job_ids:
+        return []
+    init_db()
+    marks = ",".join("?" for _ in outcomes)
+    sql = f"""
+        SELECT * FROM job_runs
+        WHERE outcome IN ({marks})
+          AND notified_at IS NULL
+    """
+    args: list = list(outcomes)
+    if job_ids is not None:
+        sql += " AND job_id IN (" + ",".join("?" for _ in job_ids) + ")"
+        args.extend(job_ids)
+    sql += " ORDER BY COALESCE(started_at, scheduled_for, collected_at) ASC"
+    sql += " LIMIT ?"
+    args.append(limit)
+
+    with connect() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["detail"] = json.loads(d["detail_json"]) if d["detail_json"] else {}
+        out.append(d)
+    return out
+
+
+def mark_notified(run_keys: list[str]) -> int:
+    """Stamp runs as alerted. Returns rows updated."""
+    if not run_keys:
+        return 0
+    init_db()
+    stamp = _now()
+    with connect() as conn:
+        n = 0
+        for key in run_keys:
+            cur = conn.execute(
+                "UPDATE job_runs SET notified_at = ? WHERE run_key = ?",
+                (stamp, key))
+            n += cur.rowcount or 0
+        return n
 
 
 def prune(keep_days: int = 90) -> int:
