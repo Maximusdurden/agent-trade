@@ -265,3 +265,106 @@ def prune(keep_days: int = 90) -> int:
             "DELETE FROM job_runs WHERE COALESCE(started_at, scheduled_for) < ?",
             (cutoff,))
         return cur.rowcount or 0
+
+
+# ---------------------------------------------------------------------------
+# GCS sync
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+# ---------------
+# The collector can only run on the Windows machine: it shells out to
+# `schtasks` for local tasks and to `gcloud` for cloud ones. Neither exists in
+# the Cloud Run container, and `schtasks` is Windows-only by definition.
+#
+# So the container cannot collect. It can only READ. That means the SQLite
+# file has to travel from the machine that collects to the container that
+# serves, and GCS is the transport the rest of this project already uses for
+# `trading_agent.db`.
+#
+# The collector uploads after every pass. The dashboard downloads on a TTL,
+# the same way `sync_database_from_gcs` does for the trading DB.
+#
+# WHY A SEPARATE BLOB
+# -------------------
+# `jobwatch.db` is operational metadata with a different retention policy and
+# a different failure mode. Keeping it in its own blob means a corrupt job
+# history cannot take down trading, and vice versa.
+GCS_BLOB = "jobwatch.db"
+
+
+def _gcs_bucket():
+    """The configured bucket, or None when GCS is not in play."""
+    import os
+    name = os.getenv("GCS_BUCKET_NAME")
+    if not name:
+        return None
+    try:
+        from google.cloud import storage
+        return storage.Client().bucket(name)
+    except Exception:
+        return None
+
+
+def upload_to_gcs() -> bool:
+    """Push the local jobwatch DB to GCS. Returns True on success.
+
+    Never raises: a failed upload must not fail the collection pass that
+    produced the data. The local DB is still correct; only the remote view
+    is stale, and the page shows the last-collected timestamp so that is
+    visible.
+    """
+    bucket = _gcs_bucket()
+    if bucket is None:
+        return False
+    try:
+        init_db()
+        # Copy to a temp file first so a concurrent write cannot produce a
+        # half-uploaded blob.
+        tmp = DB_PATH.with_suffix(".upload.db")
+        import shutil
+        shutil.copy2(DB_PATH, tmp)
+        try:
+            bucket.blob(GCS_BLOB).upload_from_filename(str(tmp))
+        finally:
+            tmp.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def download_from_gcs(max_age_s: float = 120.0) -> bool:
+    """Pull the jobwatch DB from GCS if the local copy is stale.
+
+    Returns True if a download happened. Never raises -- a missing blob or a
+    network failure leaves the existing local DB in place, which is the right
+    degradation: the page shows older data rather than an error.
+    """
+    bucket = _gcs_bucket()
+    if bucket is None:
+        return False
+
+    # TTL so a page refresh does not re-download on every request.
+    marker = DB_PATH.with_suffix(".last_sync")
+    try:
+        if marker.exists():
+            age = (datetime.now(timezone.utc).timestamp()
+                   - marker.stat().st_mtime)
+            if age < max_age_s:
+                return False
+    except OSError:
+        pass
+
+    try:
+        blob = bucket.blob(GCS_BLOB)
+        if not blob.exists():
+            return False
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DB_PATH.with_suffix(".download.db")
+        blob.download_to_filename(str(tmp))
+        # Atomic replace so a reader never sees a partial file.
+        tmp.replace(DB_PATH)
+        marker.write_text(datetime.now(timezone.utc).isoformat(),
+                          encoding="utf-8")
+        return True
+    except Exception:
+        return False

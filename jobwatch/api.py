@@ -104,6 +104,9 @@ def _job_payload(job: registry.Job, run: dict | None,
 
 def jobs_payload(params: dict) -> dict:
     """The main payload: every job with its latest run."""
+    # In the container the DB is a read-only copy pulled from GCS. The TTL
+    # inside download_from_gcs keeps this from re-downloading on every poll.
+    store.download_from_gcs()
     latest = store.latest_per_job()
     jobs = [_job_payload(j, latest.get(j.job_id)) for j in registry.ALL_JOBS]
     # filters
@@ -204,9 +207,35 @@ def history_payload(params: dict) -> dict:
 
 
 def collect_now() -> dict:
-    """Run a collection pass. Used by the page's Refresh button."""
+    """Run a collection pass. Used by the page's Refresh button.
+
+    In the Cloud Run container this CANNOT work: the collector shells out to
+    `schtasks` (Windows-only) and `gcloud` (not installed in the image). So
+    the container reports that honestly instead of returning a cheerful
+    "collected 0 runs", which would look like a quiet day.
+
+    The container's job is to READ the DB the Windows machine uploaded. The
+    Refresh button there re-downloads from GCS rather than collecting.
+    """
+    import os
+    import sys
+
+    in_container = (sys.platform != "win32"
+                    or os.getenv("K_SERVICE") is not None)
+    if in_container:
+        pulled = store.download_from_gcs(max_age_s=0)
+        return {
+            "mode": "read_only",
+            "pulled_from_gcs": pulled,
+            "message": ("This deployment cannot collect: the collector needs "
+                        "Windows Task Scheduler and the gcloud CLI. Showing "
+                        "the most recent data uploaded by the local machine."),
+        }
+
     from jobwatch import collect
-    return collect.collect_all(verbose=False)
+    result = collect.collect_all(verbose=False)
+    result["mode"] = "collected"
+    return result
 
 
 def job_detail_payload(params: dict) -> dict:

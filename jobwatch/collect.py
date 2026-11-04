@@ -558,9 +558,19 @@ def collect_all(verbose: bool = False) -> dict:
     finished = datetime.now(timezone.utc).isoformat()
     store.record_collect(started, finished, len(all_rows), written, errors)
 
+    # Push to GCS so the Cloud Run dashboard can read it. The container
+    # cannot collect -- `schtasks` is Windows-only and `gcloud` is not
+    # installed there -- so this upload is the only way the deployed page
+    # ever sees fresh data.
+    uploaded = store.upload_to_gcs()
+    if verbose:
+        print(f"  gcs upload: {'ok' if uploaded else 'skipped/failed'}",
+              flush=True)
+
     return {
         "started_at": started, "finished_at": finished,
         "jobs_seen": len(all_rows), "runs_written": written,
+        "uploaded": uploaded,
         "errors": errors,
     }
 

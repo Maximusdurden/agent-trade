@@ -299,14 +299,23 @@ async function load() {
 }
 
 async function refreshNow() {
-  $('refreshNote').textContent = 'collecting…';
+  $('refreshNote').textContent = 'refreshing…';
   try {
     const r = await fetch('/api/jobs/collect');
     const j = await r.json();
-    $('refreshNote').textContent = j.error
-      ? 'error: ' + j.error
-      : 'collected ' + j.runs_written + ' runs' +
+    if (j.error) {
+      $('refreshNote').textContent = 'error: ' + j.error;
+    } else if (j.mode === 'read_only') {
+      // The deployed container cannot collect -- it has no Task Scheduler and
+      // no gcloud. Say so, rather than showing "collected 0 runs" which would
+      // look like a quiet day.
+      $('refreshNote').textContent = j.pulled_from_gcs
+        ? 'pulled latest from GCS' : 'already up to date';
+      $('refreshNote').title = j.message || '';
+    } else {
+      $('refreshNote').textContent = 'collected ' + j.runs_written + ' runs' +
         (j.errors && j.errors.length ? ' (' + j.errors.length + ' errors)' : '');
+    }
     await load();
   } catch (e) {
     $('refreshNote').textContent = 'failed: ' + e;
