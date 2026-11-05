@@ -342,6 +342,46 @@ def log_trade(decision_id: int | None, alpaca_order_id: str, symbol: str,
         return get_last_insert_id(cursor)
 
 
+def normalize_fill_status(status, filled_qty=None, qty=None) -> str:
+    """Normalize a broker order status into a fill status FIFO matching keeps.
+
+    Alpaca reports an order that partially filled and then expired/canceled as
+    status ``expired``/``canceled`` even though shares actually changed hands
+    (e.g. MSFT BUY 53, filled 9 @ 545.66, then EXPIRED). Storing that status
+    verbatim makes ``core.feedback._fetch_filled_trades`` — which only selects
+    ``filled``/``partially_filled`` — silently drop a real fill, so FIFO cost
+    basis and realized PnL go wrong. If any quantity filled, report a fill
+    status; only a zero-fill order keeps its terminal status.
+
+    Args:
+        status: broker status string (case-insensitive).
+        filled_qty: filled quantity, if known.
+        qty: ordered quantity, used to decide filled vs partially_filled.
+
+    Returns:
+        ``"filled"``, ``"partially_filled"``, or the lowercased input status.
+    """
+    raw = str(status or "").strip().lower()
+
+    def _as_float(value):
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    filled = _as_float(filled_qty)
+    ordered = _as_float(qty)
+
+    if raw in ("filled", "partially_filled"):
+        return raw
+    # Only orders that actually traded get promoted to a fill status.
+    if filled is None or filled <= 0:
+        return raw if raw else "canceled"
+    if ordered is not None and ordered > 0 and filled + 1e-9 < ordered:
+        return "partially_filled"
+    return "filled"
+
+
 def reconcile_broker_orders(broker_orders: list[dict]) -> int:
     """Backfill broker-side fills into the trades table.
 
@@ -391,7 +431,7 @@ def reconcile_broker_orders(broker_orders: list[dict]) -> int:
                 str(order.get("side", "")).lower(),
                 float(order.get("qty", 0.0) or 0.0),
                 float(order.get("filled_avg_price")) if order.get("filled_avg_price") is not None else None,
-                str(order.get("status", "filled")).lower(),
+                normalize_fill_status(order.get("status"), order.get("filled_qty"), order.get("qty")),
                 option_type,
             ))
             existing.add(oid)

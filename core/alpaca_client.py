@@ -549,6 +549,12 @@ class AlpacaClient:
                         # is "OrderSide.BUY", which mislabels every order as "sell".
                         "side": "buy" if (order.side and (getattr(order.side, "value", None) == "buy" or str(order.side).lower() == "buy")) else "sell",
                         "qty": float(order.filled_qty or order.qty or 0),
+                        # Ordered qty + actual filled qty are BOTH needed by the
+                        # reconciler: Alpaca marks a partially-filled-then-expired
+                        # order as status=expired with filled_qty > 0, and without
+                        # filled_qty that real fill would be normalized away.
+                        "ordered_qty": float(order.qty or 0),
+                        "filled_qty": float(order.filled_qty) if order.filled_qty is not None else None,
                         "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
                         "status": str(order.status.value) if hasattr(order.status, "value") else str(order.status),
                     })
@@ -580,7 +586,8 @@ class AlpacaClient:
         unique.sort(key=lambda o: o["timestamp"], reverse=True)
         return unique[:limit]
 
-    def get_historical_bars(self, symbol, limit: int = 100, timeframe_str: str = "day", max_retries: int = 3) -> pd.DataFrame:
+    def get_historical_bars(self, symbol, limit: int = 100, timeframe_str: str = "day", max_retries: int = 3,
+                            start=None, end=None) -> pd.DataFrame:
         """Fetches historical daily or intraday bar data for a ticker or list of tickers (automatically handles Stocks or Crypto).
         
         Args:
@@ -588,6 +595,10 @@ class AlpacaClient:
             limit: Number of bars to fetch
             timeframe_str: Timeframe for bars (e.g. 'day', '15min')
             max_retries: Maximum number of retry attempts
+            start: Optional explicit window start (tz-aware datetime). When given
+                with ``end``, the request is anchored to that window instead of
+                "now" — required for charts of trades that are not from today.
+            end: Optional explicit window end (tz-aware datetime).
         
         Returns:
             pd.DataFrame: DataFrame containing historical bars
@@ -612,13 +623,19 @@ class AlpacaClient:
         # Partition into stock, crypto, and option symbols
         stock_symbols, crypto_symbols, option_symbols = self._partition_symbols(symbols_list)
         
-        # Fetch last N days (making sure we cover weekends/holidays)
-        start_time = datetime.now() - timedelta(days=limit * day_multiplier)
+        # Anchor to an explicit window when provided (charts of past trades);
+        # otherwise fall back to "last N days from now".
+        if start is not None and end is not None:
+            start_time = start
+            end_time = end
+        else:
+            start_time = datetime.now() - timedelta(days=limit * day_multiplier)
+            end_time = datetime.now()
         
         # Try fetching data with retries
-        stock_dfs = self._fetch_stock_data(stock_symbols, tf, start_time, max_retries)
-        crypto_dfs = self._fetch_crypto_data(crypto_symbols, tf, start_time, max_retries)
-        option_dfs = self._fetch_option_data(option_symbols, tf, start_time, max_retries)
+        stock_dfs = self._fetch_stock_data(stock_symbols, tf, start_time, max_retries, end_time=end_time)
+        crypto_dfs = self._fetch_crypto_data(crypto_symbols, tf, start_time, max_retries, end_time=end_time)
+        option_dfs = self._fetch_option_data(option_symbols, tf, start_time, max_retries, end_time=end_time)
         
         # Combine results
         all_dfs = stock_dfs + crypto_dfs + option_dfs
@@ -812,7 +829,8 @@ class AlpacaClient:
                 stock_symbols.append(sym)
         return stock_symbols, crypto_symbols, option_symbols
 
-    def _fetch_option_data(self, option_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
+    def _fetch_option_data(self, option_symbols: list[str], tf, start_time, max_retries: int,
+                           end_time=None) -> list[pd.DataFrame]:
         """Fetch option historical bars via the OptionHistoricalDataClient.
 
         Returns an empty list when no option symbols are requested or when option
@@ -846,7 +864,7 @@ class AlpacaClient:
                 symbol_or_symbols=option_symbols,
                 timeframe=tf,
                 start=start_time,
-                end=datetime.now()
+                end=end_time or datetime.now()
             )
             bars = self._fetch_with_retry(self.option_data_client, request_params, self.option_data_client.get_option_bars, max_retries)
             if bars and bars.df is not None and not bars.df.empty:
@@ -860,7 +878,7 @@ class AlpacaClient:
                         symbol_or_symbols=sym,
                         timeframe=tf,
                         start=start_time,
-                        end=datetime.now()
+                        end=end_time or datetime.now()
                     )
                     bars = self._fetch_with_retry(self.option_data_client, request_params, self.option_data_client.get_option_bars, max_retries)
                     if bars and bars.df is not None and not bars.df.empty:
@@ -869,7 +887,8 @@ class AlpacaClient:
                     logger.error(f"Failed to fetch option bars for {sym}: {sym_err}")
         return option_dfs
         
-    def _fetch_stock_data(self, stock_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
+    def _fetch_stock_data(self, stock_symbols: list[str], tf, start_time, max_retries: int,
+                          end_time=None) -> list[pd.DataFrame]:
         """Fetch stock data with retries and fallbacks."""
         stock_dfs = []
         if stock_symbols:
@@ -878,7 +897,7 @@ class AlpacaClient:
                     "symbol_or_symbols": stock_symbols,
                     "timeframe": tf,
                     "start": start_time,
-                    "end": datetime.now()
+                    "end": end_time or datetime.now()
                 }
                 if DATA_FEED_AVAILABLE:
                     stock_bars_request_kwargs["feed"] = DataFeed.IEX
@@ -895,7 +914,7 @@ class AlpacaClient:
                             "symbol_or_symbols": sym,
                             "timeframe": tf,
                             "start": start_time,
-                            "end": datetime.now()
+                            "end": end_time or datetime.now()
                         }
                         if DATA_FEED_AVAILABLE:
                             stock_bars_request_kwargs["feed"] = DataFeed.IEX
@@ -909,7 +928,8 @@ class AlpacaClient:
                     self._log_bar_fetch_failures("stock", failed_syms)
         return stock_dfs
         
-    def _fetch_crypto_data(self, crypto_symbols: list[str], tf, start_time, max_retries: int) -> list[pd.DataFrame]:
+    def _fetch_crypto_data(self, crypto_symbols: list[str], tf, start_time, max_retries: int,
+                           end_time=None) -> list[pd.DataFrame]:
         """Fetch crypto data with retries and fallbacks."""
         crypto_dfs = []
         if crypto_symbols:
@@ -918,7 +938,7 @@ class AlpacaClient:
                     symbol_or_symbols=crypto_symbols,
                     timeframe=tf,
                     start=start_time,
-                    end=datetime.now()
+                    end=end_time or datetime.now()
                 )
                 bars = self._fetch_with_retry(self.crypto_data_client, request_params, self.crypto_data_client.get_crypto_bars, max_retries)
                 if bars and bars.df is not None and not bars.df.empty:
@@ -932,7 +952,7 @@ class AlpacaClient:
                             symbol_or_symbols=sym,
                             timeframe=tf,
                             start=start_time,
-                            end=datetime.now()
+                            end=end_time or datetime.now()
                         )
                         bars = self._fetch_with_retry(self.crypto_data_client, request_params, self.crypto_data_client.get_crypto_bars, max_retries)
                         if bars and bars.df is not None and not bars.df.empty:

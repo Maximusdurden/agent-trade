@@ -91,6 +91,11 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     # Capture the AMD decision payload so it can be re-inserted into a fresh GCS
     # DB right before upload (race-condition fix — see step 8).
     amd_decision_payload = None
+    # Capture every trade row this cycle writes so it can be re-inserted after
+    # the pre-upload GCS re-download (which replaces the local DB file and would
+    # otherwise silently discard this lane's fills — the bug that dropped AMD
+    # from the 2026-11-04 blog post while keeping only MSFT).
+    executed_trade_rows = []
 
     for decision in decisions:
         if not isinstance(decision, dict):
@@ -211,6 +216,18 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                 filled_avg_price=order_result.get("filled_avg_price"),
                 status=order_result.get("status", "submitted"),
             )
+            # Capture a broker-shaped row for the pre-upload re-insert (step 8).
+            # The pre-upload GCS re-download replaces the whole DB file, so this
+            # list is the ONLY durable copy of this cycle's fills until they are
+            # written back. (log_trade stamps its own timestamp on re-insert.)
+            executed_trade_rows.append({
+                "alpaca_order_id": order_result.get("id"),
+                "symbol": symbol,
+                "side": action.lower(),
+                "qty": float(qty),
+                "filled_avg_price": order_result.get("filled_avg_price"),
+                "status": str(order_result.get("status", "filled") or "filled"),
+            })
             executed_results.append(f"{action} {qty} {symbol}")
             # Wipe the trailing-stop HWM on full liquidation to prevent
             # stale-peak false exits (a 30% winner's peak must not blind the
@@ -237,16 +254,10 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
             except Exception as log_err:
                 logger.error(f"Failed to log failed execution: {log_err}")
 
-    # 7. Broker-order reconciliation (so broker-side fills reach the DB).
-    try:
-        broker_orders = alpaca_client.get_executed_orders(limit=500)
-        if broker_orders:
-            inserted = database.reconcile_broker_orders(broker_orders)
-            if inserted:
-                logger.info(f"Broker reconciliation backfilled {inserted} fill(s).")
-    except Exception as e:
-        logger.error(f"Broker reconciliation failed: {e}")
-        log_exception_to_jira(e, "AMD Sideload Broker Reconciliation Failure")
+    # 7. Broker-order reconciliation (step moved AFTER the GCS re-download).
+    # Reconciliation must run against the DB we are actually about to upload.
+    # Running it before the re-download (the old order) meant every backfilled
+    # fill was thrown away when the fresh GCS DB replaced the local file.
 
     # 8. Sync to GCS if configured (so the cloud DB stays fresh for blog/dashboard).
     # RACE-CONDITION FIX (2026-09-18): the normal lane and this sideload lane both
@@ -256,6 +267,11 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
     # appearing. To prevent that, re-download the freshest GCS DB right before
     # uploading and re-insert this lane's AMD decision into it, so this upload
     # carries BOTH the latest normal-lane decisions AND the AMD decision.
+    #
+    # DATA-LOSS FIX (2026-11-05): the re-insert must ALSO restore this cycle's
+    # trade rows. Re-downloading replaces the local DB file, so every trade
+    # log_trade() wrote above was lost — the AMD decision survived but its fills
+    # did not, which is why the 2026-11-04 post showed only MSFT.
     try:
         from core.gcs_sync import download_from_gcs
         download_from_gcs()
@@ -268,6 +284,33 @@ def run_single_cycle(alpaca_client: AlpacaClient, data_provider: DataProvider,
                 logger.info("Re-inserted AMD decision into fresh GCS DB before upload.")
             except Exception as reinsert_err:
                 logger.error(f"Failed to re-insert AMD decision before upload: {reinsert_err}")
+        # Re-insert this cycle's fills (deduped by alpaca_order_id inside
+        # log_trade via INSERT OR IGNORE).
+        restored = 0
+        for row in executed_trade_rows:
+            try:
+                database.log_trade(
+                    decision_id=None,
+                    alpaca_order_id=row["alpaca_order_id"],
+                    symbol=row["symbol"], side=row["side"], qty=row["qty"],
+                    filled_avg_price=row["filled_avg_price"],
+                    status=row["status"],
+                )
+                restored += 1
+            except Exception as tr_err:
+                logger.error(f"Failed to re-insert trade {row.get('alpaca_order_id')}: {tr_err}")
+        if restored:
+            logger.info(f"Re-inserted {restored} trade row(s) into fresh GCS DB before upload.")
+        # Reconcile broker fills LAST so it operates on (and keeps) these rows.
+        try:
+            broker_orders = alpaca_client.get_executed_orders(limit=500)
+            if broker_orders:
+                inserted = database.reconcile_broker_orders(broker_orders)
+                if inserted:
+                    logger.info(f"Broker reconciliation backfilled {inserted} fill(s).")
+        except Exception as e:
+            logger.error(f"Broker reconciliation failed: {e}")
+            log_exception_to_jira(e, "AMD Sideload Broker Reconciliation Failure")
     except Exception as dl_err:
         logger.warning(f"Could not re-download GCS DB before sideload upload: {dl_err}")
 

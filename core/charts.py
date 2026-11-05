@@ -26,7 +26,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -104,13 +104,33 @@ def _parse_ticker_details(ticker):
 
 
 def _fetch_bars(client, api_symbol, start_dt, end_dt):
-    """Fetch 5-min OHLC bars for the window around a trade (ET-aware)."""
+    """Fetch 5-min OHLC bars for the window around a trade (ET-aware).
+
+    The bar request is anchored to the TRADE window, not to "now". The previous
+    implementation derived its lookback from ``datetime.now()``, so a trade more
+    than a few days old requested a window that ended today and the trade's own
+    bars were never returned — the chart then had no candle to attach the BUY
+    marker to, and only the (later) sell appeared. Anchoring to ``end_dt`` makes
+    multi-day holds render correctly.
+    """
     try:
-        fetch_start = start_dt - timedelta(days=2)
-        days_diff = (datetime.now() - fetch_start.replace(tzinfo=None)).days + 2
-        if days_diff < 1:
-            days_diff = 1
-        data = client.get_historical_bars(api_symbol, limit=days_diff * 24 * 12, timeframe_str="5min")
+        # Anchor the request to the trade window. Alpaca's ``start``/``end`` are
+        # UTC, so convert the naive-ET bounds explicitly.
+        end_utc = end_dt.replace(tzinfo=timezone.utc) if end_dt.tzinfo is None else end_dt.astimezone(timezone.utc)
+        start_utc = start_dt.replace(tzinfo=timezone.utc) if start_dt.tzinfo is None else start_dt.astimezone(timezone.utc)
+        # Small pad so the first/last candle of the window is fully covered.
+        start_utc = start_utc - timedelta(days=1)
+        end_utc = end_utc + timedelta(days=1)
+
+        # 5-min bars: 78 per RTH session, but the window may span pre/post
+        # market and multiple days. Size the limit from the actual span.
+        span_days = max((end_utc - start_utc).days, 1)
+        limit = min(span_days * 24 * 12, 20000)
+
+        data = client.get_historical_bars(
+            api_symbol, limit=limit, timeframe_str="5min",
+            start=start_utc, end=end_utc,
+        )
         if data is None or data.empty:
             return pd.DataFrame()
         if isinstance(data.index, pd.MultiIndex):
@@ -192,6 +212,32 @@ def _fetch_order_fills(client, api_symbol, start_dt, end_dt):
     return fills
 
 
+def _marker_y(df, idx, price, side, pad_frac=0.012):
+    """Return a y value that keeps a fill marker VISIBLE outside the candle body.
+
+    A fill price almost always falls inside its own candle's high/low range, so
+    plotting the marker at the raw fill price buries it inside the body — the
+    green buy triangle becomes invisible against a green candle (and the red
+    sell triangle against a red one). That is why the 2026-11-04 AMD chart
+    showed only the sell: the buy at 479.48 sat inside a 476.81-499.23 body.
+
+    Markers are therefore pushed just beyond the candle's high (sells) or low
+    (buys), so they always sit outside the body and stay readable regardless of
+    candle color. The annotation still reports the true fill price.
+    """
+    try:
+        row = df.iloc[idx]
+        high = float(row["High"])
+        low = float(row["Low"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return price
+    span = max(high - low, abs(price) * 0.001, 1e-6)
+    pad = span * pad_frac
+    if side == "buy":
+        return min(low - pad, price)
+    return max(high + pad, price)
+
+
 def _prepare_overlays(client, df, ticker, start_dt, end_dt, round_trips):
     """Build mplfinance addplots + legend for buy/sell markers and trend EMA.
 
@@ -236,15 +282,17 @@ def _prepare_overlays(client, df, ticker, start_dt, end_dt, round_trips):
         if idx[0] == -1:
             continue
         if f["side"] == "buy":
-            buy_filled[idx[0]] = f["price"]
+            marker_y = _marker_y(df, idx[0], f["price"], "buy")
+            buy_filled[idx[0]] = marker_y
             annotations.append({
-                "x": idx[0], "y": f["price"],
+                "x": idx[0], "y": marker_y, "price": f["price"],
                 "text": f"BUY {f['qty']}\n@{f['price']:.2f}", "color": "#00FF00",
             })
         else:
-            sell_filled[idx[0]] = f["price"]
+            marker_y = _marker_y(df, idx[0], f["price"], "sell")
+            sell_filled[idx[0]] = marker_y
             annotations.append({
-                "x": idx[0], "y": f["price"],
+                "x": idx[0], "y": marker_y, "price": f["price"],
                 "text": f"SELL {f['qty']}\n@{f['price']:.2f}", "color": "#FF4444",
             })
         has_orders = True
@@ -261,18 +309,20 @@ def _prepare_overlays(client, df, ticker, start_dt, end_dt, round_trips):
             if open_ts is not None and entry_price:
                 idx = df.index.get_indexer([open_ts.replace(tzinfo=None)], method="nearest")
                 if idx[0] != -1:
-                    buy_filled[idx[0]] = entry_price
+                    marker_y = _marker_y(df, idx[0], entry_price, "buy")
+                    buy_filled[idx[0]] = marker_y
                     annotations.append({
-                        "x": idx[0], "y": entry_price,
+                        "x": idx[0], "y": marker_y, "price": entry_price,
                         "text": f"BUY {qty}\n@{entry_price:.2f}", "color": "#00FF00",
                     })
                     has_orders = True
             if close_ts is not None and exit_price:
                 idx = df.index.get_indexer([close_ts.replace(tzinfo=None)], method="nearest")
                 if idx[0] != -1:
-                    sell_filled[idx[0]] = exit_price
+                    marker_y = _marker_y(df, idx[0], exit_price, "sell")
+                    sell_filled[idx[0]] = marker_y
                     annotations.append({
-                        "x": idx[0], "y": exit_price,
+                        "x": idx[0], "y": marker_y, "price": exit_price,
                         "text": f"SELL {qty}\n@{exit_price:.2f}", "color": "#FF4444",
                     })
                     has_orders = True
@@ -294,11 +344,18 @@ def _render_chart(title, filename, df, addplots, legends, annotations, save_fold
         raise RuntimeError("matplotlib/mplfinance required to render trade charts.")
     os.makedirs(save_folder, exist_ok=True)
     full_path = os.path.join(save_folder, filename)
+    # Multi-day windows need the date on the axis; a bare "%H:%M" makes a
+    # 5-week hold read as a single confusing session (15:05, 09:35, 10:35...).
+    try:
+        span_days = (df.index.max() - df.index.min()).days
+    except (AttributeError, TypeError, ValueError):
+        span_days = 0
+    dt_format = "%m-%d %H:%M" if span_days >= 1 else "%H:%M"
     fig, axlist = mpf.plot(
         df, type="candle", style=CHART_STYLE, addplot=addplots,
         volume=True, panel_ratios=(6, 2),
         figscale=1.5, figsize=(16, 10),
-        datetime_format="%H:%M", xrotation=0, returnfig=True,
+        datetime_format=dt_format, xrotation=0, returnfig=True,
         warn_too_much_data=10000,
         title=dict(title=title, color="white", fontsize=16, weight="bold"),
     )
@@ -306,20 +363,33 @@ def _render_chart(title, filename, df, addplots, legends, annotations, save_fold
     if legends:
         ax.legend(handles=legends, loc="upper left", fontsize=10, framealpha=0.6)
 
-    right_edge_x = len(df) + 1
-    for i, note in enumerate(annotations):
-        if "BUY" in note["text"]:
-            y_offset = -40 if i % 2 == 0 else -60
-        else:
-            y_offset = 40 if i % 2 == 0 else 60
+    # Keep annotation labels inside the axes. A fixed pixel offset pushed the
+    # BUY label below the bottom spine (it was clipped and invisible) whenever
+    # the fill sat near the low of the visible range. Place the label on the
+    # side with more room instead, and clamp it to the axes bounds.
+    y_lo, y_hi = ax.get_ylim()
+    y_span = (y_hi - y_lo) or 1.0
+    for note in annotations:
+        is_buy = "BUY" in note["text"]
+        # Buys label below the marker, sells above — but flip when there is no
+        # room on the preferred side.
+        prefer_below = is_buy
+        room_below = (note["y"] - y_lo) / y_span
+        room_above = (y_hi - note["y"]) / y_span
+        if prefer_below and room_below < 0.18 and room_above > room_below:
+            prefer_below = False
+        elif (not prefer_below) and room_above < 0.18 and room_below > room_above:
+            prefer_below = True
+        y_offset = -34 if prefer_below else 34
         ax.annotate(
             note["text"],
             xy=(note["x"], note["y"]),
             xytext=(0, y_offset),
             textcoords="offset points",
             arrowprops=dict(arrowstyle="->", color="white", lw=0.8),
-            bbox=dict(boxstyle="round,pad=0.3", fc="black", ec=note["color"], alpha=0.8),
+            bbox=dict(boxstyle="round,pad=0.3", fc="black", ec=note["color"], alpha=0.85),
             fontsize=8, color="white", ha="center",
+            annotation_clip=False,
         )
 
     plt.savefig(full_path)
