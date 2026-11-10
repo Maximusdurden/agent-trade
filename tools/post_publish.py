@@ -97,15 +97,45 @@ def _fetch_post(post_id: int) -> dict | None:
 
 
 def _recent_posts(exclude_id: int, limit: int = 10) -> list[dict]:
+    """Recent published posts, WITH editable content.
+
+    ``context=edit`` is mandatory. Without it WordPress returns only
+    ``content.rendered`` and omits ``content.raw`` entirely, so a caller that
+    reads ``content.raw`` gets an empty string and -- if it then writes that
+    back -- silently erases the post. That is exactly how posts 3252 and 3248
+    were destroyed on 2026-11-09.
+    """
     r = requests.get(
         f"{wp.WP_URL}/wp-json/wp/v2/posts",
-        params={"per_page": limit, "status": "publish", "orderby": "date", "order": "desc"},
+        params={
+            "per_page": limit,
+            "status": "publish",
+            "orderby": "date",
+            "order": "desc",
+            "context": "edit",
+        },
         headers=wp.get_auth_header(),
         timeout=30,
     )
     if r.status_code != 200:
         return []
     return [p for p in r.json() if p["id"] != exclude_id]
+
+
+def _raw_content(post: dict) -> str | None:
+    """Return the editable content, or None if it is unavailable.
+
+    Returning None (rather than "") is the whole point: an empty string is a
+    valid post body, so a caller cannot distinguish "this post is empty" from
+    "the API did not give me the content". None forces the caller to abort.
+    """
+    content = post.get("content")
+    if not isinstance(content, dict):
+        return None
+    raw = content.get("raw")
+    if raw is None:
+        return None
+    return raw
 
 
 def _title(post: dict) -> str:
@@ -159,7 +189,10 @@ def add_related_to_post(post_id: int, dry: bool = False) -> bool:
         logger.warning("could not fetch post %s", post_id)
         return False
 
-    content = (post.get("content") or {}).get("raw") or ""
+    content = _raw_content(post)
+    if content is None:
+        logger.warning("post %s: no editable content returned; refusing to write", post_id)
+        return False
     neighbours = _recent_posts(exclude_id=post_id, limit=RELATED_COUNT + 1)[:RELATED_COUNT]
     block = _related_block(neighbours)
     if not block:
@@ -195,7 +228,14 @@ def add_backlinks_from_recent(new_post: dict, dry: bool = False) -> int:
 
     updated = 0
     for post in _recent_posts(exclude_id=new_id, limit=BACKLINK_COUNT):
-        content = (post.get("content") or {}).get("raw") or ""
+        content = _raw_content(post)
+        if content is None:
+            # Never write when the API did not hand us the real body. Writing
+            # here would replace the post with just the backlink block.
+            logger.warning(
+                "post %s: no editable content returned; skipping backlink", post["id"]
+            )
+            continue
         if new_link in content:
             continue  # already linked
 
