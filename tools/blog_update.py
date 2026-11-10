@@ -141,10 +141,13 @@ def verify_pnl_in_body(body, total_pnl, date_str=None):
     # Repair the known LLM token-fusion bug where the date and PnL get glued
     # together, e.g. "-$105-09-18" (from "2026-09-18" + "-$105"). The model
     # drops the year and splices the dollar figure onto the "-MM-DD" fragment.
-    # Pattern: optional sign + $ + digits, immediately followed by a date
-    # fragment like "-09-18" (or "-09-18" with a leading year already present).
+    #
+    # CRITICAL: the number must carry a currency marker ($ or a leading sign).
+    # Without that requirement this pattern matches the year inside a plain
+    # "2026-11-09" date and "repairs" it into "$525 2026-11-09" -- which is
+    # exactly the corruption that shipped on 2026-11-09.
     fused = re.search(
-        r"(?P<lead>\s*)(?P<sign>[-−]?)\s*\$?\s*(?P<num>\d[\d,]*)\s*"
+        r"(?P<lead>\s*)(?P<sign>[-−]\s*\$?|\$\s*)(?P<num>\d[\d,]*)\s*"
         r"(?P<dash>-)\s*(?P<mm>\d{1,2})\s*-\s*(?P<dd>\d{1,2})\b",
         body,
     )
@@ -163,10 +166,16 @@ def verify_pnl_in_body(body, total_pnl, date_str=None):
                     + correct_str + " " + date_frag + body[fused.end():])
         return repaired
 
-    match = re.search(r"(?P<lead>\s*)(?P<sign>[-−]?)\s*\$?\s*(?P<num>\d[\d,]*)", body)
+    # Sign repair. A bare "-105" is indistinguishable from a date fragment
+    # ("2026-11-09" contains "-11"), so this path REQUIRES a currency marker.
+    # A PnL figure written in prose always carries one.
+    match = re.search(
+        r"(?P<lead>\s*)(?P<sign>[-−]\s*\$|\$\s*)(?P<num>\d[\d,]*(?:\.\d+)?)",
+        body,
+    )
     if not match:
         return body
-    stated_neg = match.group("sign") in ("-", "−")
+    stated_neg = "-" in match.group("sign") or "−" in match.group("sign")
     actual_neg = pnl_float < 0
     if stated_neg != actual_neg:
         return body[:match.start()] + match.group("lead") + correct_str + body[match.end():]
@@ -243,12 +252,135 @@ def _get_root_ticker(ticker: str) -> str:
 
 def _home_html_header() -> str:
     return ('<section class="wp-block-group" style="max-width:1200px;margin:0 auto;">'
-            '<div style="background:#ffffff;border-radius:15px;padding:20px;'
-            'border:1px solid #d7ccc8;">')
+            f'<div style="background:{SURFACE};border-radius:15px;padding:20px;'
+            f'border:1px solid {BORDER};">')
 
 
 def _home_html_footer() -> str:
     return "</div></section>"
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+#
+# The theme ships a light AND a warm dark mode (``html.tmc-dark``), which swaps
+# --ink from #221d16 to #e8e0d0. Hardcoded browns therefore vanish in dark mode,
+# so every colour below is a theme CSS variable with a light-mode fallback.
+# ---------------------------------------------------------------------------
+INK = "var(--ink, #221d16)"
+MUTED = "var(--muted, #6f6557)"
+SURFACE = "var(--surface, #faf6ec)"
+BORDER = "var(--border, #d8cdb8)"
+GAIN = "var(--gain, #2e6b44)"
+LOSS = "var(--loss, #b23b2e)"
+ACCENT = "var(--accent, #c8432c)"
+
+
+def _render_intro_block(title: str, body: str, total_pnl: float, date_str: str) -> str:
+    """Render the post header: title, a real stat strip, then Dexter's prose.
+
+    The old version dumped the raw LLM body into a single ``<p>``, which is how
+    "MARKET NEWS:" and "LATEST BUYS CONTEXT:" ended up as visible labels in the
+    published post. The body is now split into paragraphs and the machine-ish
+    scaffolding lines are dropped.
+    """
+    import html as _html
+    import re as _re
+
+    # Strip the prompt scaffolding the model echoes back.
+    cleaned = body or ""
+    for junk in ("MARKET NEWS:", "LATEST BUYS CONTEXT:", "SPECIAL INSTRUCTIONS / DAILY NOTES:"):
+        cleaned = cleaned.replace(junk, "")
+    # Drop "Tickers: ['AMD']" style debug lines.
+    cleaned = _re.sub(r"^\s*Tickers:\s*\[[^\]]*\]\s*$", "", cleaned, flags=_re.M)
+    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    paragraphs = [p.strip() for p in _re.split(r"\n\s*\n", cleaned) if p.strip()]
+    if not paragraphs:
+        paragraphs = [cleaned] if cleaned else []
+
+    pnl_color = GAIN if total_pnl >= 0 else LOSS
+    pnl_label = format_pnl(total_pnl)
+
+    parts = [
+        f'<h1 style="color:{INK}; margin:0 0 4px 0;">{_html.escape(title)}</h1>',
+        f'<p style="color:{MUTED}; font-size:14px; margin:0 0 18px 0;">{date_str}</p>',
+        # Stat strip: only real numbers, no empty placeholders.
+        '<div style="display:flex; gap:12px; flex-wrap:wrap; margin:0 0 22px 0;">',
+        f'<div style="flex:1 1 160px; background:{SURFACE}; border:1px solid {BORDER}; '
+        f'border-radius:12px; padding:14px 16px;">'
+        f'<div style="color:{MUTED}; font-size:12px; text-transform:uppercase; '
+        f'letter-spacing:.06em;">Day P&amp;L</div>'
+        f'<div style="color:{pnl_color}; font-size:26px; font-weight:800; '
+        f'line-height:1.2;">{pnl_label}</div></div>',
+        '</div>',
+    ]
+    for para in paragraphs:
+        safe = _html.escape(para).replace("\n", "<br />")
+        parts.append(
+            f'<p style="color:{INK}; line-height:1.75; font-size:17px; '
+            f'margin:0 0 16px 0;">{safe}</p>'
+        )
+    return "".join(parts)
+
+
+def _render_grade_metrics(grade_info: dict | None) -> str:
+    """Render the trade-grader metrics, omitting any that have no value.
+
+    The grader emits ``None`` for alpha/MAE/MFE when the benchmark data is
+    missing, and the old template rendered those as a bare ``%`` -- four empty
+    percentages in a row, which reads as broken. A metric with no value is
+    simply not shown.
+    """
+    if not grade_info:
+        return ""
+
+    def _fmt(value, suffix: str = "") -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if not value or value in {"%", "-", "—", "None", "nan"}:
+                return None
+            return f"{value}{suffix}"
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if num != num:  # NaN
+            return None
+        return f"{num:.1f}{suffix}"
+
+    rows: list[tuple[str, str]] = []
+    grade = (grade_info.get("grade") or "").strip()
+    if grade:
+        rows.append(("Grade", grade))
+    score = _fmt(grade_info.get("composite_score"))
+    if score:
+        rows.append(("Composite", f"{score}/100"))
+    for key, label, suffix in (
+        ("alpha_vs_spy", "Alpha vs SPY", "%"),
+        ("alpha_vs_sector", "Alpha vs Sector", "%"),
+        ("mae_drawdown", "MAE Drawdown", "%"),
+        ("mfe_capture", "MFE Capture", "%"),
+    ):
+        val = _fmt(grade_info.get(key), suffix)
+        if val:
+            rows.append((label, val))
+
+    if not rows:
+        return ""
+
+    cells = "".join(
+        f'<div style="min-width:110px;"><div style="color:{MUTED}; font-size:11px; '
+        f'text-transform:uppercase; letter-spacing:.06em;">{label}</div>'
+        f'<div style="color:{INK}; font-size:15px; font-weight:700;">{value}</div></div>'
+        for label, value in rows
+    )
+    return (
+        f'<div style="display:flex; gap:18px; flex-wrap:wrap; margin-top:14px; '
+        f'padding-top:14px; border-top:1px solid {BORDER};">{cells}</div>'
+    )
 
 
 def _market_research(date_str: str, tickers) -> str:
@@ -436,7 +568,7 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
         logger.warning("grade fetch failed: %s", e)
 
     html_body = _home_html_header()
-    html_body += f"<h1>{intro['title']}</h1><p style='color:#5d4037; font-size:17px;'>{intro['body']}</p>"
+    html_body += _render_intro_block(intro["title"], intro["body"], total_pnl, target_date)
 
     if not day_rows.empty:
         # Pre-filter the original round-trips to those closed on the target date
@@ -488,7 +620,7 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
             raw = generate_trade_blurb(ticker, group_pnl, metrics_str, grade_info=gi)
             blurb = wp.autolink_tickers(raw, tickers)
             blurb = wp.autolink_financial_terms(blurb)
-            color = "#4caf50" if group_pnl > 0 else "#f44336"
+            color = GAIN if group_pnl > 0 else LOSS
 
             # Per-ticker candlestick chart (buy/sell markers), like the old blog.
             chart_html = ""
@@ -513,9 +645,10 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
                 logger.warning("Chart render/upload skipped for %s: %s", ticker, e)
 
             html_body += f"""
-            <div style="padding:24px; border-left:8px solid {color}; background:#ffffff; margin:20px 0; border-radius:15px; border:1px solid #d7ccc8;">
-                <h3 style="margin-top:0; color:#008080; font-weight:800;">{ticker} Analysis</h3>
-                <p style="color:#5d4037; line-height:1.7; font-size:17px;">{blurb}</p>
+            <div style="padding:24px; border-left:8px solid {color}; background:{SURFACE}; margin:20px 0; border-radius:15px; border:1px solid {BORDER};">
+                <h3 style="margin-top:0; color:{ACCENT}; font-weight:800;">{ticker} Analysis</h3>
+                <p style="color:{INK}; line-height:1.7; font-size:17px; margin:0;">{blurb}</p>
+                {_render_grade_metrics(gi)}
                 {chart_html}
             </div>"""
     else:
@@ -558,12 +691,27 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
         logger.warning("SEO skip: %s", e)
 
     # ---- 7. Publish (or dry-run print) ----
+    #
+    # NOTE on the meta description: Rank Math's ``rank_math_description`` is NOT
+    # registered with show_in_rest, so writing it through the REST API silently
+    # drops it -- which is why every post's <meta name="description"> fell back
+    # to something useless (on 2026-11-09 it was literally the date). The
+    # ``excerpt`` field IS exposed, and Rank Math uses it as the description
+    # fallback, so that is what we set.
+    description = (seo_meta or {}).get("meta_description") or intro.get("meta") or ""
+    description = " ".join(str(description).split())[:300]
+
     post_data = {
         "title": intro["title"],
         "content": html_body,
         "status": "publish",
         "date": f"{target_date}T16:00:00",
-        "meta": {"rank_math_description": seo_meta.get("meta_description") if seo_meta else intro["meta"]},
+        "excerpt": description,
+        "meta": {"rank_math_description": description},
+        # Consumed by wp.publish_post / wp.update_post to assign tags. Without
+        # this the post publishes with tags: [] and every /tag/<ticker>/ link in
+        # the body points at an archive that does not include this post.
+        "_tickers": tickers,
     }
     if seo_meta and seo_meta.get("json_ld_schema"):
         post_data["content"] = wp.add_json_ld_schema(post_data["content"], seo_meta["json_ld_schema"])

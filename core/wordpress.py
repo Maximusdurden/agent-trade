@@ -113,6 +113,66 @@ def autolink_tickers(text: str, tickers_list) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Tagging
+#
+# Every internal link the autolinkers emit points at /tag/<slug>/. Those pages
+# only exist, and only list the right posts, if the post is actually ASSIGNED
+# the tag. Posts were publishing with ``tags: []``, so:
+#   * /tag/amd/ showed a stale archive ending in June, and
+#   * /tag/pnl/ and /tag/sector/ 404'd outright (the tags never existed).
+# The helper ``get_or_create_tag_id`` was defined and exported but never called.
+# ---------------------------------------------------------------------------
+
+# Financial terms the autolinker links to. These must exist as real tags or the
+# links 404, so they are created on demand.
+FINANCIAL_TERM_TAGS = [
+    "PnL", "Sector", "Sectors", "EMA", "SMA", "RSI", "MACD", "Volume",
+    "Support", "Resistance", "Volatility", "Stop Loss", "Take Profit",
+    "Golden Cross", "Death Cross", "Slippage", "Backtest", "Paper Trading",
+]
+
+
+def resolve_tag_ids(names: list[str]) -> list[int]:
+    """Map tag names to ids, creating any that are missing.
+
+    Returns only the ids that resolved. A failure to create one tag must never
+    block publishing, so errors are logged and skipped.
+    """
+    ids: list[int] = []
+    seen: set[int] = set()
+    for name in names:
+        clean = (name or "").strip()
+        if not clean:
+            continue
+        tid = get_or_create_tag_id(clean)
+        if tid and tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    return ids
+
+
+def tags_for_post(tickers: list[str] | None = None, extra: list[str] | None = None) -> list[int]:
+    """Build the tag id list for a post: its tickers plus the standard terms.
+
+    Tickers are tagged in upper case (AMD, NVDA) because that is how they are
+    written in the body and how the tag archive reads. Financial terms are
+    tagged so the autolinker's /tag/pnl/ style links resolve.
+    """
+    names: list[str] = []
+    for t in tickers or []:
+        up = (t or "").strip().upper()
+        if up and up not in names:
+            names.append(up)
+    for term in FINANCIAL_TERM_TAGS:
+        if term not in names:
+            names.append(term)
+    for e in extra or []:
+        if e and e not in names:
+            names.append(e)
+    return resolve_tag_ids(names)
+
+
 def autolink_financial_terms(text: str) -> str:
     if not text:
         return text
@@ -409,6 +469,16 @@ def publish_post(post_data: dict) -> requests.Response:
         cat_id = get_or_create_category_id(config.WP_CATEGORY_NAME)
         if cat_id:
             post_data["categories"] = [cat_id]
+    # Tags are what make the autolinker's /tag/<slug>/ links resolve to a real
+    # archive that includes this post. Callers pass the day's tickers via
+    # ``post_data["_tickers"]``; the key is stripped before the request.
+    if "tags" not in post_data:
+        tickers = post_data.pop("_tickers", None)
+        tag_ids = tags_for_post(tickers)
+        if tag_ids:
+            post_data["tags"] = tag_ids
+    else:
+        post_data.pop("_tickers", None)
     return get_retry_session().post(
         f"{WP_URL}/wp-json/wp/v2/posts", headers=get_auth_header(), json=post_data, timeout=15)
 
@@ -427,6 +497,18 @@ def update_post(post_id: int, post_data: dict) -> requests.Response:
     and any comments — rather than delete+recreate (which orphans media and
     breaks internal links). Returns the requests.Response.
     """
+    post_data = dict(post_data)
+    # Tag handling on update is OPT-IN, unlike publish.
+    #
+    # A partial update (e.g. rewriting only ``content`` to add a cross-link) must
+    # not touch tags at all -- doing so blanket-tagged every post with the full
+    # financial-term list. Tags are only assigned when the caller explicitly
+    # passes ``_tickers`` or ``tags``.
+    tickers = post_data.pop("_tickers", None)
+    if "tags" not in post_data and tickers is not None:
+        tag_ids = tags_for_post(tickers)
+        if tag_ids:
+            post_data["tags"] = tag_ids
     return get_retry_session().post(
         f"{WP_URL}/wp-json/wp/v2/posts/{post_id}", headers=get_auth_header(),
         json=post_data, timeout=20)

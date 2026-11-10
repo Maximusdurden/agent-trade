@@ -53,25 +53,37 @@ PRE_TRADE_BUFFER_MIN = 45
 POST_TRADE_BUFFER_MIN = 45
 
 # Dark mplfinance style (matches dexter's charts).
-mc = mpf.make_marketcolors(up="lime", down="red", edge="inherit", wick="inherit", volume="in")
-CHART_STYLE = mpf.make_mpf_style(
-    marketcolors=mc,
-    gridstyle=":",
-    gridcolor="#333333",
-    facecolor="black",
-    figcolor="black",
-    rc={
-        "axes.labelcolor": "white",
-        "xtick.labelcolor": "white",
-        "ytick.labelcolor": "white",
-        "axes.edgecolor": "white",
-        "axes.titlecolor": "white",
-        "text.color": "white",
-        "legend.facecolor": "black",
-        "legend.edgecolor": "gray",
-        "legend.labelcolor": "white",
-    },
-)
+#
+# These MUST be guarded. The import block above sets ``mpf = None`` when the
+# charting deps are missing, and calling ``mpf.make_marketcolors()`` at module
+# level then raised AttributeError on import -- which surfaced as the opaque
+# "Chart render/upload skipped for AMD: 'NoneType' object has no attribute
+# 'make_marketcolors'" and silently dropped the chart from the post.
+if _MPL_AVAILABLE:
+    mc = mpf.make_marketcolors(
+        up="lime", down="red", edge="inherit", wick="inherit", volume="in"
+    )
+    CHART_STYLE = mpf.make_mpf_style(
+        marketcolors=mc,
+        gridstyle=":",
+        gridcolor="#333333",
+        facecolor="black",
+        figcolor="black",
+        rc={
+            "axes.labelcolor": "white",
+            "xtick.labelcolor": "white",
+            "ytick.labelcolor": "white",
+            "axes.edgecolor": "white",
+            "axes.titlecolor": "white",
+            "text.color": "white",
+            "legend.facecolor": "black",
+            "legend.edgecolor": "gray",
+            "legend.labelcolor": "white",
+        },
+    )
+else:  # pragma: no cover - exercised only when deps are absent
+    mc = None
+    CHART_STYLE = None
 
 
 def _parse_ts(iso_str):
