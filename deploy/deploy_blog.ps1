@@ -165,12 +165,18 @@ if (-not $JobExists) {
 }
 
 # 6. Cloud Scheduler after the strategy job's DB sync each trading day.
-# The cron is expressed in UTC. 16:30 ET:
-#   - 16:30 EDT (Mar-Nov, daylight) == 20:30 UTC  -> schedule "30 20 * * 1-5"
-#   - 16:30 EST (Nov-Mar, standard) == 21:30 UTC   -> schedule "30 21 * * 1-5"
-# Adjust the scheduled time for your timezone / DST below. Day-of-week 1-5 =
-# weekdays (Mon-Fri) market days; 16:30 ET runs shortly after the 16:00 close so
-# the full day's round-trips are captured and the DB has synced to GCS.
+#
+# The cron is expressed in a NAMED timezone (America/New_York), not UTC.
+#
+# This used to be a fixed UTC cron "30 20 * * 1-5", which is 16:30 EDT but
+# 15:30 EST. When US DST ended on 2026-11-01 the job silently started running an
+# hour early -- the 2026-11-09 post was generated at 15:30 ET instead of 16:30.
+# A named timezone makes Cloud Scheduler handle the shift itself, so the job is
+# always 16:30 local regardless of the season.
+#
+# Day-of-week 1-5 = weekdays (Mon-Fri) market days; 16:30 ET runs shortly after
+# the 16:00 close so the full day's round-trips are captured and the DB has
+# synced to GCS.
 #
 # NOTE (2026-09-10): Use the DEFAULT compute service account, NOT a custom
 # `run-invoker` SA. The `run-invoker@<project>.iam.gserviceaccount.com` SA does
@@ -188,7 +194,8 @@ if (-not $DefaultComputeSa) {
 $SchedulerSa = $DefaultComputeSa
 Write-Host "Scheduler service account: $SchedulerSa"
 & $GCloud scheduler jobs delete $SchedulerName --location $Region --quiet 2>$null
-& $GCloud scheduler jobs create http $SchedulerName --schedule="30 20 * * 1-5" `
+& $GCloud scheduler jobs create http $SchedulerName --schedule="30 16 * * 1-5" `
+    --time-zone="America/New_York" `
     --location $Region `
     --uri="https://$Region-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GcpProject/jobs/${JobName}:run" `
     --http-method=POST `
@@ -199,6 +206,5 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "`nDone: blog job $JobName deployed; scheduler $SchedulerName registered."
-Write-Host "Schedule runs 16:30 ET (Mon-Fri) via UTC cron '30 20 * * 1-5' (EDT)."
-Write-Host "If DST changes, flip to '30 21 * * 1-5' (EST)."
+Write-Host "Schedule runs 16:30 America/New_York (Mon-Fri); DST is handled by the scheduler."
 Write-Host "Verify: & $GCloud run jobs describe $JobName --region $Region"

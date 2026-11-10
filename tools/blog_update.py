@@ -485,6 +485,26 @@ def _strategy_status_summary(db_path: str, target_date: str) -> str:
     return "\n".join(lines)
 
 
+def _post_publish(post_id: int | None) -> None:
+    """Run the SEO step after a successful publish.
+
+    Re-submits the sitemap and cross-links the post with its neighbours. This is
+    strictly best-effort: a Search Console outage or a WordPress hiccup must
+    never turn a successful publish into a failure, so every error is logged and
+    swallowed. Set HONEYPOT_SKIP_POST_PUBLISH=1 to disable.
+    """
+    if not post_id:
+        return
+    if os.environ.get("HONEYPOT_SKIP_POST_PUBLISH", "").strip() in {"1", "true", "yes"}:
+        logger.info("post-publish step skipped (HONEYPOT_SKIP_POST_PUBLISH set)")
+        return
+    try:
+        from tools import post_publish  # noqa: PLC0415 - optional dependency
+        post_publish.run(int(post_id))
+    except Exception as exc:  # noqa: BLE001 - never fail a publish over SEO
+        logger.warning("post-publish step failed (non-fatal): %s", exc)
+
+
 def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
                        update_post_id: int | None = None) -> int:
     """Grade + build the post (intro, blurbs, card, calendar) + publish.
@@ -726,6 +746,7 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
         if resp.status_code == 200:
             link = resp.json().get("link", "no link")
             logger.info("Updated post %s: %s -> %s", update_post_id, intro["title"], link)
+            _post_publish(update_post_id)
             return 0
         logger.error("Update post %s failed: %s - %s",
                      update_post_id, resp.status_code, resp.text[:500])
@@ -733,12 +754,14 @@ def _build_and_publish(trips, db_path: str, target_date: str, dry: bool,
 
     resp = wp.publish_post(post_data)
     if resp.status_code == 201:
-        link = resp.json().get("link", "no link")
+        body = resp.json()
+        link = body.get("link", "no link")
         logger.info("Published: %s -> %s", intro["title"], link)
         try:
             wp.notify_new_post(intro["title"], total_pnl, link)
         except Exception as e:
             logger.warning("Discord notify failed: %s", e)
+        _post_publish(body.get("id"))
         return 0
 
     logger.error("Publish failed: %s - %s", resp.status_code, resp.text[:500])
